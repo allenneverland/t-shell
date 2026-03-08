@@ -129,6 +129,31 @@ void __setupProcessEnv(void) {
   ssh_init();
 }
 
++ (void)prepareShellRuntimeSynchronously {
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    sideLoading = false; // Turn off extra commands from iOS system
+    initializeEnvironment(); // initialize environment variables for iOS system
+
+    NSString *blinkCommandListPath = [[NSBundle mainBundle] pathForResource:@"blinkCommandsDictionary" ofType:@"plist"];
+    if (blinkCommandListPath.length == 0) {
+      NSLog(@"[shell] blinkCommandsDictionary.plist not found. Builtin blink commands may be unavailable.");
+    } else {
+      NSError *commandListError = addCommandList(blinkCommandListPath); // Load blink commands to ios_system
+      if (commandListError != nil) {
+        NSLog(@"[shell] Failed loading blinkCommandsDictionary.plist: %@", commandListError.localizedDescription);
+      }
+    }
+
+    // Call this after ios_system initializeEnvironment to override ios_system defaults.
+    __setupProcessEnv();
+  });
+}
+
++ (NSArray<NSString *> *)availableShellCommands {
+  return commandsAsArray();
+}
+
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
   
   [Migrator perform];
@@ -145,11 +170,8 @@ void __setupProcessEnv(void) {
     
   });
 
-  sideLoading = false; // Turn off extra commands from iOS system
-  initializeEnvironment(); // initialize environment variables for iOS system
+  [AppDelegate prepareShellRuntimeSynchronously];
   dispatch_async(bgQueue, ^{
-    addCommandList([[NSBundle mainBundle] pathForResource:@"blinkCommandsDictionary" ofType:@"plist"]); // Load blink commands to ios_system
-    __setupProcessEnv(); // we should call this after ios_system initializeEnvironment to override its defaults.
     [AppDelegate _loadProfileVars];
   });
   

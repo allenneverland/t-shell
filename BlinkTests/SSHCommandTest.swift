@@ -141,3 +141,23 @@ final class TmuxNotificationPayloadResolverTests: XCTestCase {
     XCTAssertNil(TmuxNotificationPayloadResolver.resolve(userInfo) { _ in nil })
   }
 }
+
+final class ShellRuntimeBootstrapTests: XCTestCase {
+  override class func setUp() {
+    super.setUp()
+    AppDelegate.prepareShellRuntimeSynchronously()
+  }
+
+  func testShellRuntimeRegistersSSHCommands() {
+    let commands = Set(AppDelegate.availableShellCommands())
+    XCTAssertTrue(commands.contains("ssh"))
+    XCTAssertTrue(commands.contains("scp"))
+    XCTAssertTrue(commands.contains("sftp"))
+  }
+
+  func testShellRuntimePreparationIsIdempotent() {
+    AppDelegate.prepareShellRuntimeSynchronously()
+    let commands = Set(AppDelegate.availableShellCommands())
+    XCTAssertTrue(commands.contains("ssh"))
+  }
+}

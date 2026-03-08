@@ -34,6 +34,8 @@
 @interface AppDelegate : UIResponder <UIApplicationDelegate>
 
 + (void)reloadDefaults;
++ (void)prepareShellRuntimeSynchronously;
++ (NSArray<NSString *> * _Nonnull)availableShellCommands;
 + (NSString * _Nullable)currentAPNSToken;
 + (void)requestRemoteNotificationsRegistrationIfNeeded;
 + (NSString * _Nullable)tmuxAPNsPrivateKeyForHostAlias:(NSString * _Nonnull)hostAlias;
