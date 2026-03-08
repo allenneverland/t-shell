@@ -4,30 +4,17 @@ set -e
 REPO="allenneverland/t-shell"
 BINARY="tmuxd"
 
-# Detect OS
-OS="$(uname -s)"
-case "$OS" in
-    Linux*)  OS_NAME="linux";;
-    Darwin*) OS_NAME="darwin";;
-    *)       echo "Unsupported OS: $OS"; exit 1;;
+# Detect platform and fallback candidates
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
+case "$OS-$ARCH" in
+    linux-x86_64) candidates="linux-x86_64-gnu linux-x86_64-musl linux-x86_64 linux-amd64" ;;
+    linux-aarch64|linux-arm64) candidates="linux-aarch64-gnu linux-aarch64-musl linux-aarch64 linux-arm64" ;;
+    darwin-arm64|darwin-aarch64) candidates="darwin-aarch64 darwin-arm64" ;;
+    darwin-x86_64) candidates="darwin-x86_64 darwin-amd64" ;;
+    *) echo "Unsupported platform: $OS-$ARCH"; exit 1 ;;
 esac
-
-# Detect architecture
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64)  ARCH_NAME="x86_64";;
-    aarch64) ARCH_NAME="aarch64";;
-    arm64)   ARCH_NAME="aarch64";;
-    *)       echo "Unsupported architecture: $ARCH"; exit 1;;
-esac
-
-# Linux uses musl build for better compatibility
-if [ "$OS_NAME" = "linux" ]; then
-    PLATFORM="${OS_NAME}-${ARCH_NAME}-musl"
-else
-    PLATFORM="${OS_NAME}-${ARCH_NAME}"
-fi
-echo "Detected platform: $PLATFORM"
+echo "Detected platform: $OS-$ARCH"
 
 # Get latest tmuxd release tag (prefers tmuxd-v* tags)
 RELEASES_API="https://api.github.com/repos/$REPO/releases?per_page=100"
@@ -52,20 +39,35 @@ fi
 
 echo "Selected release tag: $LATEST"
 
-# Download URL
-URL="https://github.com/$REPO/releases/download/$LATEST/tmuxd-$PLATFORM.tar.gz"
-echo "Downloading from: $URL"
-
 # Create temp directory
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
 
 # Download and extract
-if command -v curl > /dev/null 2>&1; then
-    curl -sL "$URL" | tar xz -C "$TMP_DIR"
-else
-    wget -qO- "$URL" | tar xz -C "$TMP_DIR"
+SELECTED_URL=""
+for PLATFORM in $candidates; do
+    URL="https://github.com/$REPO/releases/download/$LATEST/tmuxd-$PLATFORM.tar.gz"
+    echo "Trying download: $URL"
+    if command -v curl > /dev/null 2>&1; then
+        if curl -fsSL "$URL" -o "$TMP_DIR/tmuxd.tgz"; then
+            SELECTED_URL="$URL"
+            break
+        fi
+    else
+        if wget -qO "$TMP_DIR/tmuxd.tgz" "$URL"; then
+            SELECTED_URL="$URL"
+            break
+        fi
+    fi
+done
+
+if [ -z "$SELECTED_URL" ]; then
+    echo "Error: Could not find a matching tmuxd binary asset for $OS-$ARCH"
+    exit 1
 fi
+
+echo "Downloaded from: $SELECTED_URL"
+tar xzf "$TMP_DIR/tmuxd.tgz" -C "$TMP_DIR"
 
 # Install
 INSTALL_DIR="/usr/local/bin"
