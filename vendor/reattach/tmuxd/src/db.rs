@@ -676,15 +676,29 @@ impl Database {
         &self,
         req: RegisterDeviceRequest,
     ) -> AppResult<RegisterDeviceResponse> {
-        if req.token.trim().is_empty() {
+        let RegisterDeviceRequest {
+            token,
+            sandbox,
+            device_id,
+            device_name,
+            server_name,
+        } = req;
+
+        if token.trim().is_empty() {
             return Err(AppError::bad_request("token is required"));
         }
-        if req.device_id.trim().is_empty() {
+        if device_id.trim().is_empty() {
             return Err(AppError::bad_request("device_id is required"));
         }
-        if req.server_name.trim().is_empty() {
+        if server_name.trim().is_empty() {
             return Err(AppError::bad_request("server_name is required"));
         }
+        let device_name = device_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(device_id.as_str())
+            .to_string();
 
         let now = now_utc();
         let mut conn = lock_conn(&self.conn)?;
@@ -695,13 +709,13 @@ impl Database {
                 "SELECT id, device_api_token_id FROM devices
                  WHERE device_id = ?1 AND revoked_at IS NULL
                  LIMIT 1",
-                params![req.device_id],
+                params![&device_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
 
         if let Some((existing_id, old_device_api_token_id)) = existing {
-            revoke_conflicting_apns_token(&tx, &req.token, Some(&existing_id), now)?;
+            revoke_conflicting_apns_token(&tx, &token, Some(&existing_id), now)?;
 
             let new_device_api_token_id = Uuid::new_v4().to_string();
             let new_device_api_token_raw = generate_token();
@@ -734,9 +748,9 @@ impl Database {
                  WHERE id = ?7",
                 params![
                     device_name,
-                    req.server_name,
-                    req.token,
-                    bool_to_int(req.sandbox),
+                    &server_name,
+                    &token,
+                    bool_to_int(sandbox),
                     new_device_api_token_id,
                     now.to_rfc3339(),
                     existing_id,
@@ -752,7 +766,7 @@ impl Database {
         }
 
         let new_id = Uuid::new_v4().to_string();
-        revoke_conflicting_apns_token(&tx, &req.token, None, now)?;
+        revoke_conflicting_apns_token(&tx, &token, None, now)?;
 
         let token_id = Uuid::new_v4().to_string();
         let token_raw = generate_token();
@@ -775,11 +789,11 @@ impl Database {
             ) VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, NULL)",
             params![
                 new_id,
-                req.device_id,
+                &device_id,
                 device_name,
-                req.server_name,
-                req.token,
-                bool_to_int(req.sandbox),
+                &server_name,
+                &token,
+                bool_to_int(sandbox),
                 token_id,
                 now.to_rfc3339(),
             ],
