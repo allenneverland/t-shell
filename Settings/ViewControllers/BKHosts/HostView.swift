@@ -535,7 +535,7 @@ struct HostView: View {
       ) {
         Field("Service URL", $_tmuxServiceURL, next: "Service Token", placeholder: "https://tmuxd.example.com", enabled: _enabled, kbType: .URL)
         Field("Service Token", $_tmuxServiceToken, next: "Push Device ID", placeholder: "Optional bearer token", secureTextEntry: true, enabled: _enabled)
-        Field("Push Device ID", $_tmuxPushDeviceId, next: "Push Device Name", placeholder: "Optional device id for pairing", enabled: _enabled)
+        Field("Push Device ID", $_tmuxPushDeviceId, next: "Push Device Name", placeholder: "Optional device id for registration", enabled: _enabled)
         Field("Push Device Name", $_tmuxPushDeviceName, next: "Push Device API Token", placeholder: "Optional display name", enabled: _enabled)
         Field("Push Device API Token", $_tmuxPushDeviceApiToken, next: "Alias", placeholder: "Optional token", secureTextEntry: true, enabled: _enabled)
         Field("APNS Key ID", $_tmuxAPNSKeyID, next: "APNS Team ID", placeholder: "ABC123DEFG", enabled: _enabled)
@@ -552,7 +552,7 @@ struct HostView: View {
           action: _runTmuxSSHOnboarding,
           label: {
             Label(
-              _tmuxOnboardingRunning ? "正在執行一鍵 SSH Onboarding…" : "一鍵 SSH Onboarding（安裝 tmuxd + pairing）",
+              _tmuxOnboardingRunning ? "正在執行一鍵 SSH Onboarding…" : "一鍵 SSH Onboarding（安裝 tmuxd + APNs）",
               systemImage: "bolt.horizontal.circle"
             )
           }
@@ -904,7 +904,7 @@ struct HostView: View {
           throw ValidationError.general(message: "Service URL is required for SSH onboarding.")
         }
 
-        guard TmuxSSHOnboardingService.normalizeServiceBaseURL(serviceURL) != nil else {
+        guard let normalizedServiceURL = TmuxSSHOnboardingService.normalizeServiceBaseURL(serviceURL) else {
           throw ValidationError.general(message: "Service URL is invalid. Use http:// or https:// with a host.")
         }
 
@@ -920,9 +920,8 @@ struct HostView: View {
         }
 
         let apnsToken = (AppDelegate.currentAPNSToken() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apnsToken.isEmpty else {
+        if apnsToken.isEmpty {
           AppDelegate.requestRemoteNotificationsRegistrationIfNeeded()
-          throw ValidationError.general(message: "APNs token is not ready. Allow notifications and retry onboarding.")
         }
 
         let deviceId = _tmuxPushDeviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -931,25 +930,17 @@ struct HostView: View {
         let deviceName = _tmuxPushDeviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
           ? UIDevice.current.name
           : _tmuxPushDeviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let serviceToken = _tmuxServiceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          ? TmuxSSHOnboardingService.generateServiceToken()
+          : _tmuxServiceToken.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        _tmuxServiceURL = normalizedServiceURL
+        _tmuxServiceToken = serviceToken
         _tmuxPushDeviceId = deviceId
         _tmuxPushDeviceName = deviceName
+        _tmuxPushDeviceApiToken = ""
         _tmuxPushEnabled = true
         _tmuxOnboardingStatus = "Saving host settings…"
-        _saveHost()
-
-        _tmuxOnboardingStatus = "Starting push pairing…"
-        let pairing = try await TmuxSSHOnboardingService.startPairingAndRegister(
-          serviceBaseURL: serviceURL,
-          apnsToken: apnsToken,
-          deviceId: deviceId,
-          deviceName: deviceName,
-          serverName: alias
-        )
-
-        _tmuxPushDeviceApiToken = pairing.deviceApiToken
-        _tmuxPushEnabled = true
-        _tmuxOnboardingStatus = "Persisting pairing result…"
         _saveHost()
 
         guard
@@ -961,8 +952,8 @@ struct HostView: View {
 
         let command = TmuxSSHOnboardingService.buildSSHOnboardingCommand(
           hostAlias: alias,
-          serviceBaseURL: pairing.serviceBaseURL,
-          pairingToken: pairing.pairingToken,
+          serviceBaseURL: normalizedServiceURL,
+          serviceToken: serviceToken,
           apnsKeyBase64: apnsKeyBase64,
           apnsKeyID: apnsKeyID,
           apnsTeamID: apnsTeamID,
@@ -970,7 +961,24 @@ struct HostView: View {
         )
         _tmuxOnboardingStatus = "Opening shell and running onboarding script…"
         sceneDelegate.spaceController.openShellAndRunCommand(command)
-        _tmuxOnboardingStatus = "Onboarding started in a new shell tab."
+
+        if !apnsToken.isEmpty {
+          _tmuxOnboardingStatus = "Waiting for tmuxd startup…"
+          let deviceApiToken = try await TmuxSSHOnboardingService.registerDeviceWithRetry(
+            serviceBaseURL: normalizedServiceURL,
+            serviceToken: serviceToken,
+            apnsToken: apnsToken,
+            deviceId: deviceId,
+            deviceName: deviceName,
+            serverName: alias
+          )
+          _tmuxPushDeviceApiToken = deviceApiToken
+          _tmuxOnboardingStatus = "Persisting device token…"
+          _saveHost()
+          _tmuxOnboardingStatus = "Onboarding completed."
+        } else {
+          _tmuxOnboardingStatus = "Onboarding started in a new shell tab. Allow notifications to complete device registration."
+        }
       } catch {
         _tmuxOnboardingStatus = ""
         _errorMessage = error.localizedDescription
@@ -995,29 +1003,17 @@ fileprivate enum ValidationError: Error, LocalizedError {
   }
 }
 
-fileprivate struct TmuxOnboardingPairingResult {
-  let serviceBaseURL: String
-  let pairingToken: String
-  let deviceApiToken: String
-}
-
 fileprivate enum TmuxSSHOnboardingService {
-  private struct StartPairingResponse: Decodable {
-    let pairingToken: String
-    let deviceRegisterToken: String
-
-    enum CodingKeys: String, CodingKey {
-      case pairingToken = "pairing_token"
-      case deviceRegisterToken = "device_register_token"
-    }
-  }
-
   private struct RegisterDeviceResponse: Decodable {
     let deviceApiToken: String
 
     enum CodingKeys: String, CodingKey {
       case deviceApiToken = "device_api_token"
     }
+  }
+
+  static func generateServiceToken() -> String {
+    UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
   }
 
   static func normalizeServiceBaseURL(_ raw: String) -> String? {
@@ -1040,7 +1036,8 @@ fileprivate enum TmuxSSHOnboardingService {
     components.fragment = nil
     components.user = nil
     components.password = nil
-    if components.percentEncodedPath == "/" {
+    let path = components.percentEncodedPath.lowercased()
+    if path == "/" || path == "/healthz" || path == "/healthz/" || path == "/v1/healthz" || path == "/v1/healthz/" {
       components.percentEncodedPath = ""
     }
 
@@ -1071,44 +1068,58 @@ fileprivate enum TmuxSSHOnboardingService {
     return normalized
   }
 
-  static func startPairingAndRegister(
+  static func registerDeviceWithRetry(
     serviceBaseURL: String,
+    serviceToken: String,
+    apnsToken: String,
+    deviceId: String,
+    deviceName: String,
+    serverName: String,
+    attempts: Int = 25,
+    delayNanos: UInt64 = 1_000_000_000
+  ) async throws -> String {
+    var lastError: Error?
+    for attempt in 1...max(attempts, 1) {
+      do {
+        return try await registerDevice(
+          serviceBaseURL: serviceBaseURL,
+          serviceToken: serviceToken,
+          apnsToken: apnsToken,
+          deviceId: deviceId,
+          deviceName: deviceName,
+          serverName: serverName
+        )
+      } catch {
+        lastError = error
+        if attempt < attempts {
+          try await Task.sleep(nanoseconds: delayNanos)
+        }
+      }
+    }
+
+    throw ValidationError.general(
+      message: "tmuxd started but APNs registration failed: \(lastError?.localizedDescription ?? "unknown error")."
+    )
+  }
+
+  static func registerDevice(
+    serviceBaseURL: String,
+    serviceToken: String,
     apnsToken: String,
     deviceId: String,
     deviceName: String,
     serverName: String
-  ) async throws -> TmuxOnboardingPairingResult {
+  ) async throws -> String {
     guard let baseURL = normalizeServiceBaseURL(serviceBaseURL),
-          let startURL = URL(string: "\(baseURL)/v1/pairings/start"),
-          let registerURL = URL(string: "\(baseURL)/v1/devices/register")
+          let registerURL = URL(string: "\(baseURL)/v1/push/devices/register")
     else {
       throw ValidationError.general(message: "Service URL is invalid.")
-    }
-
-    var startRequest = URLRequest(url: startURL)
-    startRequest.httpMethod = "POST"
-    startRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    startRequest.httpBody = try JSONSerialization.data(withJSONObject: [
-      "device_id": deviceId,
-      "device_name": deviceName,
-      "server_name": serverName
-    ])
-
-    let (startData, startResponse) = try await URLSession.shared.data(for: startRequest)
-    let startHTTP = startResponse as? HTTPURLResponse
-    guard let startHTTP, (200...299).contains(startHTTP.statusCode) else {
-      throw ValidationError.general(message: "Pairing start failed (HTTP \(startHTTP?.statusCode ?? -1)).")
-    }
-
-    let pairing = try JSONDecoder().decode(StartPairingResponse.self, from: startData)
-    guard !pairing.pairingToken.isEmpty, !pairing.deviceRegisterToken.isEmpty else {
-      throw ValidationError.general(message: "Pairing start response is missing required tokens.")
     }
 
     var registerRequest = URLRequest(url: registerURL)
     registerRequest.httpMethod = "POST"
     registerRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    registerRequest.setValue("Bearer \(pairing.deviceRegisterToken)", forHTTPHeaderField: "Authorization")
+    registerRequest.setValue("Bearer \(serviceToken)", forHTTPHeaderField: "Authorization")
 
     #if DEBUG
     let sandbox = true
@@ -1120,6 +1131,7 @@ fileprivate enum TmuxSSHOnboardingService {
       "token": apnsToken,
       "sandbox": sandbox,
       "device_id": deviceId,
+      "device_name": deviceName,
       "server_name": serverName
     ])
 
@@ -1133,29 +1145,26 @@ fileprivate enum TmuxSSHOnboardingService {
     guard !registerResult.deviceApiToken.isEmpty else {
       throw ValidationError.general(message: "Service response is missing device API token.")
     }
-
-    return TmuxOnboardingPairingResult(
-      serviceBaseURL: baseURL,
-      pairingToken: pairing.pairingToken,
-      deviceApiToken: registerResult.deviceApiToken
-    )
+    return registerResult.deviceApiToken
   }
 
   static func buildSSHOnboardingCommand(
     hostAlias: String,
     serviceBaseURL: String,
-    pairingToken: String,
+    serviceToken: String,
     apnsKeyBase64: String,
     apnsKeyID: String,
     apnsTeamID: String,
     apnsBundleID: String
   ) -> String {
+    let bindAddr = "0.0.0.0"
+    let serviceTokenToml = tomlStringLiteral(serviceToken)
+    let apnsKeyBase64Toml = tomlStringLiteral(apnsKeyBase64)
+    let apnsKeyIDToml = tomlStringLiteral(apnsKeyID)
+    let apnsTeamIDToml = tomlStringLiteral(apnsTeamID)
+    let apnsBundleIDToml = tomlStringLiteral(apnsBundleID)
+    let bindAddrToml = tomlStringLiteral(bindAddr)
     let serviceURL = shellQuote(serviceBaseURL)
-    let pairingTokenQuoted = shellQuote(pairingToken)
-    let apnsKeyBase64Quoted = shellQuote(apnsKeyBase64)
-    let apnsKeyIDQuoted = shellQuote(apnsKeyID)
-    let apnsTeamIDQuoted = shellQuote(apnsTeamID)
-    let apnsBundleIDQuoted = shellQuote(apnsBundleID)
     let script = """
     set -eu
     TMPDIR="$(mktemp -d)"
@@ -1205,16 +1214,19 @@ fileprivate enum TmuxSSHOnboardingService {
       install -m 755 "$bin" "$HOME/.local/bin/tmuxd"
     }
 
-    write_env_file() {
+    write_config_file() {
       mkdir -p "$HOME/.config/tmuxd"
       umask 077
-      cat > "$HOME/.config/tmuxd/env" <<'EOF'
-      PUSH_SERVER_BASE_URL=\(serviceURL)
-      PUSH_SERVER_COMPAT_NOTIFY_TOKEN=\(pairingTokenQuoted)
-      APNS_KEY_BASE64=\(apnsKeyBase64Quoted)
-      APNS_KEY_ID=\(apnsKeyIDQuoted)
-      APNS_TEAM_ID=\(apnsTeamIDQuoted)
-      APNS_BUNDLE_ID=\(apnsBundleIDQuoted)
+      cat > "$HOME/.config/tmuxd/config.toml" <<'EOF'
+      bind_addr = \(bindAddrToml)
+      port = 8787
+      service_token = \(serviceTokenToml)
+
+      [apns]
+      key_base64 = \(apnsKeyBase64Toml)
+      key_id = \(apnsKeyIDToml)
+      team_id = \(apnsTeamIDToml)
+      bundle_id = \(apnsBundleIDToml)
       EOF
     }
 
@@ -1224,18 +1236,28 @@ fileprivate enum TmuxSSHOnboardingService {
         pkill -x tmuxd || true
         sleep 1
       fi
-      set -a
-      . "$HOME/.config/tmuxd/env"
-      set +a
-      nohup "$HOME/.local/bin/tmuxd" > "$HOME/.local/state/tmuxd/tmuxd.log" 2>&1 &
+      nohup "$HOME/.local/bin/tmuxd" serve --config "$HOME/.config/tmuxd/config.toml" > "$HOME/.local/state/tmuxd/tmuxd.log" 2>&1 &
+    }
+
+    print_summary() {
+      echo "tmuxd started"
+      echo "Service URL (configured in app): \(serviceURL)"
     }
 
     install_tmuxd
-    write_env_file
+    write_config_file
     ensure_tmuxd_running
+    print_summary
     """
 
     return "ssh \(shellQuote(hostAlias)) -t \(shellQuote(script))"
+  }
+
+  private static func tomlStringLiteral(_ value: String) -> String {
+    let escaped = value
+      .replacingOccurrences(of: "\\\\", with: "\\\\\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\\\"")
+    return "\"\(escaped)\""
   }
 
   private static func shellQuote(_ value: String) -> String {

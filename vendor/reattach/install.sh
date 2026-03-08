@@ -1,0 +1,92 @@
+#!/bin/sh
+set -e
+
+REPO="allenneverland/tmux-chat"
+BINARY="tmuxd"
+
+# Detect OS
+OS="$(uname -s)"
+case "$OS" in
+    Linux*)  OS_NAME="linux";;
+    Darwin*) OS_NAME="darwin";;
+    *)       echo "Unsupported OS: $OS"; exit 1;;
+esac
+
+# Detect architecture
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  ARCH_NAME="x86_64";;
+    aarch64) ARCH_NAME="aarch64";;
+    arm64)   ARCH_NAME="aarch64";;
+    *)       echo "Unsupported architecture: $ARCH"; exit 1;;
+esac
+
+# Linux uses musl build for better compatibility
+if [ "$OS_NAME" = "linux" ]; then
+    PLATFORM="${OS_NAME}-${ARCH_NAME}-musl"
+else
+    PLATFORM="${OS_NAME}-${ARCH_NAME}"
+fi
+echo "Detected platform: $PLATFORM"
+
+# Get latest release version
+if command -v curl > /dev/null 2>&1; then
+    LATEST=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+elif command -v wget > /dev/null 2>&1; then
+    LATEST=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+else
+    echo "Error: curl or wget is required"
+    exit 1
+fi
+
+if [ -z "$LATEST" ]; then
+    echo "Error: Could not determine latest version"
+    exit 1
+fi
+
+echo "Latest version: $LATEST"
+
+# Download URL
+URL="https://github.com/$REPO/releases/download/$LATEST/tmuxd-$PLATFORM.tar.gz"
+echo "Downloading from: $URL"
+
+# Create temp directory
+TMP_DIR=$(mktemp -d)
+trap "rm -rf $TMP_DIR" EXIT
+
+# Download and extract
+if command -v curl > /dev/null 2>&1; then
+    curl -sL "$URL" | tar xz -C "$TMP_DIR"
+else
+    wget -qO- "$URL" | tar xz -C "$TMP_DIR"
+fi
+
+# Install
+INSTALL_DIR="/usr/local/bin"
+if [ ! -w "$INSTALL_DIR" ]; then
+    if command -v sudo > /dev/null 2>&1; then
+        echo "Installing to $INSTALL_DIR (requires sudo)..."
+        sudo mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+        sudo chmod +x "$INSTALL_DIR/$BINARY"
+    else
+        INSTALL_DIR="$HOME/.local/bin"
+        mkdir -p "$INSTALL_DIR"
+        mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+        chmod +x "$INSTALL_DIR/$BINARY"
+    fi
+else
+    mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
+    chmod +x "$INSTALL_DIR/$BINARY"
+fi
+
+echo ""
+echo "Installed $BINARY to $INSTALL_DIR/$BINARY"
+echo ""
+
+if [ "$INSTALL_DIR" != "/usr/local/bin" ]; then
+    echo "Note: For systemd service, copy to /usr/local/bin:"
+    echo "  sudo cp $INSTALL_DIR/$BINARY /usr/local/bin/"
+    echo ""
+fi
+
+echo "Run 'tmuxd --help' to get started"

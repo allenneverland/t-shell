@@ -67,6 +67,46 @@ static NSString * const BLKTmuxAPNsKeychainPrefix = @"tmux.apns.private.";
 static UICKeyChainStore * _BLKTmuxAPNsKeychain(void) {
   return [UICKeyChainStore keyChainStoreWithService:BLKTmuxAPNsKeychainService];
 }
+
+static NSString * _Nullable _BLKTmuxNormalizedServiceBaseURL(NSString *rawURL) {
+  NSString *value = [rawURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (value.length == 0) {
+    return nil;
+  }
+
+  NSURLComponents *components = [NSURLComponents componentsWithString:value];
+  if (!components.host.length) {
+    return nil;
+  }
+  NSString *scheme = components.scheme.lowercaseString;
+  if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
+    return nil;
+  }
+
+  components.scheme = scheme;
+  components.user = nil;
+  components.password = nil;
+  components.query = nil;
+  components.fragment = nil;
+
+  NSString *path = components.percentEncodedPath.lowercaseString ?: @"";
+  if ([path isEqualToString:@"/"] ||
+      [path isEqualToString:@"/healthz"] ||
+      [path isEqualToString:@"/healthz/"] ||
+      [path isEqualToString:@"/v1/healthz"] ||
+      [path isEqualToString:@"/v1/healthz/"]) {
+    components.percentEncodedPath = @"";
+  }
+
+  NSString *normalized = components.string;
+  if (normalized.length == 0) {
+    return nil;
+  }
+  if ([normalized hasSuffix:@"/"]) {
+    return [normalized substringToIndex:normalized.length - 1];
+  }
+  return normalized;
+}
   
 void __on_pipebroken_signal(int signum){
   NSLog(@"PIPE is broken");
@@ -221,12 +261,15 @@ void __setupProcessEnv(void) {
 }
 
 - (void)_registerAPNSToken:(NSString *)apnsToken forTmuxHost:(BKHosts *)host {
-  NSString *serverURL = [host.tmuxServiceURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-  if (serverURL.length == 0) {
+  NSString *normalizedURL = _BLKTmuxNormalizedServiceBaseURL(host.tmuxServiceURL ?: @"");
+  if (normalizedURL.length == 0) {
+    return;
+  }
+  NSString *serviceToken = [host.tmuxServiceToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (serviceToken.length == 0) {
     return;
   }
 
-  NSString *normalizedURL = [serverURL hasSuffix:@"/"] ? [serverURL substringToIndex:serverURL.length - 1] : serverURL;
   NSString *deviceId = host.tmuxPushDeviceId.length > 0 ? host.tmuxPushDeviceId : host.host;
   NSString *deviceName = host.tmuxPushDeviceName.length > 0 ? host.tmuxPushDeviceName : UIDevice.currentDevice.name;
   NSString *serverName = host.host.length > 0 ? host.host : @"tshell";
@@ -234,99 +277,58 @@ void __setupProcessEnv(void) {
     return;
   }
 
-  NSURL *pairURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/pairings/start"]];
-  if (!pairURL) {
+  NSURL *registerURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/push/devices/register"]];
+  if (!registerURL) {
     return;
   }
 
-  NSMutableURLRequest *pairRequest = [NSMutableURLRequest requestWithURL:pairURL];
-  pairRequest.HTTPMethod = @"POST";
-  [pairRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-  NSDictionary *pairBody = @{
+  NSMutableURLRequest *registerRequest = [NSMutableURLRequest requestWithURL:registerURL];
+  registerRequest.HTTPMethod = @"POST";
+  [registerRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  [registerRequest setValue:[NSString stringWithFormat:@"Bearer %@", serviceToken] forHTTPHeaderField:@"Authorization"];
+
+  #if DEBUG
+    BOOL sandbox = YES;
+  #else
+    BOOL sandbox = NO;
+  #endif
+
+  NSDictionary *registerBody = @{
+    @"token": apnsToken,
+    @"sandbox": @(sandbox),
     @"device_id": deviceId,
     @"device_name": deviceName,
     @"server_name": serverName
   };
-  NSError *pairBodyError = nil;
-  pairRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:pairBody options:0 error:&pairBodyError];
-  if (pairBodyError) {
+  NSError *registerBodyError = nil;
+  registerRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:registerBody options:0 error:&registerBodyError];
+  if (registerBodyError) {
     return;
   }
 
-  NSURLSessionDataTask *pairTask = [[NSURLSession sharedSession] dataTaskWithRequest:pairRequest completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-    if (error || !data) {
+  NSURLSessionDataTask *registerTask = [[NSURLSession sharedSession] dataTaskWithRequest:registerRequest completionHandler:^(NSData * _Nullable registerData, NSURLResponse * _Nullable registerResponse, NSError * _Nullable registerError) {
+    if (registerError || !registerData) {
       return;
     }
 
-    NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-    if (http.statusCode < 200 || http.statusCode > 299) {
+    NSHTTPURLResponse *registerHTTP = (NSHTTPURLResponse *)registerResponse;
+    if (registerHTTP.statusCode < 200 || registerHTTP.statusCode > 299) {
       return;
     }
 
-    NSError *jsonError = nil;
-    NSDictionary *pairJSON = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-    if (jsonError || ![pairJSON isKindOfClass:NSDictionary.class]) {
+    NSError *registerJSONError = nil;
+    NSDictionary *registerJSON = [NSJSONSerialization JSONObjectWithData:registerData options:0 error:&registerJSONError];
+    if (registerJSONError || ![registerJSON isKindOfClass:NSDictionary.class]) {
       return;
     }
 
-    NSString *deviceRegisterToken = pairJSON[@"device_register_token"];
-    if (deviceRegisterToken.length == 0) {
-      return;
-    }
-
-    NSURL *registerURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/devices/register"]];
-    if (!registerURL) {
-      return;
-    }
-
-    NSMutableURLRequest *registerRequest = [NSMutableURLRequest requestWithURL:registerURL];
-    registerRequest.HTTPMethod = @"POST";
-    [registerRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [registerRequest setValue:[NSString stringWithFormat:@"Bearer %@", deviceRegisterToken] forHTTPHeaderField:@"Authorization"];
-
-    #if DEBUG
-      BOOL sandbox = YES;
-    #else
-      BOOL sandbox = NO;
-    #endif
-
-    NSDictionary *registerBody = @{
-      @"token": apnsToken,
-      @"sandbox": @(sandbox),
-      @"device_id": deviceId,
-      @"server_name": serverName
-    };
-    NSError *registerBodyError = nil;
-    registerRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:registerBody options:0 error:&registerBodyError];
-    if (registerBodyError) {
-      return;
-    }
-
-    NSURLSessionDataTask *registerTask = [[NSURLSession sharedSession] dataTaskWithRequest:registerRequest completionHandler:^(NSData * _Nullable registerData, NSURLResponse * _Nullable registerResponse, NSError * _Nullable registerError) {
-      if (registerError || !registerData) {
-        return;
-      }
-
-      NSHTTPURLResponse *registerHTTP = (NSHTTPURLResponse *)registerResponse;
-      if (registerHTTP.statusCode < 200 || registerHTTP.statusCode > 299) {
-        return;
-      }
-
-      NSError *registerJSONError = nil;
-      NSDictionary *registerJSON = [NSJSONSerialization JSONObjectWithData:registerData options:0 error:&registerJSONError];
-      if (registerJSONError || ![registerJSON isKindOfClass:NSDictionary.class]) {
-        return;
-      }
-
-      NSString *deviceApiToken = registerJSON[@"device_api_token"];
-      dispatch_async(dispatch_get_main_queue(), ^{
-        host.tmuxPushDeviceApiToken = deviceApiToken ?: host.tmuxPushDeviceApiToken;
-        [BKHosts saveHosts];
-      });
-    }];
-    [registerTask resume];
+    NSString *deviceApiToken = registerJSON[@"device_api_token"];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      host.tmuxPushDeviceApiToken = deviceApiToken ?: host.tmuxPushDeviceApiToken;
+      [BKHosts saveHosts];
+    });
   }];
-  [pairTask resume];
+  [registerTask resume];
 }
 
 //- (void)_active {

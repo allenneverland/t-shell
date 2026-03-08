@@ -1555,7 +1555,7 @@ fileprivate enum TmuxControlPlaneClient {
       throw TmuxControlError.missingControlURL(alias)
     }
 
-    guard let base = _normalizeBaseURL(rawURL), let url = URL(string: "\(base)/sessions") else {
+    guard let base = _normalizeBaseURL(rawURL), let url = URL(string: "\(base)/v1/tmux/sessions") else {
       throw TmuxControlError.invalidURL(rawURL)
     }
 
@@ -1602,7 +1602,7 @@ fileprivate enum TmuxControlPlaneClient {
     components.password = nil
 
     let path = components.percentEncodedPath.lowercased()
-    if path == "/healthz" || path == "/healthz/" || path == "/" {
+    if path == "/healthz" || path == "/healthz/" || path == "/v1/healthz" || path == "/v1/healthz/" || path == "/" {
       components.percentEncodedPath = ""
     }
 
