@@ -1195,7 +1195,7 @@ fileprivate enum TmuxSSHOnboardingService {
 
       selected=""
       for platform in $candidates; do
-        url="https://github.com/allenneverland/tmux-chat/releases/latest/download/tmuxd-$platform.tar.gz"
+        url="https://github.com/allenneverland/t-blink/releases/latest/download/tmuxd-$platform.tar.gz"
         if download "$url" "$TMPDIR/tmuxd.tgz"; then
           selected="$url"
           break

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="allenneverland/tmux-chat"
+REPO="allenneverland/t-blink"
 BINARY="tmuxd"
 
 # Detect OS
