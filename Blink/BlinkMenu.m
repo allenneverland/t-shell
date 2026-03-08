@@ -45,6 +45,7 @@ const BlinkActionID BlinkActionChangeLayout = @"blink-change-layout";
 const BlinkActionID BlinkActionToggleLayoutLock = @"blink-toggle-layout-lock";
 const BlinkActionID BlinkActionToggleGeoTrack = @"blink-toggle-geo-track";
 const BlinkActionID BlinkActionToggleCompactActions = @"blink-toggle-compact-actions";
+const BlinkActionID BlinkActionTmux = @"blink-tmux-mode";
 const BlinkActionID BlinkActionLayoutFill = @"blink-layout-fill";
 const BlinkActionID BlinkActionLayoutFit = @"blink-layout-fit";
 const BlinkActionID BlinkActionLayoutCover = @"blink-layout-cover";
@@ -334,6 +335,15 @@ const CGFloat MENU_PADDING = 10.0;
     action.state = GeoManager.shared.traking ? UIMenuElementStateOn : UIMenuElementStateOff;
     
     return action;
+  }
+
+  if (elementID == BlinkActionTmux) {
+    return [UIAction
+            actionWithTitle:noTitle ? @"" : @"Tmux"
+            image:[UIImage systemImageNamed:@"rectangle.split.3x1"]
+            identifier:elementID handler:^(__kindof UIAction * _Nonnull action) {
+      [[delegate spaceController] showTmuxModeAction];
+    }];
   }
   
   if (elementID == BlinkActionToggleCompactActions) {

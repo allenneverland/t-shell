@@ -70,6 +70,7 @@ class SpaceController: UIViewController {
   private var _snippetsVC: SnippetsViewController? = nil
   private var _blinkMenu: BlinkMenu? = nil
   private var _bottomTapAreaView = UIView()
+  private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   
   var safeFrame: CGRect {
     _overlay.frame
@@ -287,6 +288,11 @@ Please go to your subscriptions and cancel one of them!
     
     nc.addObserver(self, selector: #selector(_UISceneWillEnterForegroundNotification(_:)),
                    name: UIScene.willEnterForegroundNotification, object: nil)
+
+    nc.addObserver(self, selector: #selector(_openTmuxPaneFromNotification(_:)),
+                   name: .BLKOpenTmuxPane, object: nil)
+
+    _drainPendingTmuxNotificationIfNeeded()
     
   }
                    
@@ -580,6 +586,43 @@ extension SpaceController: UIStateRestorable {
       
       uiState.keys.forEach { registry.remove(forKey: $0) }
     }
+  }
+
+  @objc static func handleTmuxRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+    guard let request = _tmuxNotificationRequest(from: userInfo) else {
+      return false
+    }
+
+    if
+      let scene = UIApplication.shared.connectedScenes.activeAppScene(),
+      let sceneDelegate = scene.delegate as? SceneDelegate
+    {
+      DispatchQueue.main.async {
+        sceneDelegate.spaceController.openTmuxPane(
+          hostAlias: request.hostAlias,
+          sessionName: request.sessionName,
+          paneTarget: request.paneTarget
+        )
+      }
+      return true
+    }
+
+    _pendingTmuxRequest = request
+
+    NotificationCenter.default.post(
+      name: .BLKOpenTmuxPane,
+      object: nil,
+      userInfo: [
+        "hostAlias": request.hostAlias,
+        "sessionName": request.sessionName ?? "",
+        "paneTarget": request.paneTarget
+      ]
+    )
+    return true
+  }
+
+  fileprivate static func _tmuxNotificationRequest(from userInfo: [AnyHashable: Any]) -> TmuxNotificationRequest? {
+    TmuxNotificationPayloadResolver.resolve(userInfo)
   }
 }
 
@@ -988,7 +1031,7 @@ extension SpaceController {
       self.view.addSubview(menu.tapToCloseView)
       
       var ids: [BlinkActionID] = []
-      ids.append(contentsOf:  [.snippets, .tabClose, .tabCreate])
+      ids.append(contentsOf:  [.snippets, .tabClose, .tabCreate, .tmux])
       
       if DeviceInfo.shared().hasCorners {
         ids.append(contentsOf:  [.layoutMenu])
@@ -1026,6 +1069,189 @@ extension SpaceController {
   @objc func toggleQuickActionsAction() {
     _interactiveSpaceController()
       ._toggleQuickActionActionWith(receiver: self)
+  }
+
+  @objc func showTmuxModeAction() {
+    let receiver = _interactiveSpaceController()
+    if receiver._blinkMenu != nil {
+      receiver.toggleQuickActionsAction()
+    }
+    receiver._presentTmuxHostPicker()
+  }
+
+  private func _presentTmuxHostPicker() {
+    let hosts = (BKHosts.allHosts() ?? []).filter { host in
+      !(host.tmuxServiceURL?.blink_trimmed.isEmpty ?? true)
+    }.sorted { ($0.host ?? "") < ($1.host ?? "") }
+
+    guard !hosts.isEmpty else {
+      showAlert(msg: "No host has Service URL configured. Edit a host in Settings > Hosts > TMUX first.")
+      return
+    }
+
+    let alert = UIAlertController(title: "Tmux Mode", message: "Select host", preferredStyle: .actionSheet)
+    for host in hosts {
+      let alias = host.host ?? "(unknown)"
+      let title = "\(alias)  (\(host.hostName ?? alias))"
+      alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
+        self?._presentTmuxSessionPicker(for: host)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _presentTmuxSessionPicker(for host: BKHosts) {
+    guard let hostAlias = host.host, !hostAlias.blink_trimmed.isEmpty else {
+      showAlert(msg: "This host has an empty alias.")
+      return
+    }
+
+    let hud = MBProgressHUD.showAdded(to: view, animated: true)
+    hud.label.text = "Loading tmux sessions…"
+    Task { [weak self] in
+      defer {
+        DispatchQueue.main.async {
+          hud.hide(animated: true)
+        }
+      }
+
+      do {
+        let sessions = try await TmuxControlPlaneClient.listSessions(for: host)
+        await MainActor.run {
+          self?._showTmuxSessionPicker(hostAlias: hostAlias, sessions: sessions)
+        }
+      } catch {
+        await MainActor.run {
+          self?.showAlert(msg: error.localizedDescription)
+        }
+      }
+    }
+  }
+
+  private func _showTmuxSessionPicker(hostAlias: String, sessions: [TmuxControlSession]) {
+    guard !sessions.isEmpty else {
+      showAlert(msg: "No tmux sessions found on \(hostAlias).")
+      return
+    }
+
+    let alert = UIAlertController(title: "Tmux Sessions", message: "Select session", preferredStyle: .actionSheet)
+    for session in sessions.sorted(by: { $0.name < $1.name }) {
+      let indicator = session.attached ? " • attached" : ""
+      alert.addAction(UIAlertAction(title: "\(session.name)\(indicator)", style: .default, handler: { [weak self] _ in
+        self?._showTmuxPanePicker(hostAlias: hostAlias, session: session)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _showTmuxPanePicker(hostAlias: String, session: TmuxControlSession) {
+    let panes = session.windows
+      .sorted(by: { $0.index < $1.index })
+      .flatMap { window in
+        window.panes.sorted(by: { $0.index < $1.index }).map { pane in
+          (window: window, pane: pane)
+        }
+      }
+
+    guard !panes.isEmpty else {
+      showAlert(msg: "Session '\(session.name)' has no panes.")
+      return
+    }
+
+    let alert = UIAlertController(title: "Session: \(session.name)", message: "Tap a pane to enter", preferredStyle: .actionSheet)
+    for entry in panes {
+      let marker = entry.pane.active ? "★ " : ""
+      let path = entry.pane.currentPath.blink_lastPathComponent
+      let title = "\(marker)\(entry.window.name) • pane \(entry.pane.index) • \(path)"
+      alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
+        self?._openTmuxPane(hostAlias: hostAlias, sessionName: session.name, paneTarget: entry.pane.target)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _presentSheetAlert(_ alert: UIAlertController) {
+    if let popover = alert.popoverPresentationController {
+      popover.sourceView = view
+      popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.maxY - 40, width: 1, height: 1)
+      popover.permittedArrowDirections = []
+    }
+    present(alert, animated: true)
+  }
+
+  @objc func openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
+    _interactiveSpaceController()._openTmuxPane(hostAlias: hostAlias, sessionName: sessionName, paneTarget: paneTarget)
+  }
+
+  @objc func openShellAndRunCommand(_ command: String) {
+    _interactiveSpaceController()._openShellAndRunCommand(command)
+  }
+
+  private func _openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
+    let cleanHost = hostAlias.blink_trimmed
+    guard !cleanHost.isEmpty else {
+      showAlert(msg: "Missing host alias in tmux notification.")
+      return
+    }
+
+    let cleanPane = paneTarget.blink_trimmed
+    guard !cleanPane.isEmpty else {
+      showAlert(msg: "Missing pane target.")
+      return
+    }
+
+    let inferredSession = cleanPane.components(separatedBy: ":").first
+    let cleanSession = sessionName?.blink_trimmed.isEmpty == false ? sessionName!.blink_trimmed : (inferredSession ?? "")
+    guard !cleanSession.isEmpty else {
+      showAlert(msg: "Missing session name for pane target \(cleanPane).")
+      return
+    }
+
+    let remoteCommand = "tmux attach-session -t \(cleanSession.blink_shellQuoted) \\; select-pane -t \(cleanPane.blink_shellQuoted)"
+    let command = "ssh \(cleanHost.blink_shellQuoted) -t \(remoteCommand.blink_shellQuoted)"
+    _openShellAndRunCommand(command)
+  }
+
+  private func _openShellAndRunCommand(_ command: String) {
+    let cleanCommand = command.blink_trimmed
+    guard !cleanCommand.isEmpty else {
+      showAlert(msg: "Command is empty.")
+      return
+    }
+
+    _createShell(userActivity: nil, animated: true) { [weak self] _ in
+      guard let self,
+            let term = self.currentTerm()
+      else {
+        return
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        term.termDevice.write(cleanCommand)
+        term.termDevice.write("\n")
+      }
+    }
+  }
+
+  @objc private func _openTmuxPaneFromNotification(_ n: Notification) {
+    guard
+      let userInfo = n.userInfo,
+      let request = Self._tmuxNotificationRequest(from: userInfo)
+    else {
+      return
+    }
+    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
+  }
+
+  private func _drainPendingTmuxNotificationIfNeeded() {
+    guard let request = Self._pendingTmuxRequest else {
+      return
+    }
+    Self._pendingTmuxRequest = nil
+    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
   }
   
   @objc func toggleGeoTrack() {
@@ -1221,4 +1447,194 @@ extension SpaceController: SnippetContext {
     return self.currentDevice
   }
   
+}
+
+struct TmuxNotificationRequest: Equatable {
+  let hostAlias: String
+  let sessionName: String?
+  let paneTarget: String
+}
+
+enum TmuxNotificationPayloadResolver {
+  static func resolve(
+    _ userInfo: [AnyHashable: Any],
+    hostAliasForDeviceID: ((String) -> String?)? = nil
+  ) -> TmuxNotificationRequest? {
+    let paneTarget = (userInfo["paneTarget"] as? String)
+      ?? (userInfo["pane_target"] as? String)
+      ?? (userInfo["paneId"] as? String)
+      ?? (userInfo["pane_id"] as? String)
+    guard let paneTarget = paneTarget?.blink_trimmed, !paneTarget.isEmpty else {
+      return nil
+    }
+
+    let sessionName = ((userInfo["sessionName"] as? String)
+      ?? (userInfo["session_name"] as? String)
+      ?? (userInfo["sessionId"] as? String)
+      ?? (userInfo["session_id"] as? String)
+      ?? paneTarget.components(separatedBy: ":").first)?.blink_trimmed
+
+    if let alias = ((userInfo["hostAlias"] as? String)
+      ?? (userInfo["hostId"] as? String)
+      ?? (userInfo["host_id"] as? String)
+      ?? (userInfo["serverName"] as? String))?.blink_trimmed,
+      !alias.isEmpty
+    {
+      return TmuxNotificationRequest(hostAlias: alias, sessionName: sessionName, paneTarget: paneTarget)
+    }
+
+    if let deviceId = ((userInfo["deviceId"] as? String)
+      ?? (userInfo["device_id"] as? String))?.blink_trimmed,
+      !deviceId.isEmpty
+    {
+      let resolveHostAlias = hostAliasForDeviceID ?? { id in
+        (BKHosts.allHosts() ?? []).first(where: { ($0.tmuxPushDeviceId ?? "").blink_trimmed == id })?.host
+      }
+      if let alias = resolveHostAlias(deviceId)?.blink_trimmed, !alias.isEmpty {
+        return TmuxNotificationRequest(hostAlias: alias, sessionName: sessionName, paneTarget: paneTarget)
+      }
+    }
+
+    return nil
+  }
+}
+
+fileprivate struct TmuxControlSession: Decodable {
+  let name: String
+  let attached: Bool
+  let windows: [TmuxControlWindow]
+}
+
+fileprivate struct TmuxControlWindow: Decodable {
+  let index: Int
+  let name: String
+  let panes: [TmuxControlPane]
+}
+
+fileprivate struct TmuxControlPane: Decodable {
+  let index: Int
+  let active: Bool
+  let target: String
+  let currentPath: String
+
+  enum CodingKeys: String, CodingKey {
+    case index
+    case active
+    case target
+    case currentPath = "current_path"
+  }
+}
+
+fileprivate enum TmuxControlError: LocalizedError {
+  case missingControlURL(String)
+  case invalidURL(String)
+  case badStatusCode(Int)
+  case missingData
+  case decoding(Error)
+
+  var errorDescription: String? {
+    switch self {
+    case .missingControlURL(let hostAlias):
+      return "Host '\(hostAlias)' is missing Service URL."
+    case .invalidURL(let value):
+      return "Service URL is invalid: \(value)"
+    case .badStatusCode(let code):
+      return "Tmux control plane returned HTTP \(code)."
+    case .missingData:
+      return "Tmux control plane returned no data."
+    case .decoding(let error):
+      return "Failed to decode tmux sessions: \(error.localizedDescription)"
+    }
+  }
+}
+
+fileprivate enum TmuxControlPlaneClient {
+  static func listSessions(for host: BKHosts) async throws -> [TmuxControlSession] {
+    let alias = host.host ?? "(unknown)"
+    guard let rawURL = host.tmuxServiceURL?.blink_trimmed, !rawURL.isEmpty else {
+      throw TmuxControlError.missingControlURL(alias)
+    }
+
+    guard let base = _normalizeBaseURL(rawURL), let url = URL(string: "\(base)/sessions") else {
+      throw TmuxControlError.invalidURL(rawURL)
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    if let token = host.tmuxServiceToken?.blink_trimmed, !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let httpResponse = response as? HTTPURLResponse else {
+      throw TmuxControlError.missingData
+    }
+    guard (200...299).contains(httpResponse.statusCode) else {
+      throw TmuxControlError.badStatusCode(httpResponse.statusCode)
+    }
+    guard !data.isEmpty else {
+      throw TmuxControlError.missingData
+    }
+
+    do {
+      return try JSONDecoder().decode([TmuxControlSession].self, from: data)
+    } catch {
+      throw TmuxControlError.decoding(error)
+    }
+  }
+
+  private static func _normalizeBaseURL(_ raw: String) -> String? {
+    guard
+      var components = URLComponents(string: raw),
+      let host = components.host,
+      let scheme = components.scheme?.lowercased(),
+      !host.isEmpty,
+      ["http", "https"].contains(scheme)
+    else {
+      return nil
+    }
+
+    components.scheme = scheme
+    components.query = nil
+    components.fragment = nil
+    components.user = nil
+    components.password = nil
+
+    let path = components.percentEncodedPath.lowercased()
+    if path == "/healthz" || path == "/healthz/" || path == "/" {
+      components.percentEncodedPath = ""
+    }
+
+    guard let normalized = components.string else {
+      return nil
+    }
+    if normalized.hasSuffix("/") {
+      return String(normalized.dropLast())
+    }
+    return normalized
+  }
+}
+
+fileprivate extension Notification.Name {
+  static let BLKOpenTmuxPane = Notification.Name("BLKOpenTmuxPaneNotification")
+}
+
+fileprivate extension String {
+  var blink_trimmed: String {
+    trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var blink_lastPathComponent: String {
+    let component = (self as NSString).lastPathComponent
+    if component.isEmpty || component == "/" || component == "." {
+      return self
+    }
+    return component
+  }
+
+  var blink_shellQuoted: String {
+    let escaped = replacingOccurrences(of: "'", with: "'\"'\"'")
+    return "'\(escaped)'"
+  }
 }

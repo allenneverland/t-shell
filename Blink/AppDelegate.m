@@ -35,6 +35,7 @@
 #import "BLKDefaults.h"
 #import <BlinkConfig/BKHosts.h>
 #import <BlinkConfig/BKPubKey.h>
+#import "UICKeyChainStore.h"
 #import <ios_system/ios_system.h>
 #import <UserNotifications/UserNotifications.h>
 #include <libssh/callbacks.h>
@@ -57,6 +58,14 @@ extern void rebind_ports(void);
   UIBackgroundTaskIdentifier _suspendTaskId;
   BOOL _suspendedMode;
   BOOL _enforceSuspension;
+}
+
+static NSString * const BLKAPNsTokenDefaultsKey = @"tmux.apns_device_token";
+static NSString * const BLKTmuxAPNsKeychainService = @"sh.blink.tmux.apns";
+static NSString * const BLKTmuxAPNsKeychainPrefix = @"tmux.apns.private.";
+
+static UICKeyChainStore * _BLKTmuxAPNsKeychain(void) {
+  return [UICKeyChainStore keyChainStoreWithService:BLKTmuxAPNsKeychainService];
 }
   
 void __on_pipebroken_signal(int signum){
@@ -124,6 +133,8 @@ void __setupProcessEnv(void) {
              name:UIScreenDidConnectNotification object:nil];
   
   [UNUserNotificationCenter currentNotificationCenter].delegate = self;
+  [self _configurePushNotifications];
+  [self _registerAPNsForConfiguredTmuxHostsIfNeeded];
   
 //  [nc addObserver:self selector:@selector(_logEvent:) name:nil object:nil];
 //  [nc addObserver:self selector:@selector(_active) name:@"UIApplicationSystemNavigationActionChangedNotification" object:nil];
@@ -139,6 +150,183 @@ void __setupProcessEnv(void) {
 #endif
   
   return YES;
+}
+
+- (void)_configurePushNotifications {
+  UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+  [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
+    switch (settings.authorizationStatus) {
+      case UNAuthorizationStatusAuthorized:
+      case UNAuthorizationStatusProvisional:
+      case UNAuthorizationStatusEphemeral:
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [UIApplication.sharedApplication registerForRemoteNotifications];
+        });
+        break;
+      case UNAuthorizationStatusNotDetermined:
+        [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
+                              completionHandler:^(BOOL granted, NSError * _Nullable error) {
+          if (error) {
+            NSLog(@"[APNs] Permission request error: %@", error.localizedDescription);
+          }
+          if (granted) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+              [UIApplication.sharedApplication registerForRemoteNotifications];
+            });
+          }
+        }];
+        break;
+      case UNAuthorizationStatusDenied:
+      default:
+        break;
+    }
+  }];
+}
+
+- (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
+  const unsigned char *dataBuffer = (const unsigned char *)deviceToken.bytes;
+  if (!dataBuffer) {
+    return;
+  }
+
+  NSMutableString *token = [NSMutableString stringWithCapacity:(deviceToken.length * 2)];
+  for (NSInteger i = 0; i < deviceToken.length; i++) {
+    [token appendFormat:@"%02x", dataBuffer[i]];
+  }
+  [[NSUserDefaults standardUserDefaults] setObject:token forKey:BLKAPNsTokenDefaultsKey];
+  [[NSUserDefaults standardUserDefaults] synchronize];
+  [self _registerAPNsForConfiguredTmuxHostsIfNeeded];
+}
+
+- (void)application:(UIApplication *)application didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
+  NSLog(@"[APNs] Failed to register for remote notifications: %@", error.localizedDescription);
+}
+
+- (void)_registerAPNsForConfiguredTmuxHostsIfNeeded {
+  NSString *apnsToken = [[NSUserDefaults standardUserDefaults] stringForKey:BLKAPNsTokenDefaultsKey];
+  if (apnsToken.length == 0) {
+    return;
+  }
+
+  for (BKHosts *host in [BKHosts allHosts]) {
+    if (!(host.tmuxPushEnabled.boolValue)) {
+      continue;
+    }
+    NSString *serviceURL = [host.tmuxServiceURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (serviceURL.length == 0) {
+      continue;
+    }
+    [self _registerAPNSToken:apnsToken forTmuxHost:host];
+  }
+}
+
+- (void)_registerAPNSToken:(NSString *)apnsToken forTmuxHost:(BKHosts *)host {
+  NSString *serverURL = [host.tmuxServiceURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (serverURL.length == 0) {
+    return;
+  }
+
+  NSString *normalizedURL = [serverURL hasSuffix:@"/"] ? [serverURL substringToIndex:serverURL.length - 1] : serverURL;
+  NSString *deviceId = host.tmuxPushDeviceId.length > 0 ? host.tmuxPushDeviceId : host.host;
+  NSString *deviceName = host.tmuxPushDeviceName.length > 0 ? host.tmuxPushDeviceName : UIDevice.currentDevice.name;
+  NSString *serverName = host.host.length > 0 ? host.host : @"tshell";
+  if (deviceId.length == 0) {
+    return;
+  }
+
+  NSURL *pairURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/pairings/start"]];
+  if (!pairURL) {
+    return;
+  }
+
+  NSMutableURLRequest *pairRequest = [NSMutableURLRequest requestWithURL:pairURL];
+  pairRequest.HTTPMethod = @"POST";
+  [pairRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  NSDictionary *pairBody = @{
+    @"device_id": deviceId,
+    @"device_name": deviceName,
+    @"server_name": serverName
+  };
+  NSError *pairBodyError = nil;
+  pairRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:pairBody options:0 error:&pairBodyError];
+  if (pairBodyError) {
+    return;
+  }
+
+  NSURLSessionDataTask *pairTask = [[NSURLSession sharedSession] dataTaskWithRequest:pairRequest completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+    if (error || !data) {
+      return;
+    }
+
+    NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+    if (http.statusCode < 200 || http.statusCode > 299) {
+      return;
+    }
+
+    NSError *jsonError = nil;
+    NSDictionary *pairJSON = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+    if (jsonError || ![pairJSON isKindOfClass:NSDictionary.class]) {
+      return;
+    }
+
+    NSString *deviceRegisterToken = pairJSON[@"device_register_token"];
+    if (deviceRegisterToken.length == 0) {
+      return;
+    }
+
+    NSURL *registerURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/devices/register"]];
+    if (!registerURL) {
+      return;
+    }
+
+    NSMutableURLRequest *registerRequest = [NSMutableURLRequest requestWithURL:registerURL];
+    registerRequest.HTTPMethod = @"POST";
+    [registerRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [registerRequest setValue:[NSString stringWithFormat:@"Bearer %@", deviceRegisterToken] forHTTPHeaderField:@"Authorization"];
+
+    #if DEBUG
+      BOOL sandbox = YES;
+    #else
+      BOOL sandbox = NO;
+    #endif
+
+    NSDictionary *registerBody = @{
+      @"token": apnsToken,
+      @"sandbox": @(sandbox),
+      @"device_id": deviceId,
+      @"server_name": serverName
+    };
+    NSError *registerBodyError = nil;
+    registerRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:registerBody options:0 error:&registerBodyError];
+    if (registerBodyError) {
+      return;
+    }
+
+    NSURLSessionDataTask *registerTask = [[NSURLSession sharedSession] dataTaskWithRequest:registerRequest completionHandler:^(NSData * _Nullable registerData, NSURLResponse * _Nullable registerResponse, NSError * _Nullable registerError) {
+      if (registerError || !registerData) {
+        return;
+      }
+
+      NSHTTPURLResponse *registerHTTP = (NSHTTPURLResponse *)registerResponse;
+      if (registerHTTP.statusCode < 200 || registerHTTP.statusCode > 299) {
+        return;
+      }
+
+      NSError *registerJSONError = nil;
+      NSDictionary *registerJSON = [NSJSONSerialization JSONObjectWithData:registerData options:0 error:&registerJSONError];
+      if (registerJSONError || ![registerJSON isKindOfClass:NSDictionary.class]) {
+        return;
+      }
+
+      NSString *deviceApiToken = registerJSON[@"device_api_token"];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        host.tmuxPushDeviceApiToken = deviceApiToken ?: host.tmuxPushDeviceApiToken;
+        [BKHosts saveHosts];
+      });
+    }];
+    [registerTask resume];
+  }];
+  [pairTask resume];
 }
 
 //- (void)_active {
@@ -157,6 +345,48 @@ void __setupProcessEnv(void) {
   [BKPubKey loadIDS];
   [BKHosts loadHosts];
   [AppDelegate _loadProfileVars];
+}
+
++ (NSString * _Nullable)currentAPNSToken {
+  return [[NSUserDefaults standardUserDefaults] stringForKey:BLKAPNsTokenDefaultsKey];
+}
+
++ (void)requestRemoteNotificationsRegistrationIfNeeded {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [UIApplication.sharedApplication registerForRemoteNotifications];
+  });
+}
+
++ (NSString * _Nullable)tmuxAPNsPrivateKeyForHostAlias:(NSString *)hostAlias {
+  NSString *alias = [hostAlias stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (alias.length == 0) {
+    return nil;
+  }
+  NSString *keyRef = [BLKTmuxAPNsKeychainPrefix stringByAppendingString:alias];
+  return [_BLKTmuxAPNsKeychain() stringForKey:keyRef];
+}
+
++ (void)setTmuxAPNsPrivateKey:(NSString * _Nullable)privateKey forHostAlias:(NSString *)hostAlias {
+  NSString *alias = [hostAlias stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (alias.length == 0) {
+    return;
+  }
+  NSString *keyRef = [BLKTmuxAPNsKeychainPrefix stringByAppendingString:alias];
+  NSString *value = [privateKey stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (value.length == 0) {
+    [_BLKTmuxAPNsKeychain() removeItemForKey:keyRef];
+    return;
+  }
+  [_BLKTmuxAPNsKeychain() setString:value forKey:keyRef];
+}
+
++ (void)removeTmuxAPNsPrivateKeyForHostAlias:(NSString *)hostAlias {
+  NSString *alias = [hostAlias stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (alias.length == 0) {
+    return;
+  }
+  NSString *keyRef = [BLKTmuxAPNsKeychainPrefix stringByAppendingString:alias];
+  [_BLKTmuxAPNsKeychain() removeItemForKey:keyRef];
 }
 
 + (void)_loadProfileVars {
@@ -194,7 +424,8 @@ void __setupProcessEnv(void) {
 
 - (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
   [[BKiCloudSyncHandler sharedHandler]checkForReachabilityAndSync:nil];
-  // TODO: pass completion handler.
+  BOOL handledTmuxNotification = [SpaceController handleTmuxRemoteNotification:userInfo];
+  completionHandler(handledTmuxNotification ? UIBackgroundFetchResultNewData : UIBackgroundFetchResultNoData);
 }
 
 // MARK: NSUserActivity
@@ -369,11 +600,17 @@ configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completionHandler {
-  SceneDelegate *sceneDelegate = (SceneDelegate *)response.targetScene.delegate;
-  
-  SpaceController *ctrl = sceneDelegate.spaceController;
-  
-  [ctrl moveToShellWithKey:response.notification.request.content.threadIdentifier];
+  NSDictionary *userInfo = response.notification.request.content.userInfo;
+  if ([SpaceController handleTmuxRemoteNotification:userInfo]) {
+    completionHandler();
+    return;
+  }
+
+  if ([response.targetScene.delegate isKindOfClass:[SceneDelegate class]]) {
+    SceneDelegate *sceneDelegate = (SceneDelegate *)response.targetScene.delegate;
+    SpaceController *ctrl = sceneDelegate.spaceController;
+    [ctrl moveToShellWithKey:response.notification.request.content.threadIdentifier];
+  }
   
   completionHandler();
 }

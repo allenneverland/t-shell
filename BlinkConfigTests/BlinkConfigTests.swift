@@ -55,13 +55,26 @@ ControlMaster no
                                 password: "password",
                                 hostKey: "id_rsa",
                                 moshServer: "",
+                                moshPredictOverwrite: "",
+                                moshExperimentalIP: BKMoshExperimentalIP(rawValue: 0),
                                 moshPortRange: "",
                                 startUpCmd: "",
                                 prediction: BKMoshPrediction(rawValue: 0),
                                 proxyCmd: "exec nc %h:%p",
                                 proxyJump: "jumphost",
                                 sshConfigAttachment: sshConfigAttachment,
-                                fpDomainsJSON: "")
+                                fpDomainsJSON: "",
+                                agentForwardPrompt: BKAgentForward(rawValue: 0),
+                                agentForwardKeys: [],
+                                tmuxServiceURL: "",
+                                tmuxServiceToken: "",
+                                tmuxPushDeviceId: "",
+                                tmuxPushDeviceName: "",
+                                tmuxPushDeviceApiToken: "",
+                                tmuxPushEnabled: NSNumber(value: false),
+                                tmuxAPNSKeyID: "",
+                                tmuxAPNSTeamID: "",
+                                tmuxAPNSBundleID: "")
   }
   
   override func tearDownWithError() throws {

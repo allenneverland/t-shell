@@ -79,6 +79,15 @@ static UICKeyChainStore *__get_keychain() {
   _fpDomainsJSON = [coder decodeObjectOfClasses:strings forKey:@"fpDomainsJSON"];
   _agentForwardPrompt = [coder decodeObjectOfClasses:numbers forKey:@"agentForwardPrompt"];
   _agentForwardKeys = [coder decodeArrayOfObjectsOfClass:NSString.class forKey:@"agentForwardKeys"];
+  _tmuxServiceURL = [coder decodeObjectOfClasses:strings forKey:@"tmuxServiceURL"];
+  _tmuxServiceToken = [coder decodeObjectOfClasses:strings forKey:@"tmuxServiceToken"];
+  _tmuxPushDeviceId = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceId"];
+  _tmuxPushDeviceName = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceName"];
+  _tmuxPushDeviceApiToken = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceApiToken"];
+  _tmuxPushEnabled = [coder decodeObjectOfClasses:numbers forKey:@"tmuxPushEnabled"];
+  _tmuxAPNSKeyID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSKeyID"];
+  _tmuxAPNSTeamID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSTeamID"];
+  _tmuxAPNSBundleID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSBundleID"];
   return self;
 }
 
@@ -106,6 +115,15 @@ static UICKeyChainStore *__get_keychain() {
   [encoder encodeObject:_fpDomainsJSON forKey:@"fpDomainsJSON"];
   [encoder encodeObject:_agentForwardPrompt forKey:@"agentForwardPrompt"];
   [encoder encodeObject:_agentForwardKeys forKey:@"agentForwardKeys"];
+  [encoder encodeObject:_tmuxServiceURL forKey:@"tmuxServiceURL"];
+  [encoder encodeObject:_tmuxServiceToken forKey:@"tmuxServiceToken"];
+  [encoder encodeObject:_tmuxPushDeviceId forKey:@"tmuxPushDeviceId"];
+  [encoder encodeObject:_tmuxPushDeviceName forKey:@"tmuxPushDeviceName"];
+  [encoder encodeObject:_tmuxPushDeviceApiToken forKey:@"tmuxPushDeviceApiToken"];
+  [encoder encodeObject:_tmuxPushEnabled forKey:@"tmuxPushEnabled"];
+  [encoder encodeObject:_tmuxAPNSKeyID forKey:@"tmuxAPNSKeyID"];
+  [encoder encodeObject:_tmuxAPNSTeamID forKey:@"tmuxAPNSTeamID"];
+  [encoder encodeObject:_tmuxAPNSBundleID forKey:@"tmuxAPNSBundleID"];
 }
 
 - (id)initWithAlias:(NSString *)alias
@@ -126,6 +144,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
       fpDomainsJSON:(NSString *)fpDomainsJSON
  agentForwardPrompt:(enum BKAgentForward)agentForwardPrompt
    agentForwardKeys:(NSArray<NSString *> *)agentForwardKeys
+     tmuxServiceURL:(NSString *)tmuxServiceURL
+   tmuxServiceToken:(NSString *)tmuxServiceToken
+   tmuxPushDeviceId:(NSString *)tmuxPushDeviceId
+ tmuxPushDeviceName:(NSString *)tmuxPushDeviceName
+tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
+    tmuxPushEnabled:(NSNumber *)tmuxPushEnabled
+      tmuxAPNSKeyID:(NSString *)tmuxAPNSKeyID
+    tmuxAPNSTeamID:(NSString *)tmuxAPNSTeamID
+   tmuxAPNSBundleID:(NSString *)tmuxAPNSBundleID
 {
   self = [super init];
   if (self) {
@@ -159,6 +186,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
     _fpDomainsJSON = fpDomainsJSON;
     _agentForwardPrompt = [NSNumber numberWithInt: agentForwardPrompt];
     _agentForwardKeys = agentForwardKeys;
+    _tmuxServiceURL = tmuxServiceURL;
+    _tmuxServiceToken = tmuxServiceToken;
+    _tmuxPushDeviceId = tmuxPushDeviceId;
+    _tmuxPushDeviceName = tmuxPushDeviceName;
+    _tmuxPushDeviceApiToken = tmuxPushDeviceApiToken;
+    _tmuxPushEnabled = tmuxPushEnabled;
+    _tmuxAPNSKeyID = tmuxAPNSKeyID;
+    _tmuxAPNSTeamID = tmuxAPNSTeamID;
+    _tmuxAPNSBundleID = tmuxAPNSBundleID;
   }
   return self;
 }
@@ -232,6 +268,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
            fpDomainsJSON:(NSString *)fpDomainsJSON
       agentForwardPrompt:(enum BKAgentForward)agentForwardPrompt
         agentForwardKeys:(NSArray *)agentForwardKeys
+          tmuxServiceURL:(NSString *)tmuxServiceURL
+        tmuxServiceToken:(NSString *)tmuxServiceToken
+        tmuxPushDeviceId:(NSString *)tmuxPushDeviceId
+      tmuxPushDeviceName:(NSString *)tmuxPushDeviceName
+  tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
+         tmuxPushEnabled:(NSNumber *)tmuxPushEnabled
+           tmuxAPNSKeyID:(NSString *)tmuxAPNSKeyID
+         tmuxAPNSTeamID:(NSString *)tmuxAPNSTeamID
+        tmuxAPNSBundleID:(NSString *)tmuxAPNSBundleID
 {
   NSString *pwdRef = @"";
   if (password) {
@@ -260,6 +305,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
                               fpDomainsJSON:fpDomainsJSON
                          agentForwardPrompt:agentForwardPrompt
                            agentForwardKeys:agentForwardKeys
+                              tmuxServiceURL:tmuxServiceURL
+                            tmuxServiceToken:tmuxServiceToken
+                            tmuxPushDeviceId:tmuxPushDeviceId
+                          tmuxPushDeviceName:tmuxPushDeviceName
+                      tmuxPushDeviceApiToken:tmuxPushDeviceApiToken
+                             tmuxPushEnabled:tmuxPushEnabled
+                               tmuxAPNSKeyID:tmuxAPNSKeyID
+                             tmuxAPNSTeamID:tmuxAPNSTeamID
+                            tmuxAPNSBundleID:tmuxAPNSBundleID
     ];
     [__hosts addObject:bkHost];
   } else {
@@ -293,6 +347,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
     bkHost.fpDomainsJSON = fpDomainsJSON;
     bkHost.agentForwardPrompt = [NSNumber numberWithInt: agentForwardPrompt];
     bkHost.agentForwardKeys = agentForwardKeys;
+    bkHost.tmuxServiceURL = tmuxServiceURL;
+    bkHost.tmuxServiceToken = tmuxServiceToken;
+    bkHost.tmuxPushDeviceId = tmuxPushDeviceId;
+    bkHost.tmuxPushDeviceName = tmuxPushDeviceName;
+    bkHost.tmuxPushDeviceApiToken = tmuxPushDeviceApiToken;
+    bkHost.tmuxPushEnabled = tmuxPushEnabled;
+    bkHost.tmuxAPNSKeyID = tmuxAPNSKeyID;
+    bkHost.tmuxAPNSTeamID = tmuxAPNSTeamID;
+    bkHost.tmuxAPNSBundleID = tmuxAPNSBundleID;
   }
   if (![BKHosts saveHosts]) {
     return nil;
@@ -480,6 +543,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
                                    fpDomainsJSON:[hostRecord valueForKey:@"fpDomainsJSON"]
                               agentForwardPrompt:[[hostRecord valueForKey:@"agentForwardPrompt"] intValue]
                                 agentForwardKeys:[hostRecord valueForKey:@"agentForwardKeys"]
+                                  tmuxServiceURL:nil
+                                tmuxServiceToken:nil
+                                tmuxPushDeviceId:nil
+                              tmuxPushDeviceName:nil
+                          tmuxPushDeviceApiToken:nil
+                                 tmuxPushEnabled:nil
+                                   tmuxAPNSKeyID:nil
+                                 tmuxAPNSTeamID:nil
+                                tmuxAPNSBundleID:nil
   ];
 
   return host;

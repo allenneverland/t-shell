@@ -32,6 +32,8 @@
 import CloudKit
 import Combine
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 
 import BlinkFileProvider
 
@@ -401,6 +403,19 @@ struct HostView: View {
   @State private var _proxyCmd: String = ""
   @State private var _proxyJump: String = ""
   @State private var _sshConfigAttachment: String = HostView.__sshConfigAttachmentExample
+  @State private var _tmuxServiceURL: String = ""
+  @State private var _tmuxServiceToken: String = ""
+  @State private var _tmuxPushDeviceId: String = ""
+  @State private var _tmuxPushDeviceName: String = ""
+  @State private var _tmuxPushDeviceApiToken: String = ""
+  @State private var _tmuxPushEnabled: Bool = false
+  @State private var _tmuxAPNSKeyID: String = ""
+  @State private var _tmuxAPNSTeamID: String = ""
+  @State private var _tmuxAPNSBundleID: String = ""
+  @State private var _tmuxAPNSPrivateKey: String = ""
+  @State private var _tmuxImportAPNSFile: Bool = false
+  @State private var _tmuxOnboardingRunning: Bool = false
+  @State private var _tmuxOnboardingStatus: String = ""
 
   @State private var _moshServer: String = ""
   @State private var _moshPort: String = ""
@@ -516,6 +531,41 @@ struct HostView: View {
       }.disabled(!_enabled)
 
       Section(
+        header: Text("TMUX")
+      ) {
+        Field("Service URL", $_tmuxServiceURL, next: "Service Token", placeholder: "https://tmuxd.example.com", enabled: _enabled, kbType: .URL)
+        Field("Service Token", $_tmuxServiceToken, next: "Push Device ID", placeholder: "Optional bearer token", secureTextEntry: true, enabled: _enabled)
+        Field("Push Device ID", $_tmuxPushDeviceId, next: "Push Device Name", placeholder: "Optional device id for pairing", enabled: _enabled)
+        Field("Push Device Name", $_tmuxPushDeviceName, next: "Push Device API Token", placeholder: "Optional display name", enabled: _enabled)
+        Field("Push Device API Token", $_tmuxPushDeviceApiToken, next: "Alias", placeholder: "Optional token", secureTextEntry: true, enabled: _enabled)
+        Field("APNS Key ID", $_tmuxAPNSKeyID, next: "APNS Team ID", placeholder: "ABC123DEFG", enabled: _enabled)
+        Field("APNS Team ID", $_tmuxAPNSTeamID, next: "APNS Bundle ID", placeholder: "TEAM123ABC", enabled: _enabled)
+        Field("APNS Bundle ID", $_tmuxAPNSBundleID, next: "Alias", placeholder: "sh.blink.shell", enabled: _enabled)
+        Button(
+          action: { _tmuxImportAPNSFile = true },
+          label: { Label("Import APNS .p8 File", systemImage: "square.and.arrow.down") }
+        ).disabled(!_enabled)
+        FieldTextArea("APNS Private Key (.p8 or Base64)", $_tmuxAPNSPrivateKey, enabled: _enabled)
+        Toggle("Enable Push Routing", isOn: $_tmuxPushEnabled)
+          .disabled(!_enabled)
+        Button(
+          action: _runTmuxSSHOnboarding,
+          label: {
+            Label(
+              _tmuxOnboardingRunning ? "正在執行一鍵 SSH Onboarding…" : "一鍵 SSH Onboarding（安裝 tmuxd + pairing）",
+              systemImage: "bolt.horizontal.circle"
+            )
+          }
+        )
+        .disabled(!_enabled || _tmuxOnboardingRunning)
+        if !_tmuxOnboardingStatus.isEmpty {
+          Text(_tmuxOnboardingStatus)
+            .font(.footnote)
+            .foregroundColor(.secondary)
+        }
+      }.disabled(!_enabled)
+
+      Section(
         header: Text("SSH AGENT")
       ) {
         FieldAgentForwardPrompt(value: $_agentForwardPrompt, enabled: _enabled)
@@ -573,6 +623,32 @@ struct HostView: View {
         loadHost()
       }
     }
+    .fileImporter(
+      isPresented: $_tmuxImportAPNSFile,
+      allowedContentTypes: [.data, .plainText],
+      allowsMultipleSelection: false
+    ) { result in
+      switch result {
+      case .success(let urls):
+        guard let url = urls.first else {
+          return
+        }
+        do {
+          let data = try Data(contentsOf: url)
+          if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+             !text.isEmpty
+          {
+            _tmuxAPNSPrivateKey = text
+          } else {
+            _errorMessage = "APNS .p8 file is empty or invalid UTF-8."
+          }
+        } catch {
+          _errorMessage = "Failed to import APNS .p8 file: \(error.localizedDescription)"
+        }
+      case .failure(let error):
+        _errorMessage = "APNS file import failed: \(error.localizedDescription)"
+      }
+    }
 
   }
 
@@ -612,6 +688,16 @@ struct HostView: View {
     _moshCommand = host.moshStartup ?? ""
     _agentForwardPrompt.rawValue = UInt32(host.agentForwardPrompt?.intValue ?? 0)
     _agentForwardKeys = host.agentForwardKeys ?? []
+    _tmuxServiceURL = host.tmuxServiceURL ?? ""
+    _tmuxServiceToken = host.tmuxServiceToken ?? ""
+    _tmuxPushDeviceId = host.tmuxPushDeviceId ?? ""
+    _tmuxPushDeviceName = host.tmuxPushDeviceName ?? ""
+    _tmuxPushDeviceApiToken = host.tmuxPushDeviceApiToken ?? ""
+    _tmuxPushEnabled = host.tmuxPushEnabled?.boolValue ?? false
+    _tmuxAPNSKeyID = host.tmuxAPNSKeyID ?? ""
+    _tmuxAPNSTeamID = host.tmuxAPNSTeamID ?? ""
+    _tmuxAPNSBundleID = host.tmuxAPNSBundleID ?? ""
+    _tmuxAPNSPrivateKey = AppDelegate.tmuxAPNsPrivateKey(forHostAlias: _alias) ?? ""
     _enabled = !( _conflictedICloudHost != nil || _iCloudVersion)
 
     if _duplicatedHost == nil {
@@ -658,9 +744,11 @@ struct HostView: View {
   }
 
   private func _saveHost() {
+    let previousAlias = _host?.host.trimmingCharacters(in: .whitespacesAndNewlines)
+    let newAlias = _cleanAlias
     let savedHost = BKHosts.saveHost(
-      _host?.host.trimmingCharacters(in: .whitespacesAndNewlines),
-      withNewHost: _cleanAlias,
+      previousAlias,
+      withNewHost: newAlias,
       hostName: _hostName.trimmingCharacters(in: .whitespacesAndNewlines),
       sshPort: _port.trimmingCharacters(in: .whitespacesAndNewlines),
       user: _user.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -677,11 +765,31 @@ struct HostView: View {
       sshConfigAttachment: _sshConfigAttachment == HostView.__sshConfigAttachmentExample ? "" : _sshConfigAttachment,
       fpDomainsJSON: FileProviderDomain.toJson(list: _domains),
       agentForwardPrompt: _agentForwardPrompt,
-      agentForwardKeys: _agentForwardPrompt == BKAgentForwardNo ? [] : _agentForwardKeys
+      agentForwardKeys: _agentForwardPrompt == BKAgentForwardNo ? [] : _agentForwardKeys,
+      tmuxServiceURL: _tmuxServiceURL.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxServiceToken: _tmuxServiceToken.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxPushDeviceId: _tmuxPushDeviceId.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxPushDeviceName: _tmuxPushDeviceName.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxPushDeviceApiToken: _tmuxPushDeviceApiToken.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxPushEnabled: NSNumber(value: _tmuxPushEnabled),
+      tmuxAPNSKeyID: _tmuxAPNSKeyID.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxAPNSTeamID: _tmuxAPNSTeamID.trimmingCharacters(in: .whitespacesAndNewlines),
+      tmuxAPNSBundleID: _tmuxAPNSBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
     )
 
     guard let host = savedHost else {
       return
+    }
+
+    let privateKey = _tmuxAPNSPrivateKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !newAlias.isEmpty {
+      AppDelegate.setTmuxAPNsPrivateKey(privateKey.isEmpty ? nil : privateKey, forHostAlias: newAlias)
+    }
+    if let previousAlias,
+       !previousAlias.isEmpty,
+       previousAlias != newAlias
+    {
+      AppDelegate.removeTmuxAPNsPrivateKey(forHostAlias: previousAlias)
     }
 
     BKHosts.updateHost(host.host, withiCloudId: host.iCloudRecordId, andLastModifiedTime: Date())
@@ -731,7 +839,16 @@ struct HostView: View {
       sshConfigAttachment: iCloudHost.sshConfigAttachment,
       fpDomainsJSON: iCloudHost.fpDomainsJSON,
       agentForwardPrompt: BKAgentForward(UInt32(iCloudHost.agentForwardPrompt?.intValue ?? 0)),
-      agentForwardKeys: iCloudHost.agentForwardKeys
+      agentForwardKeys: iCloudHost.agentForwardKeys,
+      tmuxServiceURL: host.tmuxServiceURL,
+      tmuxServiceToken: host.tmuxServiceToken,
+      tmuxPushDeviceId: host.tmuxPushDeviceId,
+      tmuxPushDeviceName: host.tmuxPushDeviceName,
+      tmuxPushDeviceApiToken: host.tmuxPushDeviceApiToken,
+      tmuxPushEnabled: host.tmuxPushEnabled,
+      tmuxAPNSKeyID: host.tmuxAPNSKeyID,
+      tmuxAPNSTeamID: host.tmuxAPNSTeamID,
+      tmuxAPNSBundleID: host.tmuxAPNSBundleID
     )
 
     BKHosts.updateHost(
@@ -758,6 +875,109 @@ struct HostView: View {
     syncHandler.check(forReachabilityAndSync: nil)
   }
 
+  private func _runTmuxSSHOnboarding() {
+    guard !_tmuxOnboardingRunning else {
+      return
+    }
+
+    Task { @MainActor in
+      _tmuxOnboardingRunning = true
+      _tmuxOnboardingStatus = "Preparing onboarding…"
+      _errorMessage = ""
+      defer {
+        _tmuxOnboardingRunning = false
+      }
+
+      do {
+        let alias = _cleanAlias
+        if alias.isEmpty {
+          throw ValidationError.general(message: "Alias is required.")
+        }
+
+        let cleanHostName = _hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanHostName.isEmpty {
+          throw ValidationError.general(message: "HostName is required.")
+        }
+
+        let serviceURL = _tmuxServiceURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serviceURL.isEmpty else {
+          throw ValidationError.general(message: "Service URL is required for SSH onboarding.")
+        }
+
+        guard TmuxSSHOnboardingService.normalizeServiceBaseURL(serviceURL) != nil else {
+          throw ValidationError.general(message: "Service URL is invalid. Use http:// or https:// with a host.")
+        }
+
+        let apnsKeyID = _tmuxAPNSKeyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apnsTeamID = _tmuxAPNSTeamID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apnsBundleID = _tmuxAPNSBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apnsKeyID.isEmpty, !apnsTeamID.isEmpty, !apnsBundleID.isEmpty else {
+          throw ValidationError.general(message: "APNS Key ID / Team ID / Bundle ID are required.")
+        }
+
+        guard let apnsKeyBase64 = TmuxSSHOnboardingService.normalizeAPNSKeyBase64(_tmuxAPNSPrivateKey) else {
+          throw ValidationError.general(message: "APNS private key is invalid. Paste .p8 content or base64.")
+        }
+
+        let apnsToken = (AppDelegate.currentAPNSToken() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apnsToken.isEmpty else {
+          AppDelegate.requestRemoteNotificationsRegistrationIfNeeded()
+          throw ValidationError.general(message: "APNs token is not ready. Allow notifications and retry onboarding.")
+        }
+
+        let deviceId = _tmuxPushDeviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          ? alias
+          : _tmuxPushDeviceId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let deviceName = _tmuxPushDeviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          ? UIDevice.current.name
+          : _tmuxPushDeviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        _tmuxPushDeviceId = deviceId
+        _tmuxPushDeviceName = deviceName
+        _tmuxPushEnabled = true
+        _tmuxOnboardingStatus = "Saving host settings…"
+        _saveHost()
+
+        _tmuxOnboardingStatus = "Starting push pairing…"
+        let pairing = try await TmuxSSHOnboardingService.startPairingAndRegister(
+          serviceBaseURL: serviceURL,
+          apnsToken: apnsToken,
+          deviceId: deviceId,
+          deviceName: deviceName,
+          serverName: alias
+        )
+
+        _tmuxPushDeviceApiToken = pairing.deviceApiToken
+        _tmuxPushEnabled = true
+        _tmuxOnboardingStatus = "Persisting pairing result…"
+        _saveHost()
+
+        guard
+          let scene = UIApplication.shared.connectedScenes.activeAppScene(),
+          let sceneDelegate = scene.delegate as? SceneDelegate
+        else {
+          throw ValidationError.general(message: "Cannot open shell right now. Keep Blink in foreground and retry.")
+        }
+
+        let command = TmuxSSHOnboardingService.buildSSHOnboardingCommand(
+          hostAlias: alias,
+          serviceBaseURL: pairing.serviceBaseURL,
+          pairingToken: pairing.pairingToken,
+          apnsKeyBase64: apnsKeyBase64,
+          apnsKeyID: apnsKeyID,
+          apnsTeamID: apnsTeamID,
+          apnsBundleID: apnsBundleID
+        )
+        _tmuxOnboardingStatus = "Opening shell and running onboarding script…"
+        sceneDelegate.spaceController.openShellAndRunCommand(command)
+        _tmuxOnboardingStatus = "Onboarding started in a new shell tab."
+      } catch {
+        _tmuxOnboardingStatus = ""
+        _errorMessage = error.localizedDescription
+      }
+    }
+  }
+
   private func _refreshDomainsList() {
     _domainsListVersion += 1
   }
@@ -772,5 +992,253 @@ fileprivate enum ValidationError: Error, LocalizedError {
     case .general(message: let message, field: _): return message
     case .connection(message: let message): return message
     }
+  }
+}
+
+fileprivate struct TmuxOnboardingPairingResult {
+  let serviceBaseURL: String
+  let pairingToken: String
+  let deviceApiToken: String
+}
+
+fileprivate enum TmuxSSHOnboardingService {
+  private struct StartPairingResponse: Decodable {
+    let pairingToken: String
+    let deviceRegisterToken: String
+
+    enum CodingKeys: String, CodingKey {
+      case pairingToken = "pairing_token"
+      case deviceRegisterToken = "device_register_token"
+    }
+  }
+
+  private struct RegisterDeviceResponse: Decodable {
+    let deviceApiToken: String
+
+    enum CodingKeys: String, CodingKey {
+      case deviceApiToken = "device_api_token"
+    }
+  }
+
+  static func normalizeServiceBaseURL(_ raw: String) -> String? {
+    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty,
+          var components = URLComponents(string: value),
+          let host = components.host,
+          !host.isEmpty
+    else {
+      return nil
+    }
+
+    let scheme = components.scheme?.lowercased()
+    guard scheme == "http" || scheme == "https" else {
+      return nil
+    }
+
+    components.scheme = scheme
+    components.query = nil
+    components.fragment = nil
+    components.user = nil
+    components.password = nil
+    if components.percentEncodedPath == "/" {
+      components.percentEncodedPath = ""
+    }
+
+    guard let normalized = components.string else {
+      return nil
+    }
+    return normalized.hasSuffix("/") ? String(normalized.dropLast()) : normalized
+  }
+
+  static func normalizeAPNSKeyBase64(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return nil
+    }
+
+    if trimmed.contains("-----BEGIN") {
+      guard let data = trimmed.data(using: .utf8) else {
+        return nil
+      }
+      return data.base64EncodedString()
+    }
+
+    let normalized = trimmed.replacingOccurrences(of: "\n", with: "")
+      .replacingOccurrences(of: "\r", with: "")
+    guard Data(base64Encoded: normalized) != nil else {
+      return nil
+    }
+    return normalized
+  }
+
+  static func startPairingAndRegister(
+    serviceBaseURL: String,
+    apnsToken: String,
+    deviceId: String,
+    deviceName: String,
+    serverName: String
+  ) async throws -> TmuxOnboardingPairingResult {
+    guard let baseURL = normalizeServiceBaseURL(serviceBaseURL),
+          let startURL = URL(string: "\(baseURL)/v1/pairings/start"),
+          let registerURL = URL(string: "\(baseURL)/v1/devices/register")
+    else {
+      throw ValidationError.general(message: "Service URL is invalid.")
+    }
+
+    var startRequest = URLRequest(url: startURL)
+    startRequest.httpMethod = "POST"
+    startRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    startRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+      "device_id": deviceId,
+      "device_name": deviceName,
+      "server_name": serverName
+    ])
+
+    let (startData, startResponse) = try await URLSession.shared.data(for: startRequest)
+    let startHTTP = startResponse as? HTTPURLResponse
+    guard let startHTTP, (200...299).contains(startHTTP.statusCode) else {
+      throw ValidationError.general(message: "Pairing start failed (HTTP \(startHTTP?.statusCode ?? -1)).")
+    }
+
+    let pairing = try JSONDecoder().decode(StartPairingResponse.self, from: startData)
+    guard !pairing.pairingToken.isEmpty, !pairing.deviceRegisterToken.isEmpty else {
+      throw ValidationError.general(message: "Pairing start response is missing required tokens.")
+    }
+
+    var registerRequest = URLRequest(url: registerURL)
+    registerRequest.httpMethod = "POST"
+    registerRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    registerRequest.setValue("Bearer \(pairing.deviceRegisterToken)", forHTTPHeaderField: "Authorization")
+
+    #if DEBUG
+    let sandbox = true
+    #else
+    let sandbox = false
+    #endif
+
+    registerRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+      "token": apnsToken,
+      "sandbox": sandbox,
+      "device_id": deviceId,
+      "server_name": serverName
+    ])
+
+    let (registerData, registerResponse) = try await URLSession.shared.data(for: registerRequest)
+    let registerHTTP = registerResponse as? HTTPURLResponse
+    guard let registerHTTP, (200...299).contains(registerHTTP.statusCode) else {
+      throw ValidationError.general(message: "APNs device registration failed (HTTP \(registerHTTP?.statusCode ?? -1)).")
+    }
+
+    let registerResult = try JSONDecoder().decode(RegisterDeviceResponse.self, from: registerData)
+    guard !registerResult.deviceApiToken.isEmpty else {
+      throw ValidationError.general(message: "Service response is missing device API token.")
+    }
+
+    return TmuxOnboardingPairingResult(
+      serviceBaseURL: baseURL,
+      pairingToken: pairing.pairingToken,
+      deviceApiToken: registerResult.deviceApiToken
+    )
+  }
+
+  static func buildSSHOnboardingCommand(
+    hostAlias: String,
+    serviceBaseURL: String,
+    pairingToken: String,
+    apnsKeyBase64: String,
+    apnsKeyID: String,
+    apnsTeamID: String,
+    apnsBundleID: String
+  ) -> String {
+    let serviceURL = shellQuote(serviceBaseURL)
+    let pairingTokenQuoted = shellQuote(pairingToken)
+    let apnsKeyBase64Quoted = shellQuote(apnsKeyBase64)
+    let apnsKeyIDQuoted = shellQuote(apnsKeyID)
+    let apnsTeamIDQuoted = shellQuote(apnsTeamID)
+    let apnsBundleIDQuoted = shellQuote(apnsBundleID)
+    let script = """
+    set -eu
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR"' EXIT
+
+    download() {
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+        return $?
+      fi
+      if command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+        return $?
+      fi
+      return 1
+    }
+
+    install_tmuxd() {
+      os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+      arch="$(uname -m | tr '[:upper:]' '[:lower:]')"
+      case "$os-$arch" in
+        linux-x86_64) candidates="linux-x86_64-gnu linux-x86_64-musl linux-x86_64 linux-amd64" ;;
+        linux-aarch64|linux-arm64) candidates="linux-aarch64-gnu linux-aarch64-musl linux-aarch64 linux-arm64" ;;
+        darwin-arm64|darwin-aarch64) candidates="darwin-aarch64 darwin-arm64" ;;
+        darwin-x86_64) candidates="darwin-x86_64 darwin-amd64" ;;
+        *) echo "Unsupported tmuxd platform: $os-$arch" >&2; exit 1 ;;
+      esac
+
+      selected=""
+      for platform in $candidates; do
+        url="https://github.com/allenneverland/tmux-chat/releases/latest/download/tmuxd-$platform.tar.gz"
+        if download "$url" "$TMPDIR/tmuxd.tgz"; then
+          selected="$url"
+          break
+        fi
+      done
+
+      if [ -z "$selected" ]; then
+        echo "Unable to download tmuxd release asset for $os-$arch" >&2
+        exit 1
+      fi
+
+      tar -xzf "$TMPDIR/tmuxd.tgz" -C "$TMPDIR"
+      bin="$(find "$TMPDIR" -type f -name tmuxd | head -n 1)"
+      [ -n "$bin" ] || { echo "tmuxd binary missing in archive" >&2; exit 1; }
+      mkdir -p "$HOME/.local/bin"
+      install -m 755 "$bin" "$HOME/.local/bin/tmuxd"
+    }
+
+    write_env_file() {
+      mkdir -p "$HOME/.config/tmuxd"
+      umask 077
+      cat > "$HOME/.config/tmuxd/env" <<'EOF'
+      PUSH_SERVER_BASE_URL=\(serviceURL)
+      PUSH_SERVER_COMPAT_NOTIFY_TOKEN=\(pairingTokenQuoted)
+      APNS_KEY_BASE64=\(apnsKeyBase64Quoted)
+      APNS_KEY_ID=\(apnsKeyIDQuoted)
+      APNS_TEAM_ID=\(apnsTeamIDQuoted)
+      APNS_BUNDLE_ID=\(apnsBundleIDQuoted)
+      EOF
+    }
+
+    ensure_tmuxd_running() {
+      mkdir -p "$HOME/.local/state/tmuxd"
+      if pgrep -x tmuxd >/dev/null 2>&1; then
+        pkill -x tmuxd || true
+        sleep 1
+      fi
+      set -a
+      . "$HOME/.config/tmuxd/env"
+      set +a
+      nohup "$HOME/.local/bin/tmuxd" > "$HOME/.local/state/tmuxd/tmuxd.log" 2>&1 &
+    }
+
+    install_tmuxd
+    write_env_file
+    ensure_tmuxd_running
+    """
+
+    return "ssh \(shellQuote(hostAlias)) -t \(shellQuote(script))"
+  }
+
+  private static func shellQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
   }
 }
