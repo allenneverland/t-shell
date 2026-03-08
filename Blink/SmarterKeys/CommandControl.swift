@@ -176,7 +176,7 @@ class CreateShellCommandControl: CommandControl {
 extension CreateShellCommandControl: UIDragInteractionDelegate {
   func dragInteraction(_ interaction: UIDragInteraction, itemsForBeginning session: UIDragSession) -> [UIDragItem] {
     let stringItemProvider = NSItemProvider(object: "Hello World" as NSString)
-    let activity = NSUserActivity(activityType: "com.blink.cmdline")
+    let activity = NSUserActivity(activityType: "com.allenneverland.tshell.cmdline")
     stringItemProvider.registerObject(activity, visibility: .all)
     return [
         UIDragItem(itemProvider: stringItemProvider)

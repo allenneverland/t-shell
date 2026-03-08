@@ -320,7 +320,7 @@ void __setupProcessEnv(void) {
 configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession
                                options:(UISceneConnectionOptions *)options {
   for (NSUserActivity * activity in options.userActivities) {
-    if ([activity.activityType isEqual:@"com.blink.whatsnew"]) {
+    if ([activity.activityType isEqual:@"com.allenneverland.tshell.whatsnew"]) {
       return [UISceneConfiguration configurationWithName:@"whatsnew"
                                              sessionRole:connectingSceneSession.role];
     }

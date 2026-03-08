@@ -376,7 +376,7 @@ extension TermController: TermDeviceDelegate {
     content.body = (data["body"] as? String) ?? ""
     content.sound = .default
     content.threadIdentifier = meta.key.uuidString
-    content.targetContentIdentifier = "blink://open-scene/\(view?.window?.windowScene?.session.persistentIdentifier ?? "")"
+    content.targetContentIdentifier = "tshell://open-scene/\(view?.window?.windowScene?.session.persistentIdentifier ?? "")"
     
     let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
     

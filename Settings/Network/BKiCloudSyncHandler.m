@@ -41,7 +41,7 @@
 
 
 NSString const *BKiCloudSyncDeletedHosts = @"deletedHosts";
-NSString *BKiCloudContainerIdentifier;// MOVED to init @"iCloud.com.carloscabanero.blinkshell";
+NSString *BKiCloudContainerIdentifier;// MOVED to init @"iCloud.com.allenneverland.tshell";
 NSString *BKiCloudZoneName = @"DefaultZone";
 
 static NSMutableDictionary *syncItems = nil;

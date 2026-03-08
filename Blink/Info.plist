@@ -12,7 +12,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>Blink</string>
+	<string>t-shell</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIcons</key>
@@ -90,14 +90,13 @@
 			<key>CFBundleURLIconFile</key>
 			<string></string>
 			<key>CFBundleURLName</key>
-			<string>Blink</string>
+			<string>t-shell</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>https</string>
 				<string>http</string>
 				<string>ssh</string>
-				<string>blinkshell</string>
-				<string>${BLINK_MIGRATION_SCHEME}</string>
+				<string>tshell</string>
 				<string>vscode</string>
 			</array>
 		</dict>
@@ -110,14 +109,14 @@
 	<string>public.app-category.developer-tools</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
-		<string>blinkshell</string>
+		<string>tshell</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSAppleMusicUsageDescription</key>
-	<string>Blink will show current track</string>
+	<string>t-shell will show current track</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>keyboard</string>
 	<key>NSCameraUsageDescription</key>
@@ -125,26 +124,26 @@
 	<key>NSFaceIDUsageDescription</key>
 	<string>Use Face ID with Auto Lock</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Allow geo command to track coordinates only while blink is running</string>
+	<string>Allow geo command to track coordinates only while t-shell is running</string>
 	<key>NSSiriUsageDescription</key>
 	<string>storing commands</string>
 	<key>NSUbiquitousContainers</key>
 	<dict>
-		<key>iCloud.sh.blink.blinkshell</key>
+		<key>iCloud.com.allenneverland.tshell</key>
 		<dict>
 			<key>NSUbiquitousContainerIsDocumentScopePublic</key>
 			<true/>
 			<key>NSUbiquitousContainerName</key>
-			<string>Blink</string>
+			<string>t-shell</string>
 			<key>NSUbiquitousContainerSupportedFolderLevels</key>
 			<string>Any</string>
 		</dict>
 	</dict>
 	<key>NSUserActivityTypes</key>
 	<array>
-		<string>com.blink.cmdline</string>
-		<string>com.blink.session</string>
-		<string>com.blink.whatsnew</string>
+		<string>com.allenneverland.tshell.cmdline</string>
+		<string>com.allenneverland.tshell.session</string>
+		<string>com.allenneverland.tshell.whatsnew</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
