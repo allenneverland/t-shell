@@ -1182,6 +1182,31 @@ fileprivate enum TmuxSSHOnboardingService {
       return 1
     }
 
+    resolve_tmuxd_release_tag() {
+      api="https://api.github.com/repos/allenneverland/t-blink/releases?per_page=100"
+      json=""
+      if command -v curl >/dev/null 2>&1; then
+        json="$(curl -fsSL "$api" || true)"
+      elif command -v wget >/dev/null 2>&1; then
+        json="$(wget -qO- "$api" || true)"
+      else
+        echo "curl or wget is required" >&2
+        exit 1
+      fi
+
+      tag="$(printf '%s\n' "$json" | awk -F'"' '/"tag_name":[[:space:]]*"tmuxd-v/ { print $4; exit }')"
+      if [ -z "$tag" ]; then
+        tag="$(printf '%s\n' "$json" | awk -F'"' '/"tag_name":[[:space:]]*"/ { print $4; exit }')"
+      fi
+
+      if [ -z "$tag" ]; then
+        echo "Unable to resolve tmuxd release tag" >&2
+        exit 1
+      fi
+
+      printf '%s\n' "$tag"
+    }
+
     install_tmuxd() {
       os="$(uname -s | tr '[:upper:]' '[:lower:]')"
       arch="$(uname -m | tr '[:upper:]' '[:lower:]')"
@@ -1193,9 +1218,10 @@ fileprivate enum TmuxSSHOnboardingService {
         *) echo "Unsupported tmuxd platform: $os-$arch" >&2; exit 1 ;;
       esac
 
+      release_tag="$(resolve_tmuxd_release_tag)"
       selected=""
       for platform in $candidates; do
-        url="https://github.com/allenneverland/t-blink/releases/latest/download/tmuxd-$platform.tar.gz"
+        url="https://github.com/allenneverland/t-blink/releases/download/$release_tag/tmuxd-$platform.tar.gz"
         if download "$url" "$TMPDIR/tmuxd.tgz"; then
           selected="$url"
           break

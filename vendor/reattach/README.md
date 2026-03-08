@@ -41,3 +41,11 @@ bundle_id = "..."
 cd vendor/reattach/tmuxd
 cargo build --release
 ```
+
+## Release
+
+`tmuxd` release assets are built and published by GitHub Actions.
+
+1. Create and push a tag matching `tmuxd-v*` (for example `tmuxd-v0.2.0`).
+2. Workflow `.github/workflows/release-tmuxd.yml` builds multi-platform binaries.
+3. The workflow uploads `tmuxd-<platform>.tar.gz` assets to the tag release.

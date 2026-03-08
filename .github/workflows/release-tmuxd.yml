@@ -1,0 +1,100 @@
+name: Release tmuxd
+
+on:
+  push:
+    tags:
+      - "tmuxd-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64-gnu
+            apt_packages: ""
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux-x86_64-musl
+            apt_packages: "musl-tools"
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64-gnu
+            apt_packages: "gcc-aarch64-linux-gnu"
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+            apt_packages: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux' && matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Configure cross linker
+        if: runner.os == 'Linux'
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build tmuxd
+        working-directory: vendor/reattach/tmuxd
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Package binary
+        working-directory: vendor/reattach/tmuxd
+        run: |
+          cp "target/${{ matrix.target }}/release/tmuxd" tmuxd
+          chmod +x tmuxd
+          tar -czf "tmuxd-${{ matrix.platform }}.tar.gz" tmuxd
+          shasum -a 256 "tmuxd-${{ matrix.platform }}.tar.gz" > "tmuxd-${{ matrix.platform }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmuxd-${{ matrix.platform }}
+          path: |
+            vendor/reattach/tmuxd/tmuxd-${{ matrix.platform }}.tar.gz
+            vendor/reattach/tmuxd/tmuxd-${{ matrix.platform }}.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tmuxd-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/tmuxd-*.tar.gz
+            dist/tmuxd-*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true

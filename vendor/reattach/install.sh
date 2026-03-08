@@ -29,14 +29,20 @@ else
 fi
 echo "Detected platform: $PLATFORM"
 
-# Get latest release version
+# Get latest tmuxd release tag (prefers tmuxd-v* tags)
+RELEASES_API="https://api.github.com/repos/$REPO/releases?per_page=100"
 if command -v curl > /dev/null 2>&1; then
-    LATEST=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    RELEASES_JSON=$(curl -fsSL "$RELEASES_API")
 elif command -v wget > /dev/null 2>&1; then
-    LATEST=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    RELEASES_JSON=$(wget -qO- "$RELEASES_API")
 else
     echo "Error: curl or wget is required"
     exit 1
+fi
+
+LATEST=$(printf '%s\n' "$RELEASES_JSON" | awk -F'"' '/"tag_name":[[:space:]]*"tmuxd-v/ { print $4; exit }')
+if [ -z "$LATEST" ]; then
+    LATEST=$(printf '%s\n' "$RELEASES_JSON" | awk -F'"' '/"tag_name":[[:space:]]*"/ { print $4; exit }')
 fi
 
 if [ -z "$LATEST" ]; then
@@ -44,7 +50,7 @@ if [ -z "$LATEST" ]; then
     exit 1
 fi
 
-echo "Latest version: $LATEST"
+echo "Selected release tag: $LATEST"
 
 # Download URL
 URL="https://github.com/$REPO/releases/download/$LATEST/tmuxd-$PLATFORM.tar.gz"
