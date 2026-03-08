@@ -287,22 +287,20 @@ impl Database {
         req: StartPairingRequest,
         pairing_ttl_seconds: i64,
     ) -> AppResult<StartPairingResponse> {
-        if req.device_id.trim().is_empty() {
+        let device_id = req.device_id.trim().to_string();
+        if device_id.is_empty() {
             return Err(AppError::bad_request("device_id is required"));
         }
-        if req.device_name.trim().is_empty() {
+
+        let device_name = req.device_name.trim().to_string();
+        if device_name.is_empty() {
             return Err(AppError::bad_request("device_name is required"));
         }
-        if req.server_name.trim().is_empty() {
+
+        let server_name = req.server_name.trim().to_string();
+        if server_name.is_empty() {
             return Err(AppError::bad_request("server_name is required"));
         }
-        let device_name = req
-            .device_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or(req.device_id.as_str())
-            .to_string();
 
         let now = now_utc();
         let expires_at = now + Duration::seconds(pairing_ttl_seconds.max(60));
@@ -351,9 +349,9 @@ impl Database {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8)",
             params![
                 pairing_id,
-                req.device_id,
-                req.device_name,
-                req.server_name,
+                device_id,
+                device_name,
+                server_name,
                 pair_token_id,
                 register_token_id,
                 expires_at.to_rfc3339(),
