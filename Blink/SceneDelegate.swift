@@ -100,6 +100,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   }
 
   @objc private func _showPaywallIfNeeded() {
+    guard !FeatureFlags.noSubscriptionNag else {
+      return
+    }
+
     let entitlements = EntitlementsManager.shared
 
     let doShowPaywall = !entitlements.hasActiveSubscriptions()
