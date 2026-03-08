@@ -499,16 +499,7 @@ fileprivate class KeysObservable: ObservableObject {
   func importFromFile(result: Result<URL, Error>) {
     do {
       let url = try result.get()
-      guard
-        url.startAccessingSecurityScopedResource()
-      else {
-        throw KeyUIError.noReadAccess
-      }
-      defer {
-        url.stopAccessingSecurityScopedResource()
-      }
-
-      let blob = try Data(contentsOf: url, options: .alwaysMapped)
+      let blob = try SecurityScopedFileReader.readData(from: url)
       _importKeyFromBlob(blob: blob, proposedKeyName: url.lastPathComponent)
     } catch {
       _showError(message: error.localizedDescription)

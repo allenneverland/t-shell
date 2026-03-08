@@ -161,3 +161,67 @@ final class ShellRuntimeBootstrapTests: XCTestCase {
     XCTAssertTrue(commands.contains("ssh"))
   }
 }
+
+final class TmuxSSHOnboardingServiceAPNSNormalizationTests: XCTestCase {
+  func testNormalizeAPNSKeyBase64AcceptsPEM() {
+    let pem = """
+-----BEGIN PRIVATE KEY-----
+abc123
+-----END PRIVATE KEY-----
+"""
+    let expected = pem.data(using: .utf8)?.base64EncodedString()
+    XCTAssertEqual(TmuxSSHOnboardingService.normalizeAPNSKeyBase64(pem), expected)
+  }
+
+  func testNormalizeAPNSKeyBase64AcceptsBase64WithLineBreaks() {
+    let input = "YWJj\nMTIz\r\n"
+    XCTAssertEqual(TmuxSSHOnboardingService.normalizeAPNSKeyBase64(input), "YWJjMTIz")
+  }
+
+  func testNormalizeAPNSKeyBase64RejectsInvalidInput() {
+    XCTAssertNil(TmuxSSHOnboardingService.normalizeAPNSKeyBase64("not-a-valid-base64"))
+    XCTAssertNil(TmuxSSHOnboardingService.normalizeAPNSKeyBase64("   "))
+  }
+}
+
+final class SecurityScopedFileReaderTests: XCTestCase {
+  func testReadUTF8TextTrimsWhitespaceAndNewlines() throws {
+    let url = try _temporaryFile(data: " \nmy-key\n ".data(using: .utf8)!)
+    defer { _removeTemporaryFile(url) }
+
+    XCTAssertEqual(try SecurityScopedFileReader.readUTF8Text(from: url), "my-key")
+  }
+
+  func testReadUTF8TextRejectsInvalidUTF8() throws {
+    let url = try _temporaryFile(data: Data([0xFF, 0xFE, 0xFD]))
+    defer { _removeTemporaryFile(url) }
+
+    XCTAssertThrowsError(try SecurityScopedFileReader.readUTF8Text(from: url)) { error in
+      guard case SecurityScopedFileReadError.invalidUTF8 = error else {
+        return XCTFail("Expected invalidUTF8, got \(error)")
+      }
+    }
+  }
+
+  func testReadUTF8TextRejectsEmptyContent() throws {
+    let url = try _temporaryFile(data: " \n\t ".data(using: .utf8)!)
+    defer { _removeTemporaryFile(url) }
+
+    XCTAssertThrowsError(try SecurityScopedFileReader.readUTF8Text(from: url)) { error in
+      guard case SecurityScopedFileReadError.emptyContent = error else {
+        return XCTFail("Expected emptyContent, got \(error)")
+      }
+    }
+  }
+
+  private func _temporaryFile(data: Data) throws -> URL {
+    let url = URL(fileURLWithPath: NSTemporaryDirectory())
+      .appendingPathComponent("blink-security-scoped-\(UUID().uuidString)")
+    try data.write(to: url, options: .atomic)
+    return url
+  }
+
+  private func _removeTemporaryFile(_ url: URL) {
+    try? FileManager.default.removeItem(at: url)
+  }
+}

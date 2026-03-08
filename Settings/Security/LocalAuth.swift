@@ -34,6 +34,82 @@ import Foundation
 import UIKit
 import LocalAuthentication
 
+enum SecurityScopedFileReadError: Error, LocalizedError {
+  case noReadAccess
+  case readFailed(underlying: Error)
+  case emptyContent
+  case invalidUTF8
+
+  var errorDescription: String? {
+    switch self {
+    case .noReadAccess:
+      return "Can't get read access to file."
+    case .readFailed(let underlying):
+      return underlying.localizedDescription
+    case .emptyContent:
+      return "File is empty."
+    case .invalidUTF8:
+      return "File is not valid UTF-8 text."
+    }
+  }
+}
+
+enum SecurityScopedFileReader {
+  static func readData(from url: URL, options: Data.ReadingOptions = .alwaysMapped) throws -> Data {
+    let hasSecurityScope = url.startAccessingSecurityScopedResource()
+    defer {
+      if hasSecurityScope {
+        url.stopAccessingSecurityScopedResource()
+      }
+    }
+
+    var coordinationError: NSError?
+    var readResult: Result<Data, Error>?
+    let coordinator = NSFileCoordinator()
+    coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { coordinatedURL in
+      readResult = Result {
+        try Data(contentsOf: coordinatedURL, options: options)
+      }
+    }
+
+    if let coordinationError {
+      throw _mapError(coordinationError)
+    }
+
+    guard let readResult else {
+      throw SecurityScopedFileReadError.readFailed(underlying: CocoaError(.fileReadUnknown))
+    }
+
+    switch readResult {
+    case .success(let data):
+      return data
+    case .failure(let error):
+      throw _mapError(error)
+    }
+  }
+
+  static func readUTF8Text(from url: URL) throws -> String {
+    let data = try readData(from: url)
+    guard let text = String(data: data, encoding: .utf8) else {
+      throw SecurityScopedFileReadError.invalidUTF8
+    }
+
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      throw SecurityScopedFileReadError.emptyContent
+    }
+    return trimmed
+  }
+
+  private static func _mapError(_ error: Error) -> SecurityScopedFileReadError {
+    let nsError = error as NSError
+    if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoPermissionError {
+      return .noReadAccess
+    }
+    return .readFailed(underlying: error)
+  }
+}
+
 @objc class LocalAuth: NSObject {
   
   @objc static let shared = LocalAuth()

@@ -112,16 +112,7 @@ struct KeyDetailsView: View {
   private func _importCertificateFromFile(result: Result<URL, Error>) {
     do {
       let url = try result.get()
-      guard
-        url.startAccessingSecurityScopedResource()
-      else {
-        throw KeyUIError.noReadAccess
-      }
-      defer {
-        url.stopAccessingSecurityScopedResource()
-      }
-      
-      let blob = try Data(contentsOf: url, options: .alwaysMapped)
+      let blob = try SecurityScopedFileReader.readData(from: url)
       
       try _importCertificateFromBlob(blob)
     } catch {

@@ -634,13 +634,13 @@ struct HostView: View {
           return
         }
         do {
-          let data = try Data(contentsOf: url)
-          if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-             !text.isEmpty
-          {
-            _tmuxAPNSPrivateKey = text
-          } else {
+          _tmuxAPNSPrivateKey = try SecurityScopedFileReader.readUTF8Text(from: url)
+        } catch let error as SecurityScopedFileReadError {
+          switch error {
+          case .emptyContent, .invalidUTF8:
             _errorMessage = "APNS .p8 file is empty or invalid UTF-8."
+          case .noReadAccess, .readFailed:
+            _errorMessage = "Failed to import APNS .p8 file: \(error.localizedDescription)"
           }
         } catch {
           _errorMessage = "Failed to import APNS .p8 file: \(error.localizedDescription)"
@@ -1003,7 +1003,7 @@ fileprivate enum ValidationError: Error, LocalizedError {
   }
 }
 
-fileprivate enum TmuxSSHOnboardingService {
+enum TmuxSSHOnboardingService {
   private struct RegisterDeviceResponse: Decodable {
     let deviceApiToken: String
 
