@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="allenneverland/t-blink"
+REPO="allenneverland/t-shell"
 BINARY="tmuxd"
 
 # Detect OS

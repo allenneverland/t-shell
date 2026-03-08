@@ -1183,7 +1183,7 @@ fileprivate enum TmuxSSHOnboardingService {
     }
 
     resolve_tmuxd_release_tag() {
-      api="https://api.github.com/repos/allenneverland/t-blink/releases?per_page=100"
+      api="https://api.github.com/repos/allenneverland/t-shell/releases?per_page=100"
       json=""
       if command -v curl >/dev/null 2>&1; then
         json="$(curl -fsSL "$api" || true)"
@@ -1221,7 +1221,7 @@ fileprivate enum TmuxSSHOnboardingService {
       release_tag="$(resolve_tmuxd_release_tag)"
       selected=""
       for platform in $candidates; do
-        url="https://github.com/allenneverland/t-blink/releases/download/$release_tag/tmuxd-$platform.tar.gz"
+        url="https://github.com/allenneverland/t-shell/releases/download/$release_tag/tmuxd-$platform.tar.gz"
         if download "$url" "$TMPDIR/tmuxd.tgz"; then
           selected="$url"
           break
