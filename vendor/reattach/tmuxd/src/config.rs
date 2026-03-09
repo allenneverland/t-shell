@@ -144,6 +144,23 @@ impl Config {
     }
 }
 
+pub fn notify_default_port() -> u16 {
+    if let Ok(raw) = std::env::var("TMUXD_PORT") {
+        if let Ok(port) = raw.parse::<u16>() {
+            return port;
+        }
+    }
+
+    let cfg_path = resolve_config_file_path(None);
+    if let Ok(file_cfg) = load_file_config(&cfg_path) {
+        if let Some(port) = file_cfg.port {
+            return port;
+        }
+    }
+
+    DEFAULT_PORT
+}
+
 pub fn default_config_file_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))

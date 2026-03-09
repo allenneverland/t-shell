@@ -63,9 +63,9 @@ enum Commands {
         /// Tmux pane target (e.g., "dev:0.0"). Auto-detected if running inside tmux.
         #[arg(long)]
         target: Option<String>,
-        /// Server port (default: 8787)
-        #[arg(short, long, default_value = "8787")]
-        port: u16,
+        /// Server port (default: uses config.toml port, then 8787)
+        #[arg(short, long)]
+        port: Option<u16>,
         /// Service token. Falls back to TMUXD_SERVICE_TOKEN.
         #[arg(long)]
         service_token: Option<String>,
@@ -341,7 +341,7 @@ async fn run_notify_command(
     body: Option<String>,
     title: Option<String>,
     target: Option<String>,
-    port: u16,
+    port: Option<u16>,
     service_token: Option<String>,
     verbose: bool,
 ) {
@@ -399,7 +399,12 @@ async fn run_notify_command(
         std::process::exit(2);
     }
 
-    let url = format!("http://localhost:{}/v1/push/events/{}", port, source.as_path());
+    let resolved_port = resolve_notify_port(port);
+    let url = format!(
+        "http://localhost:{}/v1/push/events/{}",
+        resolved_port,
+        source.as_path()
+    );
     let body = json!({
         "title": payload.title,
         "body": payload.body,
@@ -431,10 +436,14 @@ async fn run_notify_command(
         }
         Err(e) => {
             eprintln!("Failed to connect to tmuxd: {}", e);
-            eprintln!("Make sure tmuxd daemon is running on port {}", port);
+            eprintln!("Make sure tmuxd daemon is running on port {}", resolved_port);
             std::process::exit(1);
         }
     }
+}
+
+fn resolve_notify_port(port_override: Option<u16>) -> u16 {
+    port_override.unwrap_or_else(config::notify_default_port)
 }
 
 async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
@@ -818,6 +827,9 @@ fn uninstall_codex_hooks() {
 
 const TMUX_MANAGED_START: &str = "# >>> TMUXD START >>>";
 const TMUX_MANAGED_END: &str = "# <<< TMUXD END <<<";
+const TMUX_BELL_TARGET_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
+const TMUX_BELL_TITLE: &str = "tmux bell";
+const TMUX_BELL_BODY: &str = "tmux bell";
 
 fn install_tmux_bell_hook() {
     let tmux_conf = match home_file(".tmux.conf") {
@@ -834,13 +846,10 @@ fn install_tmux_bell_hook() {
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "tmuxd".to_string());
 
-    let run_shell = format!(
-        "{} notify --source bell --target '#{{session_name}}:#{{window_index}}.#{{pane_index}}' --title 'tmux bell' --body 'tmux bell'",
-        shell_quote(&binary)
-    );
-    let escaped = run_shell.replace('\\', "\\\\").replace('"', "\\\"");
+    let run_shell = build_tmux_bell_notify_command(&binary);
+    let escaped = tmux_escape_for_double_quotes(&run_shell);
     let managed = format!(
-        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\nset-hook -g alert-bell \"run-shell \\\"{escaped}\\\"\"\n{TMUX_MANAGED_END}\n"
+        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\nset-hook -g alert-bell \"run-shell -b \\\"{escaped}\\\"\"\n{TMUX_MANAGED_END}\n"
     );
 
     let updated = upsert_managed_tmux_block(&existing, &managed);
@@ -921,15 +930,56 @@ fn managed_tmux_block_range(existing: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn shell_quote(raw: &str) -> String {
-    let mut quoted = String::from("'");
+fn build_tmux_bell_notify_command(binary: &str) -> String {
+    let escaped_binary = shell_escape_double_quoted(binary);
+    let escaped_target = shell_escape_double_quoted(TMUX_BELL_TARGET_FORMAT);
+    let escaped_title = shell_escape_double_quoted(TMUX_BELL_TITLE);
+    let escaped_body = shell_escape_double_quoted(TMUX_BELL_BODY);
+    format!(
+        "\"{}\" notify --source bell --target \"{}\" --title \"{}\" --body \"{}\"",
+        escaped_binary, escaped_target, escaped_title, escaped_body
+    )
+}
+
+fn shell_escape_double_quoted(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("\\$"),
+            '`' => escaped.push_str("\\`"),
+            _ => escaped.push(ch),
         }
     }
-    quoted.push('\'');
-    quoted
+    escaped
+}
+
+fn tmux_escape_for_double_quotes(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_tmux_bell_notify_command, resolve_notify_port, TMUX_BELL_TARGET_FORMAT,
+    };
+
+    #[test]
+    fn notify_port_prefers_override() {
+        assert_eq!(resolve_notify_port(Some(8791)), 8791);
+    }
+
+    #[test]
+    fn bell_notify_command_uses_dynamic_tmux_target_format() {
+        let command = build_tmux_bell_notify_command("/home/allen/.local/bin/tmuxd");
+        assert!(command.contains(TMUX_BELL_TARGET_FORMAT));
+    }
+
+    #[test]
+    fn bell_notify_command_keeps_single_quote_free_prefix() {
+        let command = build_tmux_bell_notify_command("/home/allen/.local/bin/tmuxd");
+        assert!(command.starts_with("\"/home/allen/.local/bin/tmuxd\" notify"));
+        assert!(!command.starts_with("''"));
+    }
 }

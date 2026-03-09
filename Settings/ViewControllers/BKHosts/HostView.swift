@@ -604,7 +604,7 @@ struct HostView: View {
           action: _runTmuxSSHOnboarding,
           label: {
             Label(
-              _tmuxOnboardingRunning ? "正在執行一鍵 SSH Onboarding…" : "一鍵 SSH Onboarding（安裝 tmuxd + APNs）",
+              _tmuxOnboardingRunning ? "正在執行一鍵 SSH Onboarding…" : "一鍵 SSH Onboarding（安裝 tmuxd + APNs + bell hook）",
               systemImage: "bolt.horizontal.circle"
             )
           }
@@ -1064,6 +1064,15 @@ struct HostView: View {
           }
         )
 
+        try await TmuxSSHOnboardingService.sendTestBellNotificationWithRetry(
+          serviceBaseURL: resolvedServiceURL,
+          serviceToken: serviceToken,
+          serverName: prerequisites.alias,
+          onProgress: { status in
+            self._tmuxOnboardingStatus = status
+          }
+        )
+
         _tmuxPushDeviceApiToken = deviceApiToken
         _tmuxPushEnabled = true
         _tmuxOnboardingStatus = "Persisting device token…"
@@ -1264,6 +1273,13 @@ enum TmuxSSHOnboardingService {
     }
   }
 
+  private struct IngestEventResponse: Decodable {
+    let attempted: UInt64
+    let muted: UInt64
+    let delivered: UInt64
+    let failed: UInt64
+  }
+
   private struct RemoteExecResult {
     let command: String
     let stdout: String
@@ -1409,10 +1425,40 @@ enum TmuxSSHOnboardingService {
     return nil
   }
 
+  static func classifyTmuxBellHookFailureMessage(_ raw: String) -> String? {
+    let lower = raw.lowercased()
+
+    if lower.contains("no such file or directory") && lower.contains("tmuxd") {
+      return "tmuxd binary is missing on the host. Re-run onboarding to reinstall tmuxd."
+    }
+
+    if lower.contains("permission denied") && lower.contains(".tmux.conf") {
+      return "Unable to update ~/.tmux.conf while installing bell hook. Ensure ~/.tmux.conf is writable, then retry onboarding."
+    }
+
+    if lower.contains("permission denied") {
+      return "tmux bell hook installation failed due to permission issues. Ensure ~/.local/bin/tmuxd is executable and ~/.tmux.conf is writable, then retry onboarding."
+    }
+
+    if lower.contains("command not found") && lower.contains("tmux") {
+      return "tmux is missing on the host. Install tmux first, then retry onboarding."
+    }
+
+    return nil
+  }
+
   static func tailscaleServeConfigScriptForTesting() -> String {
     tailscaleHTTPSFallbackPorts
       .map { tailscaleServeApplyCommand(port: $0, target: tmuxdLocalProxyTarget) }
       .joined(separator: "\n")
+  }
+
+  static func tmuxBellHookInstallScriptForTesting() -> String {
+    installTmuxBellHookScript()
+  }
+
+  static func tmuxBellHookVerifyScriptForTesting() -> String {
+    verifyTmuxBellHookScript()
   }
 
   static func tmuxdLocalPortCandidatesForTesting() -> [Int] {
@@ -1534,6 +1580,9 @@ enum TmuxSSHOnboardingService {
     await MainActor.run { onProgress("Validating local tmuxd health…") }
     try await runChecked(script: waitForLocalHealthzScript(localPort: runtime.localPort), on: client)
 
+    await MainActor.run { onProgress("Installing tmux bell hook…") }
+    try await installTmuxBellHook(on: client)
+
     await MainActor.run { onProgress("Discovering tailscale HTTPS endpoint…") }
     let discoveredServiceBaseURL = try await resolveTailscaleHTTPSBaseURL(on: client, target: runtime.proxyTarget)
     return RemoteOnboardingResult(discoveredServiceBaseURL: discoveredServiceBaseURL)
@@ -1616,6 +1665,47 @@ enum TmuxSSHOnboardingService {
     )
   }
 
+  static func sendTestBellNotificationWithRetry(
+    serviceBaseURL: String,
+    serviceToken: String,
+    serverName: String,
+    attempts: Int = 3,
+    baseDelayNanos: UInt64 = 700_000_000,
+    onProgress: ((String) -> Void)? = nil
+  ) async throws {
+    let totalAttempts = max(attempts, 1)
+    var lastError: Error?
+    for attempt in 1...totalAttempts {
+      onProgress?("Sending test bell notification (\(attempt)/\(totalAttempts))…")
+      do {
+        let response = try await sendTestBellNotification(
+          serviceBaseURL: serviceBaseURL,
+          serviceToken: serviceToken,
+          serverName: serverName
+        )
+        if response.delivered > 0 {
+          return
+        }
+
+        let summary = "attempted=\(response.attempted), muted=\(response.muted), delivered=\(response.delivered), failed=\(response.failed)"
+        lastError = ValidationError.general(
+          message: "Test bell notification was accepted but not delivered (\(summary))."
+        )
+      } catch {
+        lastError = error
+      }
+
+      if attempt < totalAttempts {
+        let delay = retryDelayNanos(baseDelayNanos: baseDelayNanos, attempt: attempt)
+        try await Task.sleep(nanoseconds: delay)
+      }
+    }
+
+    throw ValidationError.general(
+      message: "Onboarding verification failed: test bell notification could not be delivered (\(lastError?.localizedDescription ?? "unknown error"))."
+    )
+  }
+
   static func waitForServiceHealthWithRetry(
     serviceBaseURL: String,
     attempts: Int = 8,
@@ -1695,6 +1785,49 @@ enum TmuxSSHOnboardingService {
       throw ValidationError.general(message: "Service response is missing device API token.")
     }
     return registerResult.deviceApiToken
+  }
+
+  private static func sendTestBellNotification(
+    serviceBaseURL: String,
+    serviceToken: String,
+    serverName: String
+  ) async throws -> IngestEventResponse {
+    guard let baseURL = normalizeServiceBaseURL(serviceBaseURL),
+          let notifyURL = URL(string: "\(baseURL)/v1/push/events/bell")
+    else {
+      throw ValidationError.general(message: "Tmux endpoint is invalid.")
+    }
+
+    var notifyRequest = URLRequest(url: notifyURL)
+    notifyRequest.httpMethod = "POST"
+    notifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    notifyRequest.setValue("Bearer \(serviceToken)", forHTTPHeaderField: "Authorization")
+    notifyRequest.timeoutInterval = 8
+
+    let testToken = String(UUID().uuidString.prefix(8))
+    notifyRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+      "title": "tmux bell",
+      "body": "\(serverName) onboarding bell test \(testToken)"
+    ])
+
+    let notifyData: Data
+    let notifyResponse: URLResponse
+    do {
+      (notifyData, notifyResponse) = try await networkSession.data(for: notifyRequest)
+    } catch {
+      throw ValidationError.general(message: "Test bell transport error: \(transportErrorMessage(error)).")
+    }
+
+    let notifyHTTP = notifyResponse as? HTTPURLResponse
+    guard let notifyHTTP, (200...299).contains(notifyHTTP.statusCode) else {
+      throw ValidationError.general(message: "Test bell request failed (HTTP \(notifyHTTP?.statusCode ?? -1)).")
+    }
+
+    do {
+      return try JSONDecoder().decode(IngestEventResponse.self, from: notifyData)
+    } catch {
+      throw ValidationError.general(message: "Test bell response decode failed: \(error.localizedDescription)")
+    }
   }
 
   private static func checkServiceHealth(serviceBaseURL: String) async throws {
@@ -1884,6 +2017,31 @@ enum TmuxSSHOnboardingService {
     )
   }
 
+  private static func installTmuxBellHook(on client: SSH.SSHClient) async throws {
+    do {
+      try await runChecked(script: installTmuxBellHookScript(), on: client)
+      let validation = try await runChecked(script: verifyTmuxBellHookScript(), on: client)
+      let output = validation.stdout.lowercased()
+      guard output.contains("notify --source bell") else {
+        throw ValidationError.general(
+          message: "tmux alert-bell hook is not configured with tmuxd notify."
+        )
+      }
+    } catch {
+      let raw = error.localizedDescription
+      var message = "Failed to install tmux bell hook."
+      if let guidance = classifyTmuxBellHookFailureMessage(raw) {
+        message += "\n\(guidance)"
+      } else {
+        message += "\nEnsure ~/.local/bin/tmuxd is executable and ~/.tmux.conf is writable, then retry onboarding."
+      }
+      if !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        message += "\n\(raw)"
+      }
+      throw ValidationError.general(message: message)
+    }
+  }
+
   private static func runChecked(
     script: String,
     on client: SSH.SSHClient
@@ -2064,6 +2222,22 @@ enum TmuxSSHOnboardingService {
     [ -n "$bin" ] || { echo "tmuxd binary missing in archive" >&2; exit 1; }
     mkdir -p "$HOME/.local/bin"
     install -m 755 "$bin" "$HOME/.local/bin/tmuxd"
+    """
+  }
+
+  private static func installTmuxBellHookScript() -> String {
+    """
+    set -eu
+    "$HOME/.local/bin/tmuxd" hooks install
+    """
+  }
+
+  private static func verifyTmuxBellHookScript() -> String {
+    """
+    set -eu
+    hooks="$(tmux show-hooks -g alert-bell 2>/dev/null || true)"
+    printf '%s\\n' "$hooks"
+    printf '%s' "$hooks" | grep -F "notify --source bell" >/dev/null
     """
   }
 

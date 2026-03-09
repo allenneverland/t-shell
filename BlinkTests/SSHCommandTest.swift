@@ -476,6 +476,24 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertFalse(commands.contains(where: { $0.contains("--https=443 ") }))
   }
 
+  func testTmuxBellHookInstallScriptUsesManagedTmuxdBinary() {
+    let script = TmuxSSHOnboardingService.tmuxBellHookInstallScriptForTesting()
+    XCTAssertTrue(script.contains("\"$HOME/.local/bin/tmuxd\" hooks install"))
+  }
+
+  func testTmuxBellHookVerifyScriptChecksNotifyBellHook() {
+    let script = TmuxSSHOnboardingService.tmuxBellHookVerifyScriptForTesting()
+    XCTAssertTrue(script.contains("tmux show-hooks -g alert-bell"))
+    XCTAssertTrue(script.contains("grep -F \"notify --source bell\""))
+  }
+
+  func testClassifyTmuxBellHookFailurePermissionDeniedMentionsTmuxConf() {
+    let output = "Remote command failed with exit status 1.\nstderr:\npermission denied: /home/dev/.tmux.conf"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains(".tmux.conf") ?? false)
+  }
+
   func testManagedTmuxdLocalPortCandidates() {
     XCTAssertEqual(TmuxSSHOnboardingService.tmuxdLocalPortCandidatesForTesting(), [8787, 8790, 8791])
   }
