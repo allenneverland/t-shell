@@ -20,7 +20,7 @@ use axum::{
     routing::{delete, get, post},
     Extension, Router,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::ServeArgs;
 use db::Database;
 use error::AppResult;
@@ -101,6 +101,18 @@ enum HookAction {
     Install,
     /// Uninstall Claude Code + Codex + tmux alert-bell hooks
     Uninstall,
+    /// Verify tmux alert-bell hook status
+    Verify(HookVerifyArgs),
+}
+
+#[derive(Args)]
+struct HookVerifyArgs {
+    /// Output verification report as JSON
+    #[arg(long)]
+    json: bool,
+    /// Return non-zero when verification is not fully healthy
+    #[arg(long)]
+    strict: bool,
 }
 
 #[tokio::main]
@@ -142,8 +154,7 @@ async fn main() {
             Ok(())
         }
         Some(Commands::Hooks { action }) => {
-            run_hooks_command(action);
-            Ok(())
+            run_hooks_command(action).map_err(error::AppError::internal)
         }
         None => run_daemon(None).await,
     };
@@ -436,7 +447,10 @@ async fn run_notify_command(
         }
         Err(e) => {
             eprintln!("Failed to connect to tmuxd: {}", e);
-            eprintln!("Make sure tmuxd daemon is running on port {}", resolved_port);
+            eprintln!(
+                "Make sure tmuxd daemon is running on port {}",
+                resolved_port
+            );
             std::process::exit(1);
         }
     }
@@ -491,12 +505,18 @@ async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
         .route("/v1/tmux/sessions", get(control_api::list_sessions))
         .route("/v1/tmux/sessions", post(control_api::create_session))
         .route("/v1/tmux/panes/{target}", delete(control_api::delete_pane))
-        .route("/v1/tmux/panes/{target}/input", post(control_api::send_input))
+        .route(
+            "/v1/tmux/panes/{target}/input",
+            post(control_api::send_input),
+        )
         .route(
             "/v1/tmux/panes/{target}/input-events",
             post(control_api::send_input_events),
         )
-        .route("/v1/tmux/panes/{target}/key", post(control_api::send_key_legacy))
+        .route(
+            "/v1/tmux/panes/{target}/key",
+            post(control_api::send_key_legacy),
+        )
         .route(
             "/v1/tmux/panes/{target}/keys",
             post(control_api::send_keys_legacy),
@@ -505,7 +525,10 @@ async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
             "/v1/tmux/panes/{target}/escape",
             post(control_api::send_escape),
         )
-        .route("/v1/tmux/panes/{target}/output", get(control_api::get_output))
+        .route(
+            "/v1/tmux/panes/{target}/output",
+            get(control_api::get_output),
+        )
         .layer(Extension(key_dispatcher))
         .layer(middleware::from_fn_with_state(
             config.clone(),
@@ -522,7 +545,10 @@ async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
         ));
 
     let push_device_api_routes = Router::new()
-        .route("/v1/push/mutes", get(push_api::list_mutes).post(push_api::create_mute))
+        .route(
+            "/v1/push/mutes",
+            get(push_api::list_mutes).post(push_api::create_mute),
+        )
         .route("/v1/push/mutes/{id}", delete(push_api::delete_mute))
         .route("/v1/push/metrics/ios", post(push_api::ingest_ios_metrics));
 
@@ -574,19 +600,98 @@ async fn service_auth_middleware(
     Ok(next.run(request).await)
 }
 
-fn run_hooks_command(action: Option<HookAction>) {
+fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
     match action.unwrap_or(HookAction::Install) {
         HookAction::Install => {
             install_claude_hooks();
             install_codex_hooks();
-            install_tmux_bell_hook();
+            install_tmux_bell_hook()
         }
         HookAction::Uninstall => {
             uninstall_claude_hooks();
             uninstall_codex_hooks();
-            uninstall_tmux_bell_hook();
+            uninstall_tmux_bell_hook()
+        }
+        HookAction::Verify(args) => {
+            let binary = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "tmuxd".to_string());
+            let report = verify_tmux_bell_hook(&binary);
+
+            if args.json {
+                let json = serde_json::to_string(&report)
+                    .map_err(|e| format!("failed to serialize verify report: {e}"))?;
+                println!("{json}");
+            } else {
+                println!(
+                    "persistent_config_ok={}",
+                    if report.persistent_config_ok {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "runtime_server_present={}",
+                    if report.runtime_server_present {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "runtime_hook_ok={}",
+                    if report.runtime_hook_ok {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "overall_ok={}",
+                    if report.overall_ok { "true" } else { "false" }
+                );
+                if !report.reasons.is_empty() {
+                    println!("reasons:");
+                    for reason in &report.reasons {
+                        println!("  - {reason}");
+                    }
+                }
+                if !report.warnings.is_empty() {
+                    println!("warnings:");
+                    for warning in &report.warnings {
+                        println!("  - {warning}");
+                    }
+                }
+            }
+
+            if args.strict && !report.overall_ok {
+                return Err(format!(
+                    "tmux bell hook verification failed: {}",
+                    report.reasons.join("; ")
+                ));
+            }
+            Ok(())
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct HookVerifyReport {
+    persistent_config_ok: bool,
+    runtime_server_present: bool,
+    runtime_hook_ok: bool,
+    overall_ok: bool,
+    reasons: Vec<String>,
+    warnings: Vec<String>,
+}
+
+enum RuntimeHookProbe {
+    HookOutput(String),
+    ServerNotRunning(String),
+    MissingTmuxBinary,
+    QueryFailed(String),
 }
 
 fn home_file(path: &str) -> Option<std::path::PathBuf> {
@@ -831,12 +936,11 @@ const TMUX_BELL_TARGET_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_in
 const TMUX_BELL_TITLE: &str = "tmux bell";
 const TMUX_BELL_BODY: &str = "tmux bell";
 
-fn install_tmux_bell_hook() {
+fn install_tmux_bell_hook() -> Result<(), String> {
     let tmux_conf = match home_file(".tmux.conf") {
         Some(path) => path,
         None => {
-            eprintln!("Failed to resolve ~/.tmux.conf path");
-            return;
+            return Err("failed to resolve ~/.tmux.conf path".to_string());
         }
     };
 
@@ -854,41 +958,299 @@ fn install_tmux_bell_hook() {
 
     let updated = upsert_managed_tmux_block(&existing, &managed);
     if updated != existing {
-        if let Err(e) = std::fs::write(&tmux_conf, updated) {
-            eprintln!("Failed to write {}: {}", tmux_conf.display(), e);
-            return;
-        }
+        std::fs::write(&tmux_conf, updated)
+            .map_err(|e| format!("failed to write {}: {e}", tmux_conf.display()))?;
         println!("Updated {}", tmux_conf.display());
     }
 
-    let _ = std::process::Command::new("tmux")
-        .arg("source-file")
-        .arg(tmux_conf.to_string_lossy().to_string())
-        .status();
+    match apply_runtime_tmux_bell_hook(&run_shell)? {
+        RuntimeApplyResult::Applied => {
+            println!("Applied tmux alert-bell runtime hook");
+        }
+        RuntimeApplyResult::NoServerRunning => {
+            eprintln!(
+                "tmux server is not running; persisted ~/.tmux.conf and skipped runtime hook apply"
+            );
+        }
+    }
+
+    let report = verify_tmux_bell_hook(&binary);
+    if !report.persistent_config_ok {
+        return Err(format!(
+            "persistent tmux bell hook verification failed: {}",
+            report.reasons.join("; ")
+        ));
+    }
+    if report.runtime_server_present && !report.runtime_hook_ok {
+        return Err(format!(
+            "runtime tmux bell hook verification failed: {}",
+            report.reasons.join("; ")
+        ));
+    }
+
+    Ok(())
 }
 
-fn uninstall_tmux_bell_hook() {
+fn uninstall_tmux_bell_hook() -> Result<(), String> {
     let tmux_conf = match home_file(".tmux.conf") {
         Some(path) => path,
         None => {
-            eprintln!("Failed to resolve ~/.tmux.conf path");
-            return;
+            return Err("failed to resolve ~/.tmux.conf path".to_string());
         }
     };
 
     let existing = std::fs::read_to_string(&tmux_conf).unwrap_or_default();
     let updated = remove_managed_tmux_block(&existing);
     if updated != existing {
-        if let Err(e) = std::fs::write(&tmux_conf, updated) {
-            eprintln!("Failed to write {}: {}", tmux_conf.display(), e);
-            return;
-        }
+        std::fs::write(&tmux_conf, updated)
+            .map_err(|e| format!("failed to write {}: {e}", tmux_conf.display()))?;
         println!("Updated {}", tmux_conf.display());
     }
 
-    let _ = std::process::Command::new("tmux")
-        .args(["set-hook", "-gu", "alert-bell"])
-        .status();
+    clear_runtime_tmux_bell_hook()?;
+    Ok(())
+}
+
+fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
+    let run_shell = build_tmux_bell_notify_command(binary);
+    let expected_fragment = format!("run-shell -b \"{}\"", run_shell);
+    let mut reasons = Vec::new();
+    let mut warnings = Vec::new();
+
+    let persistent_config_ok = match home_file(".tmux.conf") {
+        None => {
+            reasons.push("unable to resolve ~/.tmux.conf path".to_string());
+            false
+        }
+        Some(tmux_conf) => match std::fs::read_to_string(&tmux_conf) {
+            Ok(contents) => {
+                if let Some((start, end)) = managed_tmux_block_range(&contents) {
+                    let block = &contents[start..end];
+                    if !block.contains("set-hook -g alert-bell") {
+                        reasons.push(
+                            "managed tmux block is present but alert-bell hook line is missing"
+                                .to_string(),
+                        );
+                        false
+                    } else if !block.contains("notify --source bell") {
+                        reasons.push(
+                            "managed tmux block does not route alert-bell to `notify --source bell`"
+                                .to_string(),
+                        );
+                        false
+                    } else if !block.contains(&expected_fragment) {
+                        reasons.push(
+                            "managed tmux block exists but hook command does not match current tmuxd binary path"
+                                .to_string(),
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    reasons.push("managed tmux block is missing from ~/.tmux.conf".to_string());
+                    false
+                }
+            }
+            Err(e) => {
+                reasons.push(format!("failed to read ~/.tmux.conf: {e}"));
+                false
+            }
+        },
+    };
+
+    let (runtime_server_present, runtime_hook_ok) = match probe_runtime_tmux_alert_hook() {
+        RuntimeHookProbe::HookOutput(output) => {
+            if output.contains("notify --source bell") {
+                (true, true)
+            } else if output.trim() == "alert-bell" {
+                reasons.push(
+                    "runtime alert-bell hook is empty (`tmux show-hooks` returned only `alert-bell`)"
+                        .to_string(),
+                );
+                (true, false)
+            } else {
+                reasons.push(format!(
+                    "runtime alert-bell hook is present but not routed to tmuxd notify: {output}"
+                ));
+                (true, false)
+            }
+        }
+        RuntimeHookProbe::ServerNotRunning(detail) => {
+            if !detail.is_empty() {
+                warnings.push(format!("runtime tmux server is not running ({detail})"));
+            } else {
+                warnings.push("runtime tmux server is not running".to_string());
+            }
+            (false, false)
+        }
+        RuntimeHookProbe::MissingTmuxBinary => {
+            reasons.push("tmux binary is missing on host".to_string());
+            (false, false)
+        }
+        RuntimeHookProbe::QueryFailed(detail) => {
+            reasons.push(format!(
+                "failed to inspect runtime alert-bell hook: {detail}"
+            ));
+            (false, false)
+        }
+    };
+
+    let overall_ok = persistent_config_ok && (!runtime_server_present || runtime_hook_ok);
+    HookVerifyReport {
+        persistent_config_ok,
+        runtime_server_present,
+        runtime_hook_ok,
+        overall_ok,
+        reasons,
+        warnings,
+    }
+}
+
+enum RuntimeApplyResult {
+    Applied,
+    NoServerRunning,
+}
+
+fn apply_runtime_tmux_bell_hook(run_shell: &str) -> Result<RuntimeApplyResult, String> {
+    ensure_tmux_binary_available()?;
+
+    if !tmux_server_is_running()? {
+        return Ok(RuntimeApplyResult::NoServerRunning);
+    }
+
+    run_tmux_command(
+        &["set-window-option", "-g", "monitor-bell", "on"],
+        "set monitor-bell",
+    )?;
+    run_tmux_command(
+        &["set-option", "-g", "bell-action", "any"],
+        "set bell-action",
+    )?;
+
+    let hook_value = format!("run-shell -b \"{}\"", run_shell);
+    let output = std::process::Command::new("tmux")
+        .args(["set-hook", "-g", "alert-bell", hook_value.as_str()])
+        .output()
+        .map_err(|e| format!("failed to execute `tmux set-hook`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`tmux set-hook` failed: {}",
+            format_tmux_command_output(&output)
+        ));
+    }
+    Ok(RuntimeApplyResult::Applied)
+}
+
+fn clear_runtime_tmux_bell_hook() -> Result<(), String> {
+    ensure_tmux_binary_available()?;
+    if !tmux_server_is_running()? {
+        return Ok(());
+    }
+    run_tmux_command(&["set-hook", "-gu", "alert-bell"], "unset alert-bell hook")
+}
+
+fn ensure_tmux_binary_available() -> Result<(), String> {
+    match std::process::Command::new("tmux").arg("-V").output() {
+        Ok(output) => {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "tmux is not usable: {}",
+                    format_tmux_command_output(&output)
+                ))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("tmux command not found on host".to_string())
+        }
+        Err(e) => Err(format!("failed to execute `tmux -V`: {e}")),
+    }
+}
+
+fn tmux_server_is_running() -> Result<bool, String> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions"])
+        .output()
+        .map_err(|e| format!("failed to execute `tmux list-sessions`: {e}"))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let detail = format_tmux_command_output(&output);
+    if is_tmux_no_server_output(&detail) {
+        Ok(false)
+    } else {
+        Err(format!("`tmux list-sessions` failed: {detail}"))
+    }
+}
+
+fn probe_runtime_tmux_alert_hook() -> RuntimeHookProbe {
+    let output = match std::process::Command::new("tmux")
+        .args(["show-hooks", "-g", "alert-bell"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeHookProbe::MissingTmuxBinary;
+        }
+        Err(e) => return RuntimeHookProbe::QueryFailed(e.to_string()),
+    };
+
+    if output.status.success() {
+        let stdout = String::from_utf8(output.stdout).unwrap_or_default();
+        return RuntimeHookProbe::HookOutput(stdout.trim().to_string());
+    }
+
+    let detail = format_tmux_command_output(&output);
+    if is_tmux_no_server_output(&detail) {
+        return RuntimeHookProbe::ServerNotRunning(detail);
+    }
+    RuntimeHookProbe::QueryFailed(detail)
+}
+
+fn run_tmux_command(args: &[&str], context: &str) -> Result<(), String> {
+    let output = std::process::Command::new("tmux")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute `tmux` for {context}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "tmux command failed while {context}: {}",
+            format_tmux_command_output(&output)
+        ))
+    }
+}
+
+fn format_tmux_command_output(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8(output.stderr.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let stdout = String::from_utf8(output.stdout.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut parts = Vec::new();
+    if !stderr.is_empty() {
+        parts.push(stderr);
+    }
+    if !stdout.is_empty() {
+        parts.push(stdout);
+    }
+    if parts.is_empty() {
+        return format!("exit status {}", output.status);
+    }
+    parts.join(" | ")
+}
+
+fn is_tmux_no_server_output(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("no server running")
+        || lower.contains("failed to connect to server")
+        || (lower.contains("no such file or directory") && lower.contains("tmux-"))
 }
 
 fn upsert_managed_tmux_block(existing: &str, managed_block: &str) -> String {
@@ -962,7 +1324,8 @@ fn tmux_escape_for_double_quotes(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tmux_bell_notify_command, resolve_notify_port, TMUX_BELL_TARGET_FORMAT,
+        build_tmux_bell_notify_command, is_tmux_no_server_output, resolve_notify_port,
+        TMUX_BELL_TARGET_FORMAT,
     };
 
     #[test]
@@ -981,5 +1344,24 @@ mod tests {
         let command = build_tmux_bell_notify_command("/home/allen/.local/bin/tmuxd");
         assert!(command.starts_with("\"/home/allen/.local/bin/tmuxd\" notify"));
         assert!(!command.starts_with("''"));
+    }
+
+    #[test]
+    fn tmux_no_server_output_detection_handles_common_messages() {
+        assert!(is_tmux_no_server_output(
+            "failed to connect to server: Connection refused"
+        ));
+        assert!(is_tmux_no_server_output(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(is_tmux_no_server_output(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+        ));
+    }
+
+    #[test]
+    fn tmux_no_server_output_detection_ignores_other_errors() {
+        assert!(!is_tmux_no_server_output("unknown option: --foo"));
+        assert!(!is_tmux_no_server_output("permission denied"));
     }
 }

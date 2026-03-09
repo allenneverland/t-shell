@@ -483,8 +483,7 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
 
   func testTmuxBellHookVerifyScriptChecksNotifyBellHook() {
     let script = TmuxSSHOnboardingService.tmuxBellHookVerifyScriptForTesting()
-    XCTAssertTrue(script.contains("tmux show-hooks -g alert-bell"))
-    XCTAssertTrue(script.contains("grep -F \"notify --source bell\""))
+    XCTAssertTrue(script.contains("\"$HOME/.local/bin/tmuxd\" hooks verify --json"))
   }
 
   func testClassifyTmuxBellHookFailurePermissionDeniedMentionsTmuxConf() {
@@ -492,6 +491,20 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
     XCTAssertNotNil(message)
     XCTAssertTrue(message?.localizedCaseInsensitiveContains(".tmux.conf") ?? false)
+  }
+
+  func testClassifyTmuxBellHookFailureForEmptyRuntimeAlertBellHook() {
+    let output = "Remote command failed with exit status 1.\nstdout:\nalert-bell"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("runtime") ?? false)
+  }
+
+  func testParseTmuxBellHookVerifyJSON() {
+    let json = """
+    {"persistent_config_ok":true,"runtime_server_present":false,"runtime_hook_ok":false,"overall_ok":true,"reasons":[],"warnings":["runtime tmux server is not running"]}
+    """
+    XCTAssertTrue(TmuxSSHOnboardingService.parseTmuxBellHookVerifyJSONForTesting(json))
   }
 
   func testManagedTmuxdLocalPortCandidates() {

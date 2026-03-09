@@ -1280,6 +1280,24 @@ enum TmuxSSHOnboardingService {
     let failed: UInt64
   }
 
+  private struct TmuxBellHookVerifyResponse: Decodable {
+    let persistentConfigOK: Bool
+    let runtimeServerPresent: Bool
+    let runtimeHookOK: Bool
+    let overallOK: Bool
+    let reasons: [String]
+    let warnings: [String]
+
+    enum CodingKeys: String, CodingKey {
+      case persistentConfigOK = "persistent_config_ok"
+      case runtimeServerPresent = "runtime_server_present"
+      case runtimeHookOK = "runtime_hook_ok"
+      case overallOK = "overall_ok"
+      case reasons
+      case warnings
+    }
+  }
+
   private struct RemoteExecResult {
     let command: String
     let stdout: String
@@ -1432,6 +1450,16 @@ enum TmuxSSHOnboardingService {
       return "tmuxd binary is missing on the host. Re-run onboarding to reinstall tmuxd."
     }
 
+    if lower.contains("unrecognized subcommand") && lower.contains("verify") {
+      return "Installed tmuxd is outdated and does not support structured bell hook verification. Re-run onboarding to install the latest tmuxd release."
+    }
+
+    if lower.contains("runtime alert-bell hook is empty") ||
+      lower.contains("runtime tmux bell hook verification failed") ||
+      (lower.contains("alert-bell") && lower.contains("stdout:")) {
+      return "tmux runtime alert-bell hook is empty or not routed to tmuxd notify. Start a tmux session on the host and rerun onboarding so runtime hook can be applied."
+    }
+
     if lower.contains("permission denied") && lower.contains(".tmux.conf") {
       return "Unable to update ~/.tmux.conf while installing bell hook. Ensure ~/.tmux.conf is writable, then retry onboarding."
     }
@@ -1447,6 +1475,17 @@ enum TmuxSSHOnboardingService {
     return nil
   }
 
+  private static func decodeTmuxBellHookVerifyResponse(_ raw: String) -> TmuxBellHookVerifyResponse? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return nil
+    }
+    guard let data = trimmed.data(using: .utf8) else {
+      return nil
+    }
+    return try? JSONDecoder().decode(TmuxBellHookVerifyResponse.self, from: data)
+  }
+
   static func tailscaleServeConfigScriptForTesting() -> String {
     tailscaleHTTPSFallbackPorts
       .map { tailscaleServeApplyCommand(port: $0, target: tmuxdLocalProxyTarget) }
@@ -1459,6 +1498,10 @@ enum TmuxSSHOnboardingService {
 
   static func tmuxBellHookVerifyScriptForTesting() -> String {
     verifyTmuxBellHookScript()
+  }
+
+  static func parseTmuxBellHookVerifyJSONForTesting(_ raw: String) -> Bool {
+    decodeTmuxBellHookVerifyResponse(raw) != nil
   }
 
   static func tmuxdLocalPortCandidatesForTesting() -> [Int] {
@@ -2021,10 +2064,23 @@ enum TmuxSSHOnboardingService {
     do {
       try await runChecked(script: installTmuxBellHookScript(), on: client)
       let validation = try await runChecked(script: verifyTmuxBellHookScript(), on: client)
-      let output = validation.stdout.lowercased()
-      guard output.contains("notify --source bell") else {
+      guard let report = decodeTmuxBellHookVerifyResponse(validation.stdout) else {
         throw ValidationError.general(
-          message: "tmux alert-bell hook is not configured with tmuxd notify."
+          message: "tmuxd hooks verify returned invalid JSON output."
+        )
+      }
+
+      if !report.persistentConfigOK {
+        let reason = report.reasons.first ?? "unknown reason"
+        throw ValidationError.general(
+          message: "tmux persistent bell hook configuration is incomplete: \(reason)"
+        )
+      }
+
+      if report.runtimeServerPresent && !report.runtimeHookOK {
+        let reason = report.reasons.first ?? "runtime hook not configured"
+        throw ValidationError.general(
+          message: "tmux runtime alert-bell hook is not routed to tmuxd notify: \(reason)"
         )
       }
     } catch {
@@ -2235,9 +2291,7 @@ enum TmuxSSHOnboardingService {
   private static func verifyTmuxBellHookScript() -> String {
     """
     set -eu
-    hooks="$(tmux show-hooks -g alert-bell 2>/dev/null || true)"
-    printf '%s\\n' "$hooks"
-    printf '%s' "$hooks" | grep -F "notify --source bell" >/dev/null
+    "$HOME/.local/bin/tmuxd" hooks verify --json
     """
   }
 
