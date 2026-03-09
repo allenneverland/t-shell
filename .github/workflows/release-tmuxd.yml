@@ -58,6 +58,7 @@ jobs:
           fi
 
       - name: Run tmux hook integration tests
+        if: runner.os == 'Linux'
         working-directory: vendor/reattach
         env:
           TMUXD_REQUIRE_TMUX_INTEGRATION: "1"
