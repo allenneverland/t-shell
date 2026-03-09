@@ -1,0 +1,41 @@
+name: Workflow Hygiene
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+  push:
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Lint workflow files
+        uses: rhysd/actionlint@e7d448ef7507c20fc4c88a95d0c448b848cd6127 # v1.7.8
+
+  deprecated-actions-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Block deprecated action versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          disallowed_pattern='actions/cache@v(1|2)|actions/checkout@v(1|2|3)'
+          if grep -R -nE --include='*.yml' --include='*.yaml' "$disallowed_pattern" .github/workflows; then
+            echo "::error title=Deprecated Actions::Found deprecated action versions. Use actions/cache@v4+ and actions/checkout@v4+."
+            exit 1
+          fi
