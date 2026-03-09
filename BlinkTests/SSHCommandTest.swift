@@ -49,6 +49,240 @@ final class SSHCommandTest: XCTestCase {
   }
 }
 
+final class TmuxAttachCommandTests: XCTestCase {
+  func testTokenRoundTripPreservesPayload() throws {
+    let request = TmuxNotificationRequest(hostAlias: "allen", sessionName: "trade", paneTarget: "trade:1.1")
+    let token = try XCTUnwrap(request.tmuxAttachToken)
+    let decoded = try XCTUnwrap(TmuxNotificationRequest.fromTmuxAttachToken(token))
+    XCTAssertEqual(decoded, request)
+  }
+
+  func testBuildInvocationUsesSessionFallbackFromPaneTarget() throws {
+    let request = TmuxNotificationRequest(hostAlias: "allen", sessionName: nil, paneTarget: "market:1.1")
+    let invocation = try TmuxAttachInvocation.build(from: request)
+
+    XCTAssertEqual(invocation.hostAlias, "allen")
+    XCTAssertEqual(invocation.sshArgv, [
+      "ssh",
+      "allen",
+      "-t",
+      "tmux attach-session -t 'market' \\; select-pane -t 'market:1.1'"
+    ])
+    XCTAssertFalse(invocation.remoteCommand.contains("\"'market'\""))
+  }
+
+  func testBuildInvocationEscapesSingleQuotesForRemoteShell() throws {
+    let request = TmuxNotificationRequest(hostAlias: "allen", sessionName: "o'clock", paneTarget: "o'clock:1.1")
+    let invocation = try TmuxAttachInvocation.build(from: request)
+
+    XCTAssertTrue(invocation.remoteCommand.contains("'o'\"'\"'clock'"))
+  }
+
+  func testBuildInvocationRejectsMissingSessionAndUnqualifiedPane() {
+    let request = TmuxNotificationRequest(hostAlias: "allen", sessionName: nil, paneTarget: "pane-without-session")
+    XCTAssertThrowsError(try TmuxAttachInvocation.build(from: request)) { error in
+      XCTAssertEqual(error as? TmuxAttachInvocationError, .missingSessionName("pane-without-session"))
+    }
+  }
+
+  func testTokenArgumentParsingSupportsTwoForms() {
+    XCTAssertEqual(tmuxAttachTokenArgument(from: ["--token", "abc123"]), "abc123")
+    XCTAssertEqual(tmuxAttachTokenArgument(from: ["--token=abc123"]), "abc123")
+    XCTAssertNil(tmuxAttachTokenArgument(from: ["--token"]))
+    XCTAssertNil(tmuxAttachTokenArgument(from: ["--other", "value"]))
+  }
+
+}
+
+final class TmuxControlPlaneRouteTests: XCTestCase {
+  func testNamespacedProfilePaths() {
+    let profile = TmuxControlPlaneProfile.namespacedV1
+    XCTAssertEqual(profile.sessionsPath, "/v1/tmux/sessions")
+    XCTAssertEqual(profile.paneOutputPath(target: "work:1.2", lines: 500), "/v1/tmux/panes/work:1.2/output?lines=500")
+    XCTAssertEqual(profile.paneInputPath(target: "work:1.2"), "/v1/tmux/panes/work:1.2/input")
+    XCTAssertEqual(profile.paneEscapePath(target: "work:1.2"), "/v1/tmux/panes/work:1.2/escape")
+  }
+
+  func testFlatProfilePaths() {
+    let profile = TmuxControlPlaneProfile.flat
+    XCTAssertEqual(profile.sessionsPath, "/sessions")
+    XCTAssertEqual(profile.paneOutputPath(target: "work:1.2", lines: 500), "/panes/work:1.2/output?lines=500")
+    XCTAssertEqual(profile.paneInputPath(target: "work:1.2"), "/panes/work:1.2/input")
+    XCTAssertEqual(profile.paneEscapePath(target: "work:1.2"), "/panes/work:1.2/escape")
+  }
+
+  func testPaneTargetPathEncodingEscapesSlashAndSpace() {
+    XCTAssertEqual(tmuxControlEncodePathComponent("dev path/1.2"), "dev%20path%2F1.2")
+    XCTAssertEqual(tmuxControlEncodePathComponent("session:1.2"), "session:1.2")
+  }
+}
+
+final class TmuxPaneBridgeCodecTests: XCTestCase {
+  private let esc: UInt8 = 0x1b
+
+  func testDecodeControlModeOutputOctalEscapes() {
+    let decoded = tmuxControlModeDecodeValue("hello\\040world\\012")
+    XCTAssertEqual(String(decoding: decoded, as: UTF8.self), "hello world\n")
+  }
+
+  func testDecodeControlModeOutputKeepsBackslash() {
+    let decoded = tmuxControlModeDecodeValue("path\\\\to\\\\bin")
+    XCTAssertEqual(String(decoding: decoded, as: UTF8.self), "path\\to\\bin")
+  }
+
+  func testSendKeysCommandsChunkInput() {
+    let commands = tmuxControlModeSendKeysCommands(
+      paneID: "%17",
+      bytes: Array("abcdef".utf8),
+      chunkSize: 3
+    )
+    XCTAssertEqual(commands, [
+      "send-keys -t '%17' -H 61 62 63\n",
+      "send-keys -t '%17' -H 64 65 66\n"
+    ])
+  }
+
+  func testParseControlModeOutputEvent() {
+    let event = tmuxControlModeParseEvent(line: "%output %17 hello\\040world")
+    XCTAssertEqual(event, .paneOutput(paneID: "%17", payload: Data("hello world".utf8)))
+  }
+
+  func testParseControlModeErrorEvent() {
+    let event = tmuxControlModeParseEvent(line: "%error can't find pane")
+    XCTAssertEqual(event, .error("can't find pane"))
+  }
+
+  func testParseControlModePlainEvent() {
+    let event = tmuxControlModeParseEvent(line: "open terminal failed: not a terminal")
+    XCTAssertEqual(event, .plain("open terminal failed: not a terminal"))
+  }
+
+  func testParseExtendedOutputEventWithAgeAndColon() {
+    let event = tmuxControlModeParseEvent(line: "%extended-output %17 0 : hello\\040world")
+    XCTAssertEqual(event, .paneOutput(paneID: "%17", payload: Data("hello world".utf8)))
+  }
+
+  func testParseExtendedOutputEventWithoutColonDelimiter() {
+    let event = tmuxControlModeParseEvent(line: "%extended-output %17 0 hello\\040world")
+    XCTAssertEqual(event, .paneOutput(paneID: "%17", payload: Data("hello world".utf8)))
+  }
+
+  func testConsumeLinesSupportsCRDelimitedControlModeFrames() {
+    var buffer = Data()
+    let chunk = Data("%output %17 hello\\040world\r%output %17 next\\012\r".utf8)
+    let lines = tmuxControlModeConsumeLines(buffer: &buffer, chunk: chunk)
+    XCTAssertEqual(lines, ["%output %17 hello\\040world", "%output %17 next\\012"])
+    XCTAssertTrue(buffer.isEmpty)
+  }
+
+  func testConsumeLinesStripsDCSFramingFromCCMode() {
+    var buffer = Data()
+    let framingStripper = TmuxControlModeFramingStripper()
+    let prefix = "\u{1B}P1000p"
+    let suffix = "\u{1B}\\"
+    let chunk = Data("\(prefix)%begin 1 2 0\r%exit\r\(suffix)".utf8)
+    let lines = tmuxControlModeConsumeLines(buffer: &buffer, chunk: chunk, framingStripper: framingStripper)
+    XCTAssertEqual(lines, ["%begin 1 2 0", "%exit"])
+    let flushed = tmuxControlModeFlushLines(buffer: &buffer, framingStripper: framingStripper)
+    XCTAssertTrue(flushed.isEmpty)
+  }
+
+  func testFramingStripperPreservesNonCCDCSPayload() {
+    let stripper = TmuxControlModeFramingStripper()
+    let payload = Data([esc, 0x50]) + Data("tmux;raw".utf8) + Data([esc, 0x5c])
+    let output = stripper.process(payload) + stripper.flush()
+    XCTAssertEqual(output, payload)
+  }
+
+  func testCapturePaneCommandQuotesTargetAndClampsLines() {
+    let command = tmuxCapturePaneCommand(paneTarget: "o'clock:1.2", lines: 0)
+    XCTAssertEqual(command, "tmux capture-pane -p -t 'o'\"'\"'clock:1.2' -S -1")
+  }
+
+  func testPassthroughUnwrapperUnwrapsSingleLayerTmuxDCS() {
+    let inner = Data([esc, 0x5d]) + Data("7;file://host/home/allen".utf8) + Data([0x07])
+    let wrapped = _wrapAsTmuxPassthrough(inner, layers: 1)
+    let unwrapper = TmuxPassthroughUnwrapper()
+    XCTAssertEqual(unwrapper.process(wrapped), inner)
+  }
+
+  func testPassthroughUnwrapperUnwrapsNestedTmuxDCS() {
+    let inner = Data([esc, 0x5d]) + Data("7;file://host/work".utf8) + Data([0x07])
+    let wrapped = _wrapAsTmuxPassthrough(inner, layers: 2)
+    let unwrapper = TmuxPassthroughUnwrapper()
+    XCTAssertEqual(unwrapper.process(wrapped), inner)
+  }
+
+  func testPassthroughUnwrapperHandlesChunkBoundaries() {
+    let inner = Data([esc, 0x5d]) + Data("7;file://host/chunk".utf8) + Data([0x07])
+    let wrapped = _wrapAsTmuxPassthrough(inner, layers: 1)
+    let split = wrapped.count / 2
+    let unwrapper = TmuxPassthroughUnwrapper()
+    let part1 = unwrapper.process(wrapped.prefix(split))
+    let part2 = unwrapper.process(wrapped.dropFirst(split))
+    XCTAssertEqual(part1 + part2 + unwrapper.flush(), inner)
+  }
+
+  func testPassthroughUnwrapperKeepsNonTmuxDCS() {
+    let nonTmuxDCS = Data([esc, 0x50]) + Data("plain;dcs".utf8) + Data([esc, 0x5c])
+    let unwrapper = TmuxPassthroughUnwrapper()
+    XCTAssertEqual(unwrapper.process(nonTmuxDCS), nonTmuxDCS)
+  }
+
+  func testOSCFilterConsumesOSC7BELSequence() {
+    let filter = TmuxOSCSequenceFilter()
+    let input = Data("left".utf8)
+      + Data([esc, 0x5d])
+      + Data("7;file://host/home/allen".utf8)
+      + Data([0x07])
+      + Data("right".utf8)
+    let output = filter.process(input) + filter.flush()
+    XCTAssertEqual(output, Data("leftright".utf8))
+    XCTAssertEqual(filter.osc7ConsumedCount, 1)
+  }
+
+  func testOSCFilterConsumesOSC7STAcrossChunks() {
+    let filter = TmuxOSCSequenceFilter()
+    let part1 = Data("a".utf8) + Data([esc, 0x5d]) + Data("7;file://host/work".utf8) + Data([esc])
+    let part2 = Data([0x5c]) + Data("b".utf8)
+    let output = filter.process(part1) + filter.process(part2) + filter.flush()
+    XCTAssertEqual(output, Data("ab".utf8))
+    XCTAssertEqual(filter.osc7ConsumedCount, 1)
+  }
+
+  func testOSCFilterKeepsNonOSC7Sequence() {
+    let filter = TmuxOSCSequenceFilter()
+    let osc8 = Data([esc, 0x5d]) + Data("8;id=1;https://example.com".utf8) + Data([0x07])
+    let output = filter.process(osc8) + filter.flush()
+    XCTAssertEqual(output, osc8)
+    XCTAssertEqual(filter.osc7ConsumedCount, 0)
+  }
+
+  private func _wrapAsTmuxPassthrough(_ payload: Data, layers: Int) -> Data {
+    guard layers > 0 else { return payload }
+    var current = payload
+    for _ in 0..<layers {
+      current = Data([esc, 0x50])
+        + Data("tmux;".utf8)
+        + _doubleEscapes(current)
+        + Data([esc, 0x5c])
+    }
+    return current
+  }
+
+  private func _doubleEscapes(_ payload: Data) -> Data {
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(payload.count * 2)
+    for byte in payload {
+      bytes.append(byte)
+      if byte == esc {
+        bytes.append(byte)
+      }
+    }
+    return Data(bytes)
+  }
+}
+
 final class TmuxNotificationPayloadResolverTests: XCTestCase {
   func testResolvesLegacyCamelCaseFields() {
     let userInfo: [AnyHashable: Any] = [
@@ -153,6 +387,7 @@ final class ShellRuntimeBootstrapTests: XCTestCase {
     XCTAssertTrue(commands.contains("ssh"))
     XCTAssertTrue(commands.contains("scp"))
     XCTAssertTrue(commands.contains("sftp"))
+    XCTAssertTrue(commands.contains("tmux-pane-bridge"))
   }
 
   func testShellRuntimePreparationIsIdempotent() {
