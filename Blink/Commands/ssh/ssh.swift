@@ -1196,7 +1196,6 @@ private final class TmuxControlModeInputBridge: WriterTo {
                 }
                 return self._startBridge(
                   on: conn,
-                  hostAlias: cleanHost,
                   sessionName: cleanSession,
                   paneTarget: cleanPane,
                   paneID: paneID
@@ -1245,7 +1244,6 @@ private final class TmuxControlModeInputBridge: WriterTo {
 
   private func _startBridge(
     on conn: SSH.SSHClient,
-    hostAlias: String,
     sessionName: String,
     paneTarget: String,
     paneID: String
@@ -1296,7 +1294,6 @@ private final class TmuxControlModeInputBridge: WriterTo {
         }
         stream.connect(stdout: outputBridge, stdin: inputBridge, stderr: outputBridge)
         self.device.rawMode = true
-        self._writeBridgeStatus("connected to \(hostAlias) \(sessionName) \(paneTarget) (\(paneID))")
         return conn
       }
       .eraseToAnyPublisher()
@@ -1388,10 +1385,6 @@ private final class TmuxControlModeInputBridge: WriterTo {
     connectCancellable = nil
     connection = nil
     didSendInitialRefresh = false
-  }
-
-  private func _writeBridgeStatus(_ message: String) {
-    tmuxWriteToFD(errstream, data: Data(("[tmux-pane-bridge] \(message)\r\n").utf8))
   }
 
   private func awaitRunLoop() {
