@@ -33,8 +33,6 @@ import Foundation
 import SwiftUI
 import BlinkConfig
 
-import RevenueCat
-
 extension URLCache {
   static let imageCache = URLCache(memoryCapacity: 512*1000*1000, diskCapacity: 10*1000*1000*1000)
 }
@@ -87,7 +85,7 @@ extension URL {
     }
     var components = URLComponents(url: self, resolvingAgainstBaseURL: false)!
     components.queryItems = [
-      URLQueryItem(name: "pid", value: Purchases.shared.appUserID),
+      URLQueryItem(name: "pid", value: RevenueCatRuntime.appUserID),
       URLQueryItem(name: "customer_tier", value: tier())
     ] + additionalParams
     

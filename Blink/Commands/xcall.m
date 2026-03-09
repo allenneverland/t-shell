@@ -59,9 +59,9 @@
     _parseOutputParams = [[NSMutableArray alloc] init];
     _encodeInputParams = [[NSMutableArray alloc] init];
     
-    _xSuccessURL = [NSURL URLWithString: [NSString stringWithFormat:@"blinkshell://x-success/%@", _callID]];
-    _xErrorURL = [NSURL URLWithString: [NSString stringWithFormat:@"blinkshell://x-error/%@", _callID]];
-    _xCancelURL = [NSURL URLWithString: [NSString stringWithFormat:@"blinkshell://x-cancel/%@", _callID]];
+    _xSuccessURL = [NSURL URLWithString: [NSString stringWithFormat:@"tshell://x-success/%@", _callID]];
+    _xErrorURL = [NSURL URLWithString: [NSString stringWithFormat:@"tshell://x-error/%@", _callID]];
+    _xCancelURL = [NSURL URLWithString: [NSString stringWithFormat:@"tshell://x-cancel/%@", _callID]];
   }
   return self;
 }
@@ -362,4 +362,3 @@ int blink_xcall_main(int argc, char *argv[]) {
   
   return [call _exitCode];
 }
-

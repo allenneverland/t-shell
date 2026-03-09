@@ -1,56 +1,66 @@
 name: CI
 
-on: [push]
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-
-    runs-on: macOS-latest
-    #runs-on: macos-13
+    runs-on: macos-14
+    timeout-minutes: 60
 
     steps:
-    # - uses: swift-actions/setup-swift@v1
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
 
-    - name: switch xcode
-      run: sudo xcode-select -s '/Applications/Xcode_15.0.app/Contents/Developer'
+      - name: Detect Xcode version
+        id: xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_version="$(xcodebuild -version | awk '/Xcode/{print $2}')"
+          xcode_build="$(xcodebuild -version | awk '/Build version/{print $3}')"
+          echo "version=${xcode_version}-${xcode_build}" >> "$GITHUB_OUTPUT"
+          xcodebuild -version
 
-    - name: use cache
-      id: cache
-      uses: actions/cache@v2
-      with:
-        path: |
-          xcfs/.build
-          Frameworks/ios_system/xcfs/.build
-        key: ${{ runner.os }}-${{ hashFiles('get_frameworks.sh', 'xcfs/Package.swift') }}
+      - name: Restore frameworks cache
+        id: framework_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            xcfs/.build
+            xcfs/.swiftpm
+            Frameworks/ios_system/xcfs/.build
+          key: ${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-frameworks-${{ hashFiles('get_frameworks.sh', 'xcfs/Package.swift', 'xcfs/Package.resolved', 'Frameworks/ios_system/xcfs/Package.swift', 'Frameworks/ios_system/xcfs/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-frameworks-
+            ${{ runner.os }}-frameworks-
 
-    - name: get frameworks
-      if: steps.cache.outputs.cache-hit != 'true'
-      run: ./get_frameworks.sh
+      - name: Restore resources cache
+        id: resource_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            Resources/vim
+          key: ${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-resources-${{ hashFiles('get_resources.sh', 'Resources/vim/.gitignore') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-resources-
+            ${{ runner.os }}-resources-
 
-    - name: get resources
-      if: steps.cache.outputs.cache-hit != 'true'
-      run: ./get_resources.sh
+      - name: Get frameworks
+        if: steps.framework_cache.outputs.cache-hit != 'true'
+        run: ./get_frameworks.sh
 
-    - name: copy xcconfig
-      run: cp template_setup.xcconfig developer_setup.xcconfig
+      - name: Get resources
+        if: steps.resource_cache.outputs.cache-hit != 'true'
+        run: ./get_resources.sh
 
-    - name: BlinkTests
-      run: xcodebuild -project Blink.xcodeproj -scheme BlinkTests -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPad Air (5th generation)' test | xcpretty
+      - name: Copy xcconfig
+        run: cp template_setup.xcconfig developer_setup.xcconfig
 
-    # - name: actual build
-    #   run: set -o pipefail && xcodebuild archive -project Blink.xcodeproj -scheme Blink -sdk iphoneos -configuration Debug clean build IPHONEOS_DEPLOYMENT_TARGET='16.1' CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO | tee build.log | xcpretty
-
-    # - name: generate unsigned debug ipa
-    #   run: |
-    #     cd ~
-    #     mkdir Payload
-    #     mv ~/Library/Developer/Xcode/Archives/*/*/Products/Applications/Blink.app ~/Payload/
-    #     zip -r Blink.ipa Payload
-    # - name: upload ipa
-    #   uses: actions/upload-artifact@v2.2.0
-    #   with:
-    #     name: 'BlinkShell'
-    #     path: ~/Blink.ipa
+      - name: BlinkTests
+        run: xcodebuild -project Blink.xcodeproj -scheme BlinkTests -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPad Air (5th generation)' test | xcpretty

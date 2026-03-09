@@ -41,6 +41,13 @@ static UICKeyChainStore *__get_keychain() {
   return [UICKeyChainStore keyChainStoreWithService:@"sh.blink.pwd"];
 }
 
+static NSString *__tmux_trimmed_or_empty(NSString *value) {
+  if (!value) {
+    return @"";
+  }
+  return [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
 @implementation BKHosts
 
 + (BOOL) supportsSecureCoding {
@@ -79,6 +86,22 @@ static UICKeyChainStore *__get_keychain() {
   _fpDomainsJSON = [coder decodeObjectOfClasses:strings forKey:@"fpDomainsJSON"];
   _agentForwardPrompt = [coder decodeObjectOfClasses:numbers forKey:@"agentForwardPrompt"];
   _agentForwardKeys = [coder decodeArrayOfObjectsOfClass:NSString.class forKey:@"agentForwardKeys"];
+  _tmuxServiceURL = [coder decodeObjectOfClasses:strings forKey:@"tmuxEndpointOverride"];
+  if (!_tmuxServiceURL) {
+    _tmuxServiceURL = [coder decodeObjectOfClasses:strings forKey:@"tmuxServiceURL"];
+  }
+  _tmuxServiceToken = [coder decodeObjectOfClasses:strings forKey:@"tmuxServiceToken"];
+  _tmuxPushDeviceId = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceId"];
+  _tmuxPushDeviceName = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceName"];
+  _tmuxPushDeviceApiToken = [coder decodeObjectOfClasses:strings forKey:@"tmuxPushDeviceApiToken"];
+  _tmuxLastRegisteredAPNSToken = [coder decodeObjectOfClasses:strings forKey:@"tmuxLastRegisteredAPNSToken"];
+  if (!_tmuxLastRegisteredAPNSToken) {
+    _tmuxLastRegisteredAPNSToken = @"";
+  }
+  _tmuxPushEnabled = [coder decodeObjectOfClasses:numbers forKey:@"tmuxPushEnabled"];
+  _tmuxAPNSKeyID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSKeyID"];
+  _tmuxAPNSTeamID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSTeamID"];
+  _tmuxAPNSBundleID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSBundleID"];
   return self;
 }
 
@@ -106,6 +129,17 @@ static UICKeyChainStore *__get_keychain() {
   [encoder encodeObject:_fpDomainsJSON forKey:@"fpDomainsJSON"];
   [encoder encodeObject:_agentForwardPrompt forKey:@"agentForwardPrompt"];
   [encoder encodeObject:_agentForwardKeys forKey:@"agentForwardKeys"];
+  [encoder encodeObject:_tmuxServiceURL forKey:@"tmuxEndpointOverride"];
+  [encoder encodeObject:_tmuxServiceURL forKey:@"tmuxServiceURL"];
+  [encoder encodeObject:_tmuxServiceToken forKey:@"tmuxServiceToken"];
+  [encoder encodeObject:_tmuxPushDeviceId forKey:@"tmuxPushDeviceId"];
+  [encoder encodeObject:_tmuxPushDeviceName forKey:@"tmuxPushDeviceName"];
+  [encoder encodeObject:_tmuxPushDeviceApiToken forKey:@"tmuxPushDeviceApiToken"];
+  [encoder encodeObject:_tmuxLastRegisteredAPNSToken forKey:@"tmuxLastRegisteredAPNSToken"];
+  [encoder encodeObject:_tmuxPushEnabled forKey:@"tmuxPushEnabled"];
+  [encoder encodeObject:_tmuxAPNSKeyID forKey:@"tmuxAPNSKeyID"];
+  [encoder encodeObject:_tmuxAPNSTeamID forKey:@"tmuxAPNSTeamID"];
+  [encoder encodeObject:_tmuxAPNSBundleID forKey:@"tmuxAPNSBundleID"];
 }
 
 - (id)initWithAlias:(NSString *)alias
@@ -126,6 +160,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
       fpDomainsJSON:(NSString *)fpDomainsJSON
  agentForwardPrompt:(enum BKAgentForward)agentForwardPrompt
    agentForwardKeys:(NSArray<NSString *> *)agentForwardKeys
+     tmuxServiceURL:(NSString *)tmuxServiceURL
+   tmuxServiceToken:(NSString *)tmuxServiceToken
+   tmuxPushDeviceId:(NSString *)tmuxPushDeviceId
+ tmuxPushDeviceName:(NSString *)tmuxPushDeviceName
+tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
+    tmuxPushEnabled:(NSNumber *)tmuxPushEnabled
+      tmuxAPNSKeyID:(NSString *)tmuxAPNSKeyID
+    tmuxAPNSTeamID:(NSString *)tmuxAPNSTeamID
+   tmuxAPNSBundleID:(NSString *)tmuxAPNSBundleID
 {
   self = [super init];
   if (self) {
@@ -159,8 +202,124 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
     _fpDomainsJSON = fpDomainsJSON;
     _agentForwardPrompt = [NSNumber numberWithInt: agentForwardPrompt];
     _agentForwardKeys = agentForwardKeys;
+    _tmuxServiceURL = tmuxServiceURL;
+    _tmuxServiceToken = tmuxServiceToken;
+    _tmuxPushDeviceId = tmuxPushDeviceId;
+    _tmuxPushDeviceName = tmuxPushDeviceName;
+    _tmuxPushDeviceApiToken = tmuxPushDeviceApiToken;
+    _tmuxLastRegisteredAPNSToken = @"";
+    _tmuxPushEnabled = tmuxPushEnabled;
+    _tmuxAPNSKeyID = tmuxAPNSKeyID;
+    _tmuxAPNSTeamID = tmuxAPNSTeamID;
+    _tmuxAPNSBundleID = tmuxAPNSBundleID;
   }
   return self;
+}
+
++ (NSString * _Nullable)tmuxNormalizeBaseURL:(NSString *)rawURL {
+  NSString *value = __tmux_trimmed_or_empty(rawURL);
+  if (value.length == 0) {
+    return nil;
+  }
+
+  NSURLComponents *components = [NSURLComponents componentsWithString:value];
+  if (!components.host.length) {
+    return nil;
+  }
+
+  NSString *scheme = components.scheme.lowercaseString;
+  if (![scheme isEqualToString:@"https"]) {
+    return nil;
+  }
+
+  components.scheme = scheme;
+  components.user = nil;
+  components.password = nil;
+  components.query = nil;
+  components.fragment = nil;
+
+  NSString *path = components.percentEncodedPath.lowercaseString ?: @"";
+  if ([path isEqualToString:@"/"] ||
+      [path isEqualToString:@"/healthz"] ||
+      [path isEqualToString:@"/healthz/"] ||
+      [path isEqualToString:@"/v1/healthz"] ||
+      [path isEqualToString:@"/v1/healthz/"]) {
+    components.percentEncodedPath = @"";
+  }
+
+  NSString *normalized = components.string;
+  if (normalized.length == 0) {
+    return nil;
+  }
+  if ([normalized hasSuffix:@"/"]) {
+    normalized = [normalized substringToIndex:normalized.length - 1];
+  }
+  return normalized;
+}
+
++ (NSString * _Nullable)tmuxDefaultBaseURLForHostName:(NSString *)hostName {
+  NSString *cleanHost = __tmux_trimmed_or_empty(hostName);
+  if (cleanHost.length == 0) {
+    return nil;
+  }
+
+  NSURLComponents *components = [[NSURLComponents alloc] init];
+  components.scheme = @"https";
+  components.host = cleanHost;
+  return [self tmuxNormalizeBaseURL:components.string ?: @""];
+}
+
++ (NSString * _Nullable)tmuxResolvedBaseURLForHost:(BKHosts *)host {
+  NSString *rawOverride = __tmux_trimmed_or_empty(host.tmuxServiceURL);
+  if (rawOverride.length > 0) {
+    return [self tmuxNormalizeBaseURL:rawOverride];
+  }
+  return [self tmuxDefaultBaseURLForHostName:host.hostName ?: @""];
+}
+
++ (BOOL)tmuxEndpointOverrideRequiresHTTPSForHost:(BKHosts *)host {
+  NSString *rawOverride = __tmux_trimmed_or_empty(host.tmuxServiceURL);
+  if (rawOverride.length == 0) {
+    return NO;
+  }
+
+  NSURLComponents *components = [NSURLComponents componentsWithString:rawOverride];
+  NSString *scheme = components.scheme.lowercaseString;
+  return [scheme isEqualToString:@"http"];
+}
+
++ (BOOL)tmuxEndpointOverrideIsInvalidForHost:(BKHosts *)host {
+  NSString *rawOverride = __tmux_trimmed_or_empty(host.tmuxServiceURL);
+  if (rawOverride.length == 0) {
+    return NO;
+  }
+
+  if ([self tmuxEndpointOverrideRequiresHTTPSForHost:host]) {
+    return NO;
+  }
+  return [self tmuxNormalizeBaseURL:rawOverride] == nil;
+}
+
++ (BOOL)_migrateLegacyTmuxEndpointOverrides:(NSArray<BKHosts *> *)hosts {
+  BOOL changed = NO;
+  for (BKHosts *host in hosts) {
+    NSString *raw = __tmux_trimmed_or_empty(host.tmuxServiceURL);
+    NSString *candidate = raw;
+    NSString *normalized = [self tmuxNormalizeBaseURL:raw];
+    if (normalized.length > 0) {
+      candidate = normalized;
+      NSString *defaultBase = [self tmuxDefaultBaseURLForHostName:host.hostName ?: @""];
+      if (defaultBase.length > 0 && [defaultBase isEqualToString:candidate]) {
+        candidate = @"";
+      }
+    }
+
+    if (![raw isEqualToString:candidate]) {
+      host.tmuxServiceURL = candidate;
+      changed = YES;
+    }
+  }
+  return changed;
 }
 
 - (NSString *)password
@@ -232,6 +391,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
            fpDomainsJSON:(NSString *)fpDomainsJSON
       agentForwardPrompt:(enum BKAgentForward)agentForwardPrompt
         agentForwardKeys:(NSArray *)agentForwardKeys
+          tmuxServiceURL:(NSString *)tmuxServiceURL
+        tmuxServiceToken:(NSString *)tmuxServiceToken
+        tmuxPushDeviceId:(NSString *)tmuxPushDeviceId
+      tmuxPushDeviceName:(NSString *)tmuxPushDeviceName
+  tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
+         tmuxPushEnabled:(NSNumber *)tmuxPushEnabled
+           tmuxAPNSKeyID:(NSString *)tmuxAPNSKeyID
+         tmuxAPNSTeamID:(NSString *)tmuxAPNSTeamID
+        tmuxAPNSBundleID:(NSString *)tmuxAPNSBundleID
 {
   NSString *pwdRef = @"";
   if (password) {
@@ -260,6 +428,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
                               fpDomainsJSON:fpDomainsJSON
                          agentForwardPrompt:agentForwardPrompt
                            agentForwardKeys:agentForwardKeys
+                              tmuxServiceURL:tmuxServiceURL
+                            tmuxServiceToken:tmuxServiceToken
+                            tmuxPushDeviceId:tmuxPushDeviceId
+                          tmuxPushDeviceName:tmuxPushDeviceName
+                      tmuxPushDeviceApiToken:tmuxPushDeviceApiToken
+                             tmuxPushEnabled:tmuxPushEnabled
+                               tmuxAPNSKeyID:tmuxAPNSKeyID
+                             tmuxAPNSTeamID:tmuxAPNSTeamID
+                            tmuxAPNSBundleID:tmuxAPNSBundleID
     ];
     [__hosts addObject:bkHost];
   } else {
@@ -293,6 +470,18 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
     bkHost.fpDomainsJSON = fpDomainsJSON;
     bkHost.agentForwardPrompt = [NSNumber numberWithInt: agentForwardPrompt];
     bkHost.agentForwardKeys = agentForwardKeys;
+    bkHost.tmuxServiceURL = tmuxServiceURL;
+    bkHost.tmuxServiceToken = tmuxServiceToken;
+    bkHost.tmuxPushDeviceId = tmuxPushDeviceId;
+    bkHost.tmuxPushDeviceName = tmuxPushDeviceName;
+    bkHost.tmuxPushDeviceApiToken = tmuxPushDeviceApiToken;
+    bkHost.tmuxPushEnabled = tmuxPushEnabled;
+    bkHost.tmuxAPNSKeyID = tmuxAPNSKeyID;
+    bkHost.tmuxAPNSTeamID = tmuxAPNSTeamID;
+    bkHost.tmuxAPNSBundleID = tmuxAPNSBundleID;
+  }
+  if (!bkHost.tmuxLastRegisteredAPNSToken) {
+    bkHost.tmuxLastRegisteredAPNSToken = @"";
   }
   if (![BKHosts saveHosts]) {
     return nil;
@@ -416,6 +605,9 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
   }
   
   __hosts = [result mutableCopy];
+  if ([self _migrateLegacyTmuxEndpointOverrides:__hosts]) {
+    [self saveHosts];
+  }
 }
 
 + (CKRecord *)recordFromHost:(BKHosts *)host
@@ -480,6 +672,15 @@ sshConfigAttachment:(NSString *)sshConfigAttachment
                                    fpDomainsJSON:[hostRecord valueForKey:@"fpDomainsJSON"]
                               agentForwardPrompt:[[hostRecord valueForKey:@"agentForwardPrompt"] intValue]
                                 agentForwardKeys:[hostRecord valueForKey:@"agentForwardKeys"]
+                                  tmuxServiceURL:nil
+                                tmuxServiceToken:nil
+                                tmuxPushDeviceId:nil
+                              tmuxPushDeviceName:nil
+                          tmuxPushDeviceApiToken:nil
+                                 tmuxPushEnabled:nil
+                                   tmuxAPNSKeyID:nil
+                                 tmuxAPNSTeamID:nil
+                                tmuxAPNSBundleID:nil
   ];
 
   return host;

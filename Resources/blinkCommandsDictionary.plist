@@ -44,6 +44,20 @@
 		<string>axR:L:Vo:CGp:i:hqTtvl:F:</string>
 		<string>no</string>
 	</array>
+	<key>tmux-attach</key>
+	<array>
+		<string>MAIN</string>
+		<string>tmux_attach_main</string>
+		<string></string>
+		<string>no</string>
+	</array>
+	<key>tmux-pane-bridge</key>
+	<array>
+		<string>MAIN</string>
+		<string>tmux_pane_bridge_main</string>
+		<string></string>
+		<string>no</string>
+	</array>
 	<key>build</key>
 	<array>
 		<string>MAIN</string>

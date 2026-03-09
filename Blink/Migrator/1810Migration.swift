@@ -83,3 +83,26 @@ class MigrationFileProviderReplicatedExtension: MigrationStep {
     }
   }
 }
+
+class MigrationRestoreUpstreamCoreShortcuts: MigrationStep {
+  var version: Int { get { 1901 } }
+
+  func execute() throws {
+    guard KBTracker.shared.kbAlreadyConfigured() else {
+      return
+    }
+
+    let cfg = KBTracker.shared.loadConfig()
+    let upstreamDefault = KeyShortcut.defaultList
+    if _signatures(of: cfg.shortcuts) != _signatures(of: upstreamDefault) {
+      cfg.shortcuts = upstreamDefault
+      KBTracker.shared.saveAndApply(config: cfg)
+    }
+  }
+
+  private func _signatures(of shortcuts: [KeyShortcut]) -> [String] {
+    shortcuts.map { shortcut in
+      "\(shortcut.action.id)|\(shortcut.modifiers.rawValue)|\(shortcut.input.lowercased())"
+    }
+  }
+}

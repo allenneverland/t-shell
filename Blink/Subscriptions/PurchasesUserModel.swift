@@ -67,6 +67,10 @@ class PurchasesUserModel: ObservableObject {
   static let shared = PurchasesUserModel()
 
   private func refreshProducts() {
+    guard RevenueCatRuntime.isEnabled, RevenueCatRuntime.isConfigured else {
+      RevenueCatRuntime.logDisabledIfNeeded(context: "PurchasesUserModel.refreshProducts")
+      return
+    }
     if self.blinkShellPlusProduct == nil
         || self.classicProduct == nil
         || self.buildBasicProduct == nil
@@ -88,6 +92,9 @@ class PurchasesUserModel: ObservableObject {
 
     guard PublishingOptions.current.contains(.appStore) else {
       self.alertErrorMessage = "Available only in App Store"
+      return
+    }
+    guard _ensureRevenueCatAvailable() else {
       return
     }
 
@@ -116,6 +123,9 @@ class PurchasesUserModel: ObservableObject {
   }
 
   func purchaseBlinkPlusWithTrialValidation(setupTrial: Bool) async -> Bool {
+    guard _ensureRevenueCatAvailable() else {
+      return false
+    }
     let duration: TrialDuration = setupTrial ? .twoWeeks : .no
     
     return await _purchaseWithTrialValidation(product: blinkPlusProduct, setupTrialDuration: duration)
@@ -137,9 +147,12 @@ class PurchasesUserModel: ObservableObject {
     blinkPlusIntroOffer?.status == IntroEligibilityStatus.eligible
   }
 
-  func getUserID() -> String { Purchases.shared.appUserID }
+  func getUserID() -> String { RevenueCatRuntime.appUserID }
 
   private func _purchase(_ product: StoreProduct) async -> Bool {
+    guard _ensureRevenueCatAvailable() else {
+      return false
+    }
     do {
       let result = try await Purchases.shared.purchase(product: product)
       if result.userCancelled {
@@ -248,6 +261,9 @@ class PurchasesUserModel: ObservableObject {
   }
   
   private func _restorePurchases() async {
+    guard _ensureRevenueCatAvailable() else {
+      return
+    }
     self.restoreInProgress = true
 
     defer {
@@ -283,6 +299,9 @@ class PurchasesUserModel: ObservableObject {
   }
 
   private func fetchProducts() {
+    guard RevenueCatRuntime.isEnabled, RevenueCatRuntime.isConfigured else {
+      return
+    }
     Purchases.shared.getProducts([
       ProductBlinkShellClassicID,
       ProductBlinkShellPlusID,
@@ -311,6 +330,9 @@ class PurchasesUserModel: ObservableObject {
   }
 
   private func fetchTrialEligibility() {
+    guard RevenueCatRuntime.isEnabled, RevenueCatRuntime.isConfigured else {
+      return
+    }
     Purchases.shared.checkTrialOrIntroDiscountEligibility(
       productIdentifiers: [
         ProductBlinkBuildBasicID,
@@ -336,6 +358,19 @@ class PurchasesUserModel: ObservableObject {
     case oneWeek
     case twoWeeks
     case oneMonth
+  }
+
+  private func _ensureRevenueCatAvailable() -> Bool {
+    guard RevenueCatRuntime.isEnabled else {
+      self.alertErrorMessage = RevenueCatRuntime.unavailableUserMessage
+      RevenueCatRuntime.logDisabledIfNeeded(context: "PurchasesUserModel.userAction")
+      return false
+    }
+    guard RevenueCatRuntime.isConfigured else {
+      self.alertErrorMessage = "In-app purchases are still initializing. Please try again."
+      return false
+    }
+    return true
   }
 }
 
@@ -434,7 +469,7 @@ extension StoreProduct {
 @objc public class PurchasesUserModelObjc: NSObject {
 
   @objc public static func preparePurchasesUserModel() {
-    configureRevCat()
+    _ = configureRevCat()
     EntitlementsManager.shared.startUpdates()
     _ = PurchasesUserModel.shared
   }

@@ -70,6 +70,7 @@ class SpaceController: UIViewController {
   private var _snippetsVC: SnippetsViewController? = nil
   private var _blinkMenu: BlinkMenu? = nil
   private var _bottomTapAreaView = UIView()
+  private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   
   var safeFrame: CGRect {
     _overlay.frame
@@ -287,6 +288,11 @@ Please go to your subscriptions and cancel one of them!
     
     nc.addObserver(self, selector: #selector(_UISceneWillEnterForegroundNotification(_:)),
                    name: UIScene.willEnterForegroundNotification, object: nil)
+
+    nc.addObserver(self, selector: #selector(_openTmuxPaneFromNotification(_:)),
+                   name: .BLKOpenTmuxPane, object: nil)
+
+    _drainPendingTmuxNotificationIfNeeded()
     
   }
                    
@@ -580,6 +586,43 @@ extension SpaceController: UIStateRestorable {
       
       uiState.keys.forEach { registry.remove(forKey: $0) }
     }
+  }
+
+  @objc static func handleTmuxRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+    guard let request = _tmuxNotificationRequest(from: userInfo) else {
+      return false
+    }
+
+    if
+      let scene = UIApplication.shared.connectedScenes.activeAppScene(),
+      let sceneDelegate = scene.delegate as? SceneDelegate
+    {
+      DispatchQueue.main.async {
+        sceneDelegate.spaceController.openTmuxPane(
+          hostAlias: request.hostAlias,
+          sessionName: request.sessionName,
+          paneTarget: request.paneTarget
+        )
+      }
+      return true
+    }
+
+    _pendingTmuxRequest = request
+
+    NotificationCenter.default.post(
+      name: .BLKOpenTmuxPane,
+      object: nil,
+      userInfo: [
+        "hostAlias": request.hostAlias,
+        "sessionName": request.sessionName ?? "",
+        "paneTarget": request.paneTarget
+      ]
+    )
+    return true
+  }
+
+  fileprivate static func _tmuxNotificationRequest(from userInfo: [AnyHashable: Any]) -> TmuxNotificationRequest? {
+    TmuxNotificationPayloadResolver.resolve(userInfo)
   }
 }
 
@@ -988,7 +1031,7 @@ extension SpaceController {
       self.view.addSubview(menu.tapToCloseView)
       
       var ids: [BlinkActionID] = []
-      ids.append(contentsOf:  [.snippets, .tabClose, .tabCreate])
+      ids.append(contentsOf:  [.snippets, .tabClose, .tabCreate, .tmux])
       
       if DeviceInfo.shared().hasCorners {
         ids.append(contentsOf:  [.layoutMenu])
@@ -1026,6 +1069,212 @@ extension SpaceController {
   @objc func toggleQuickActionsAction() {
     _interactiveSpaceController()
       ._toggleQuickActionActionWith(receiver: self)
+  }
+
+  @objc func showTmuxModeAction() {
+    let receiver = _interactiveSpaceController()
+    if receiver._blinkMenu != nil {
+      receiver.toggleQuickActionsAction()
+    }
+    receiver._presentTmuxHostPicker()
+  }
+
+  private func _presentTmuxHostPicker() {
+    let allHosts = BKHosts.allHosts() ?? []
+    let hosts = allHosts.filter { host in
+      guard let resolved = BKHosts.tmuxResolvedBaseURL(for: host)?.blink_trimmed else {
+        return false
+      }
+      return !resolved.isEmpty
+    }.sorted { ($0.host ?? "") < ($1.host ?? "") }
+
+    guard !hosts.isEmpty else {
+      if allHosts.contains(where: { BKHosts.tmuxEndpointOverrideRequiresHTTPS(for: $0) }) {
+        showAlert(msg: "One or more tmux hosts still use insecure endpoint overrides (http://). Edit host settings and migrate to HTTPS.")
+        return
+      }
+      if allHosts.contains(where: { BKHosts.tmuxEndpointOverrideIsInvalid(for: $0) }) {
+        showAlert(msg: "One or more tmux hosts have invalid endpoint overrides. Edit host settings and use a valid https:// endpoint.")
+        return
+      }
+      showAlert(msg: "No host has a valid tmux endpoint. Edit a host in Settings > Hosts > SSH first.")
+      return
+    }
+
+    let alert = UIAlertController(title: "Tmux Mode", message: "Select host", preferredStyle: .actionSheet)
+    for host in hosts {
+      let alias = host.host ?? "(unknown)"
+      let title = "\(alias)  (\(host.hostName ?? alias))"
+      alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
+        self?._presentTmuxSessionPicker(for: host)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _presentTmuxSessionPicker(for host: BKHosts) {
+    guard let hostAlias = host.host, !hostAlias.blink_trimmed.isEmpty else {
+      showAlert(msg: "This host has an empty alias.")
+      return
+    }
+
+    let hud = MBProgressHUD.showAdded(to: view, animated: true)
+    hud.label.text = "Loading tmux sessions…"
+    Task { [weak self] in
+      defer {
+        DispatchQueue.main.async {
+          hud.hide(animated: true)
+        }
+      }
+
+      do {
+        let sessions = try await TmuxControlPlaneClient.listSessions(for: host)
+        await MainActor.run {
+          self?._showTmuxSessionPicker(hostAlias: hostAlias, sessions: sessions)
+        }
+      } catch let controlError as TmuxControlError {
+        await MainActor.run {
+          self?.showAlert(msg: controlError.localizedDescription)
+        }
+      } catch {
+        await MainActor.run {
+          self?.showAlert(msg: error.localizedDescription)
+        }
+      }
+    }
+  }
+
+  private func _showTmuxSessionPicker(hostAlias: String, sessions: [TmuxControlSession]) {
+    guard !sessions.isEmpty else {
+      showAlert(msg: "No tmux sessions found on \(hostAlias).")
+      return
+    }
+
+    let alert = UIAlertController(title: "Tmux Sessions", message: "Select session", preferredStyle: .actionSheet)
+    for session in sessions.sorted(by: { $0.name < $1.name }) {
+      let indicator = session.attached ? " • attached" : ""
+      alert.addAction(UIAlertAction(title: "\(session.name)\(indicator)", style: .default, handler: { [weak self] _ in
+        self?._showTmuxPanePicker(hostAlias: hostAlias, session: session)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _showTmuxPanePicker(hostAlias: String, session: TmuxControlSession) {
+    let panes = session.windows
+      .sorted(by: { $0.index < $1.index })
+      .flatMap { window in
+        window.panes.sorted(by: { $0.index < $1.index }).map { pane in
+          (window: window, pane: pane)
+        }
+      }
+
+    guard !panes.isEmpty else {
+      showAlert(msg: "Session '\(session.name)' has no panes.")
+      return
+    }
+
+    let alert = UIAlertController(title: "Session: \(session.name)", message: "Tap a pane to enter", preferredStyle: .actionSheet)
+    for entry in panes {
+      let marker = entry.pane.active ? "★ " : ""
+      let path = entry.pane.currentPath.blink_lastPathComponent
+      let title = "\(marker)\(entry.window.name) • pane \(entry.pane.index) • \(path)"
+      alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
+        self?._openTmuxPane(hostAlias: hostAlias, sessionName: session.name, paneTarget: entry.pane.target)
+      }))
+    }
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    _presentSheetAlert(alert)
+  }
+
+  private func _presentSheetAlert(_ alert: UIAlertController) {
+    if let popover = alert.popoverPresentationController {
+      popover.sourceView = view
+      popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.maxY - 40, width: 1, height: 1)
+      popover.permittedArrowDirections = []
+    }
+    present(alert, animated: true)
+  }
+
+  @objc func openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
+    _interactiveSpaceController()._openTmuxPane(hostAlias: hostAlias, sessionName: sessionName, paneTarget: paneTarget)
+  }
+
+  @objc func openShellAndRunCommand(_ command: String) {
+    _interactiveSpaceController()._openShellAndRunCommand(command, skipHistoryRecord: false)
+  }
+
+  private func _openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
+    let cleanHost = hostAlias.blink_trimmed
+    guard !cleanHost.isEmpty else {
+      showAlert(msg: "Missing host alias in tmux notification.")
+      return
+    }
+
+    let cleanPane = paneTarget.blink_trimmed
+    guard !cleanPane.isEmpty else {
+      showAlert(msg: "Missing pane target.")
+      return
+    }
+
+    let inferredSession = cleanPane.components(separatedBy: ":").first
+    let cleanSession = sessionName?.blink_trimmed.isEmpty == false ? sessionName!.blink_trimmed : (inferredSession ?? "")
+    guard !cleanSession.isEmpty else {
+      showAlert(msg: "Missing session name for pane target \(cleanPane).")
+      return
+    }
+
+    let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
+    let requestID = TmuxPaneLaunchRequestStore.shared.register(request: request)
+    _openShellAndRunCommand("tmux-pane-bridge --request-id \(requestID)", skipHistoryRecord: true)
+  }
+
+  private func _presentTmuxPaneDetail(host: BKHosts, request: TmuxNotificationRequest) {
+    let paneController = TmuxPaneDetailViewController(host: host, request: request)
+    let nav = UINavigationController(rootViewController: paneController)
+    if #available(iOS 15.0, *) {
+      nav.modalPresentationStyle = .formSheet
+    } else {
+      nav.modalPresentationStyle = .fullScreen
+    }
+    present(nav, animated: true)
+  }
+
+  private func _openShellAndRunCommand(_ command: String, skipHistoryRecord: Bool) {
+    let cleanCommand = command.blink_trimmed
+    guard !cleanCommand.isEmpty else {
+      showAlert(msg: "Command is empty.")
+      return
+    }
+
+    _createShell(userActivity: nil, animated: true) { [weak self] _ in
+      guard let self,
+            let term = self.currentTerm()
+      else {
+        return
+      }
+      term.enqueueProgrammaticCommand(cleanCommand, skipHistoryRecord: skipHistoryRecord)
+    }
+  }
+
+  @objc private func _openTmuxPaneFromNotification(_ n: Notification) {
+    guard
+      let userInfo = n.userInfo,
+      let request = Self._tmuxNotificationRequest(from: userInfo)
+    else {
+      return
+    }
+    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
+  }
+
+  private func _drainPendingTmuxNotificationIfNeeded() {
+    guard let request = Self._pendingTmuxRequest else {
+      return
+    }
+    Self._pendingTmuxRequest = nil
+    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
   }
   
   @objc func toggleGeoTrack() {
@@ -1221,4 +1470,599 @@ extension SpaceController: SnippetContext {
     return self.currentDevice
   }
   
+}
+
+struct TmuxNotificationRequest: Equatable, Codable {
+  let hostAlias: String
+  let sessionName: String?
+  let paneTarget: String
+}
+
+enum TmuxNotificationPayloadResolver {
+  static func resolve(
+    _ userInfo: [AnyHashable: Any],
+    hostAliasForDeviceID: ((String) -> String?)? = nil
+  ) -> TmuxNotificationRequest? {
+    let paneTarget = (userInfo["paneTarget"] as? String)
+      ?? (userInfo["pane_target"] as? String)
+      ?? (userInfo["paneId"] as? String)
+      ?? (userInfo["pane_id"] as? String)
+    guard let paneTarget = paneTarget?.blink_trimmed, !paneTarget.isEmpty else {
+      return nil
+    }
+
+    let sessionName = ((userInfo["sessionName"] as? String)
+      ?? (userInfo["session_name"] as? String)
+      ?? (userInfo["sessionId"] as? String)
+      ?? (userInfo["session_id"] as? String)
+      ?? paneTarget.components(separatedBy: ":").first)?.blink_trimmed
+
+    if let alias = ((userInfo["hostAlias"] as? String)
+      ?? (userInfo["hostId"] as? String)
+      ?? (userInfo["host_id"] as? String)
+      ?? (userInfo["serverName"] as? String))?.blink_trimmed,
+      !alias.isEmpty
+    {
+      return TmuxNotificationRequest(hostAlias: alias, sessionName: sessionName, paneTarget: paneTarget)
+    }
+
+    if let deviceId = ((userInfo["deviceId"] as? String)
+      ?? (userInfo["device_id"] as? String))?.blink_trimmed,
+      !deviceId.isEmpty
+    {
+      let resolveHostAlias = hostAliasForDeviceID ?? { id in
+        (BKHosts.allHosts() ?? []).first(where: { ($0.tmuxPushDeviceId ?? "").blink_trimmed == id })?.host
+      }
+      if let alias = resolveHostAlias(deviceId)?.blink_trimmed, !alias.isEmpty {
+        return TmuxNotificationRequest(hostAlias: alias, sessionName: sessionName, paneTarget: paneTarget)
+      }
+    }
+
+    return nil
+  }
+}
+
+fileprivate struct TmuxControlSession: Decodable {
+  let name: String
+  let attached: Bool
+  let windows: [TmuxControlWindow]
+}
+
+fileprivate struct TmuxControlWindow: Decodable {
+  let index: Int
+  let name: String
+  let panes: [TmuxControlPane]
+}
+
+fileprivate struct TmuxControlPane: Decodable {
+  let index: Int
+  let active: Bool
+  let target: String
+  let currentPath: String
+
+  enum CodingKeys: String, CodingKey {
+    case index
+    case active
+    case target
+    case currentPath = "current_path"
+  }
+}
+
+enum TmuxControlPlaneProfile: CaseIterable, Equatable {
+  case namespacedV1
+  case flat
+
+  var sessionsPath: String {
+    switch self {
+    case .namespacedV1:
+      return "/v1/tmux/sessions"
+    case .flat:
+      return "/sessions"
+    }
+  }
+
+  func paneOutputPath(target: String, lines: Int) -> String {
+    switch self {
+    case .namespacedV1:
+      return "/v1/tmux/panes/\(target)/output?lines=\(lines)"
+    case .flat:
+      return "/panes/\(target)/output?lines=\(lines)"
+    }
+  }
+
+  func paneInputPath(target: String) -> String {
+    switch self {
+    case .namespacedV1:
+      return "/v1/tmux/panes/\(target)/input"
+    case .flat:
+      return "/panes/\(target)/input"
+    }
+  }
+
+  func paneEscapePath(target: String) -> String {
+    switch self {
+    case .namespacedV1:
+      return "/v1/tmux/panes/\(target)/escape"
+    case .flat:
+      return "/panes/\(target)/escape"
+    }
+  }
+}
+
+fileprivate actor TmuxControlPlaneProfileCache {
+  static let shared = TmuxControlPlaneProfileCache()
+  private var values: [String: TmuxControlPlaneProfile] = [:]
+
+  func profile(for key: String) -> TmuxControlPlaneProfile? {
+    values[key]
+  }
+
+  func set(_ profile: TmuxControlPlaneProfile, for key: String) {
+    values[key] = profile
+  }
+
+  func removeProfile(for key: String) {
+    values.removeValue(forKey: key)
+  }
+}
+
+fileprivate struct TmuxControlRequestContext {
+  let hostAlias: String
+  let baseURL: String
+  let bearerToken: String?
+  let cacheKey: String
+}
+
+fileprivate struct TmuxControlHTTPResult {
+  let statusCode: Int
+  let data: Data
+}
+
+fileprivate struct TmuxControlPaneOutputResponse: Decodable {
+  let output: String
+}
+
+fileprivate struct TmuxControlPaneInputRequest: Encodable {
+  let text: String
+}
+
+fileprivate enum TmuxControlError: LocalizedError {
+  case invalidURL(String)
+  case unauthorized(Int)
+  case badStatusCode(Int, String)
+  case endpointUnsupported(String)
+  case missingData(String)
+  case decoding(String, Error)
+  case transport(Error)
+
+  var isRouteNotFound: Bool {
+    if case .badStatusCode(let code, _) = self {
+      return code == 404
+    }
+    return false
+  }
+
+  var errorDescription: String? {
+    switch self {
+    case .invalidURL(let value):
+      return "Tmux endpoint is invalid or insecure: \(value). Use a valid https:// endpoint in Settings > Hosts > SSH."
+    case .unauthorized:
+      return "Tmux endpoint rejected credentials (HTTP 401/403). Verify Service Token in Settings > Hosts > SSH."
+    case .badStatusCode(let code, let path):
+      return "Tmux control plane returned HTTP \(code) at \(path)."
+    case .endpointUnsupported(let hostAlias):
+      return "Host '\(hostAlias)' does not expose compatible pane control routes. Upgrade tmuxd/reverse-proxy to support /panes/{target}/{output,input,escape}."
+    case .missingData(let path):
+      return "Tmux control plane returned no data at \(path)."
+    case .decoding(_, let error):
+      return "Failed to decode tmux control response: \(error.localizedDescription)"
+    case .transport(let error):
+      return "Failed to connect to tmux endpoint: \(error.localizedDescription)"
+    }
+  }
+}
+
+fileprivate enum TmuxControlPlaneClient {
+  private static let outputLines = 500
+
+  static func listSessions(for host: BKHosts) async throws -> [TmuxControlSession] {
+    let context = try _context(for: host)
+    return try await _withProfile(for: context) { profile, context in
+      let path = profile.sessionsPath
+      let result = try await _request(context: context, path: path, method: "GET")
+      try _throwIfNonSuccess(result: result, path: path)
+      guard !result.data.isEmpty else {
+        throw TmuxControlError.missingData(path)
+      }
+      return try _decode([TmuxControlSession].self, data: result.data, path: path)
+    }
+  }
+
+  static func getPaneOutput(for host: BKHosts, target: String, lines: Int = outputLines) async throws -> String {
+    let context = try _context(for: host)
+    let encodedTarget = _encodePathComponent(target)
+    return try await _withProfile(for: context) { profile, context in
+      let path = profile.paneOutputPath(target: encodedTarget, lines: max(1, lines))
+      let result = try await _request(context: context, path: path, method: "GET")
+      try _throwIfNonSuccess(result: result, path: path)
+      guard !result.data.isEmpty else {
+        throw TmuxControlError.missingData(path)
+      }
+      if let response = try? _decode(TmuxControlPaneOutputResponse.self, data: result.data, path: path) {
+        return response.output
+      }
+      if let raw = String(data: result.data, encoding: .utf8) {
+        return raw
+      }
+      throw TmuxControlError.decoding(path, DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported output payload.")))
+    }
+  }
+
+  static func sendInput(for host: BKHosts, target: String, text: String) async throws {
+    let context = try _context(for: host)
+    let encodedTarget = _encodePathComponent(target)
+    let body = try JSONEncoder().encode(TmuxControlPaneInputRequest(text: text))
+    _ = try await _withProfile(for: context) { profile, context in
+      let path = profile.paneInputPath(target: encodedTarget)
+      let result = try await _request(context: context, path: path, method: "POST", body: body)
+      try _throwIfNonSuccess(result: result, path: path)
+      return ()
+    }
+  }
+
+  static func sendEscape(for host: BKHosts, target: String) async throws {
+    let context = try _context(for: host)
+    let encodedTarget = _encodePathComponent(target)
+    _ = try await _withProfile(for: context) { profile, context in
+      let path = profile.paneEscapePath(target: encodedTarget)
+      let result = try await _request(context: context, path: path, method: "POST")
+      try _throwIfNonSuccess(result: result, path: path)
+      return ()
+    }
+  }
+
+  private static func _withProfile<T>(
+    for context: TmuxControlRequestContext,
+    operation: @escaping (TmuxControlPlaneProfile, TmuxControlRequestContext) async throws -> T
+  ) async throws -> T {
+    let cache = TmuxControlPlaneProfileCache.shared
+    if let cached = await cache.profile(for: context.cacheKey) {
+      do {
+        let result = try await operation(cached, context)
+        await cache.set(cached, for: context.cacheKey)
+        return result
+      } catch let error as TmuxControlError where error.isRouteNotFound {
+        await cache.removeProfile(for: context.cacheKey)
+      } catch {
+        throw error
+      }
+    }
+
+    for profile in TmuxControlPlaneProfile.allCases {
+      do {
+        let result = try await operation(profile, context)
+        await cache.set(profile, for: context.cacheKey)
+        return result
+      } catch let error as TmuxControlError where error.isRouteNotFound {
+        continue
+      } catch {
+        throw error
+      }
+    }
+
+    throw TmuxControlError.endpointUnsupported(context.hostAlias)
+  }
+
+  private static func _context(for host: BKHosts) throws -> TmuxControlRequestContext {
+    let hostAlias = host.host?.blink_trimmed ?? ""
+    let rawURL = BKHosts.tmuxResolvedBaseURL(for: host)?.blink_trimmed ?? ""
+    guard !rawURL.isEmpty else {
+      throw TmuxControlError.invalidURL(host.hostName ?? hostAlias)
+    }
+
+    guard let base = BKHosts.tmuxNormalizeBaseURL(rawURL), !base.isEmpty else {
+      throw TmuxControlError.invalidURL(rawURL)
+    }
+
+    let token = host.tmuxServiceToken?.blink_trimmed
+    let cacheKey = "\(hostAlias.lowercased())|\(base)"
+    return TmuxControlRequestContext(
+      hostAlias: hostAlias.isEmpty ? (host.hostName ?? "(unknown)") : hostAlias,
+      baseURL: base,
+      bearerToken: token?.isEmpty == true ? nil : token,
+      cacheKey: cacheKey
+    )
+  }
+
+  private static func _request(
+    context: TmuxControlRequestContext,
+    path: String,
+    method: String,
+    body: Data? = nil
+  ) async throws -> TmuxControlHTTPResult {
+    guard let url = URL(string: "\(context.baseURL)\(path)") else {
+      throw TmuxControlError.invalidURL("\(context.baseURL)\(path)")
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.timeoutInterval = 8
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    if let body {
+      request.httpBody = body
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    }
+    if let token = context.bearerToken, !token.isEmpty {
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse else {
+        throw TmuxControlError.missingData(path)
+      }
+      return TmuxControlHTTPResult(statusCode: http.statusCode, data: data)
+    } catch let error as TmuxControlError {
+      throw error
+    } catch {
+      throw TmuxControlError.transport(error)
+    }
+  }
+
+  private static func _throwIfNonSuccess(result: TmuxControlHTTPResult, path: String) throws {
+    guard !(result.statusCode == 401 || result.statusCode == 403) else {
+      throw TmuxControlError.unauthorized(result.statusCode)
+    }
+    guard (200...299).contains(result.statusCode) else {
+      throw TmuxControlError.badStatusCode(result.statusCode, path)
+    }
+  }
+
+  private static func _decode<T: Decodable>(_ type: T.Type, data: Data, path: String) throws -> T {
+    do {
+      return try JSONDecoder().decode(type, from: data)
+    } catch {
+      throw TmuxControlError.decoding(path, error)
+    }
+  }
+
+  static func _encodePathComponent(_ value: String) -> String {
+    var allowed = CharacterSet.urlPathAllowed
+    allowed.remove(charactersIn: "/")
+    return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+  }
+}
+
+func tmuxControlEncodePathComponent(_ value: String) -> String {
+  TmuxControlPlaneClient._encodePathComponent(value)
+}
+
+@MainActor
+fileprivate final class TmuxPaneDetailViewController: UIViewController, UITextFieldDelegate {
+  private let host: BKHosts
+  private let request: TmuxNotificationRequest
+
+  private let statusLabel = UILabel()
+  private let outputTextView = UITextView()
+  private let inputField = UITextField()
+  private let sendButton = UIButton(type: .system)
+  private let escapeButton = UIButton(type: .system)
+
+  private var pollingTask: Task<Void, Never>?
+  private var refreshInFlight = false
+  private var lastOutput = ""
+  private var hasLoadedOnce = false
+
+  init(host: BKHosts, request: TmuxNotificationRequest) {
+    self.host = host
+    self.request = request
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    pollingTask?.cancel()
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .systemBackground
+    title = request.paneTarget
+    navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .close, target: self, action: #selector(_closeTapped))
+    navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .refresh, target: self, action: #selector(_refreshTapped))
+    _configureLayout()
+    _setStatus("Loading pane output…", isError: false)
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    _startPollingIfNeeded()
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    if isBeingDismissed || navigationController?.isBeingDismissed == true {
+      pollingTask?.cancel()
+      pollingTask = nil
+    }
+  }
+
+  @objc private func _closeTapped() {
+    dismiss(animated: true)
+  }
+
+  @objc private func _refreshTapped() {
+    Task { [weak self] in
+      await self?._refreshOutput(showLoading: true)
+    }
+  }
+
+  @objc private func _sendTapped() {
+    Task { [weak self] in
+      await self?._sendCurrentInput()
+    }
+  }
+
+  @objc private func _escapeTapped() {
+    Task { [weak self] in
+      await self?._sendEscape()
+    }
+  }
+
+  func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+    _sendTapped()
+    return false
+  }
+
+  private func _configureLayout() {
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    statusLabel.numberOfLines = 2
+    statusLabel.font = .preferredFont(forTextStyle: .footnote)
+    statusLabel.textColor = .secondaryLabel
+
+    outputTextView.translatesAutoresizingMaskIntoConstraints = false
+    outputTextView.isEditable = false
+    outputTextView.alwaysBounceVertical = true
+    outputTextView.backgroundColor = .secondarySystemBackground
+    outputTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+    outputTextView.textColor = .label
+    outputTextView.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+    outputTextView.layer.cornerRadius = 10
+
+    inputField.translatesAutoresizingMaskIntoConstraints = false
+    inputField.placeholder = "Send input to \(request.paneTarget)"
+    inputField.borderStyle = .roundedRect
+    inputField.returnKeyType = .send
+    inputField.delegate = self
+
+    sendButton.translatesAutoresizingMaskIntoConstraints = false
+    sendButton.setTitle("Send", for: .normal)
+    sendButton.addTarget(self, action: #selector(_sendTapped), for: .touchUpInside)
+
+    escapeButton.translatesAutoresizingMaskIntoConstraints = false
+    escapeButton.setTitle("Esc", for: .normal)
+    escapeButton.addTarget(self, action: #selector(_escapeTapped), for: .touchUpInside)
+
+    let inputStack = UIStackView(arrangedSubviews: [inputField, sendButton, escapeButton])
+    inputStack.translatesAutoresizingMaskIntoConstraints = false
+    inputStack.axis = .horizontal
+    inputStack.spacing = 8
+    inputStack.alignment = .center
+
+    view.addSubview(statusLabel)
+    view.addSubview(outputTextView)
+    view.addSubview(inputStack)
+
+    NSLayoutConstraint.activate([
+      statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+      statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+
+      outputTextView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+      outputTextView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+      outputTextView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+
+      inputStack.topAnchor.constraint(equalTo: outputTextView.bottomAnchor, constant: 8),
+      inputStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+      inputStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+      inputStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+
+      inputField.heightAnchor.constraint(equalToConstant: 36),
+      sendButton.widthAnchor.constraint(equalToConstant: 56),
+      escapeButton.widthAnchor.constraint(equalToConstant: 52)
+    ])
+  }
+
+  private func _startPollingIfNeeded() {
+    guard pollingTask == nil else { return }
+    pollingTask = Task { [weak self] in
+      guard let self else { return }
+      await self._refreshOutput(showLoading: true)
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        if Task.isCancelled { return }
+        await self._refreshOutput(showLoading: false)
+      }
+    }
+  }
+
+  private func _refreshOutput(showLoading: Bool) async {
+    guard !refreshInFlight else { return }
+    refreshInFlight = true
+    defer { refreshInFlight = false }
+
+    if showLoading {
+      _setStatus("Refreshing \(request.paneTarget)…", isError: false)
+    }
+
+    do {
+      let output = try await TmuxControlPlaneClient.getPaneOutput(for: host, target: request.paneTarget)
+      if output != lastOutput {
+        lastOutput = output
+        outputTextView.text = output
+        if !output.isEmpty {
+          let bottom = NSRange(location: max(0, output.utf16.count - 1), length: 1)
+          outputTextView.scrollRangeToVisible(bottom)
+        }
+      }
+      hasLoadedOnce = true
+      _setStatus("Connected to \(request.hostAlias) • pane \(request.paneTarget)", isError: false)
+    } catch {
+      if !hasLoadedOnce {
+        outputTextView.text = ""
+      }
+      _setStatus(error.localizedDescription, isError: true)
+    }
+  }
+
+  private func _sendCurrentInput() async {
+    let text = inputField.text?.blink_trimmed ?? ""
+    guard !text.isEmpty else {
+      return
+    }
+    inputField.text = ""
+    _setStatus("Sending input…", isError: false)
+    do {
+      try await TmuxControlPlaneClient.sendInput(for: host, target: request.paneTarget, text: text)
+      await _refreshOutput(showLoading: false)
+    } catch {
+      _setStatus(error.localizedDescription, isError: true)
+    }
+  }
+
+  private func _sendEscape() async {
+    _setStatus("Sending Esc…", isError: false)
+    do {
+      try await TmuxControlPlaneClient.sendEscape(for: host, target: request.paneTarget)
+      await _refreshOutput(showLoading: false)
+    } catch {
+      _setStatus(error.localizedDescription, isError: true)
+    }
+  }
+
+  private func _setStatus(_ message: String, isError: Bool) {
+    statusLabel.text = message
+    statusLabel.textColor = isError ? .systemRed : .secondaryLabel
+  }
+}
+
+fileprivate extension Notification.Name {
+  static let BLKOpenTmuxPane = Notification.Name("BLKOpenTmuxPaneNotification")
+}
+
+fileprivate extension String {
+  var blink_trimmed: String {
+    trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var blink_lastPathComponent: String {
+    let component = (self as NSString).lastPathComponent
+    if component.isEmpty || component == "/" || component == "." {
+      return self
+    }
+    return component
+  }
 }

@@ -19,6 +19,8 @@ a separate license by Apple Inc.
 Clone Blink into your local repository and make sure to obtain any submodules:
 git submodule init
 git submodule update
+or just run `./get_frameworks.sh` later, which now updates submodules and resolves packages in
+forced anonymous mode (no keychain prompts / no interactive credential flow).
 
 ## Dependencies & Requirements
 Blink makes use of multiple dependencies that you have to compile
@@ -71,3 +73,23 @@ with XCode, follow the proper Apple Developer documentation in that case.
 4. If you would like to use HockeyApp, change the scheme to Blink Hockey, and add HockeyID with your AppID string to info.plist.
 
 Make sure "Blink" is the selected Scheme for compilation. As a standard XCode project, just run it with Cmd-R.
+
+## CI Workflow Linting
+Changes under `.github/workflows/` are enforced by the `Workflow Hygiene` pipeline.
+Run lint checks locally before pushing to avoid CI round-trips:
+
+```bash
+actionlint
+```
+
+If your environment does not have shellcheck in `PATH`, install both tools first:
+
+```bash
+brew install actionlint shellcheck
+```
+
+Then run:
+
+```bash
+actionlint -shellcheck "$(command -v shellcheck)"
+```

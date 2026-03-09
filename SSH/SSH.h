@@ -37,7 +37,7 @@ FOUNDATION_EXPORT double SSHVersionNumber;
 
 //! Project version string for SSH.
 FOUNDATION_EXPORT const unsigned char SSHVersionString[];
+FOUNDATION_EXPORT void SSHInitializeRuntime(void);
 
 // In this header, you should import all the public headers of your framework using statements like #import <SSH/PublicHeader.h>
-
 

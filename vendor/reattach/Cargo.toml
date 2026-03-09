@@ -1,0 +1,3 @@
+[workspace]
+members = ["tmuxd"]
+resolver = "2"

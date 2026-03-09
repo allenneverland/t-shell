@@ -36,8 +36,6 @@ import SwiftUI
 
 import RevenueCat
 
-let Blink15BundleID = "sh.blink.blinkshell"
-
 class ExternalWindow: UIWindow {
   var shadowWindow: UIWindow? = nil
 }
@@ -102,6 +100,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   }
 
   @objc private func _showPaywallIfNeeded() {
+    guard !FeatureFlags.noSubscriptionNag else {
+      return
+    }
+
     let entitlements = EntitlementsManager.shared
 
     let doShowPaywall = !entitlements.hasActiveSubscriptions()
@@ -161,7 +163,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     if let sshUrlScheme = URLContexts.first(where: { $0.url.scheme == "ssh" })?.url {
       _handleSshUrlScheme(with: sshUrlScheme)
-    } else if let xCallbackUrl = URLContexts.first(where: { $0.url.scheme == "blinkshell" })?.url {
+    } else if let xCallbackUrl = URLContexts.first(where: { $0.url.scheme == "tshell" })?.url {
       _handleXcallbackUrl(with: xCallbackUrl)
     } else if let codeUrlScheme = URLContexts.first(where: { $0.url.scheme == "vscode" })?.url {
       _handleCodeUrlScheme(with: codeUrlScheme)
@@ -195,7 +197,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     let conditions = scene.activationConditions
 
     conditions.canActivateForTargetContentIdentifierPredicate = NSPredicate(value: true)
-    conditions.prefersToActivateForTargetContentIdentifierPredicate = NSPredicate(format: "SELF == 'blink://open-scene/\(scene.session.persistentIdentifier)'")
+    conditions.prefersToActivateForTargetContentIdentifierPredicate = NSPredicate(format: "SELF == 'tshell://open-scene/\(scene.session.persistentIdentifier)'")
 
     _spCtrl.sceneRole = session.role
     _spCtrl.restoreWith(stateRestorationActivity: session.stateRestorationActivity)
@@ -502,7 +504,7 @@ extension SceneDelegate {
   /**
    Handles the x-callback-url, if  a successful `x-success` URL is provided when being called from apps like Shortcuts it returns to the original app after a successful execution.
     - Parameters:
-      - xCallbackUrl: The x-callback-url specified by the user, URL format should be `blinkshell://run?key=KEY&cmd=CMD%20ENCODED`
+      - xCallbackUrl: The x-callback-url specified by the user, URL format should be `tshell://run?key=KEY&cmd=CMD%20ENCODED`
    */
   private func _handleXcallbackUrl(with xCallbackUrl: URL) {
 

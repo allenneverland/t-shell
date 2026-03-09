@@ -84,6 +84,8 @@ git clone --recursive https://github.com/blinksh/blink.git && \
     cd blink && ./get_frameworks.sh && ./get_resources.sh && \
     rm -rf Blink.xcodeproj/project.xcworkspace/xcshareddata/
 ```
+`./get_frameworks.sh` enforces anonymous, non-interactive dependency downloads (`GIT_TERMINAL_PROMPT=0`)
+so Xcode/SwiftPM builds do not depend on keychain-backed GitHub credentials.
 
 2. Change developer ids
 

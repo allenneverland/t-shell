@@ -41,7 +41,7 @@
 
 
 NSString const *BKiCloudSyncDeletedHosts = @"deletedHosts";
-NSString *BKiCloudContainerIdentifier;// MOVED to init @"iCloud.com.carloscabanero.blinkshell";
+NSString *BKiCloudContainerIdentifier;// MOVED to init @"iCloud.com.allenneverland.tshell";
 NSString *BKiCloudZoneName = @"DefaultZone";
 
 static NSMutableDictionary *syncItems = nil;
@@ -317,6 +317,15 @@ sshConfigAttachment:updatedHost.sshConfigAttachment
       fpDomainsJSON:updatedHost.fpDomainsJSON
  agentForwardPrompt:updatedHost.agentForwardPrompt.intValue
    agentForwardKeys:updatedHost.agentForwardKeys
+      tmuxServiceURL:oldHost.tmuxServiceURL
+    tmuxServiceToken:oldHost.tmuxServiceToken
+    tmuxPushDeviceId:oldHost.tmuxPushDeviceId
+  tmuxPushDeviceName:oldHost.tmuxPushDeviceName
+tmuxPushDeviceApiToken:oldHost.tmuxPushDeviceApiToken
+     tmuxPushEnabled:oldHost.tmuxPushEnabled
+       tmuxAPNSKeyID:oldHost.tmuxAPNSKeyID
+     tmuxAPNSTeamID:oldHost.tmuxAPNSTeamID
+    tmuxAPNSBundleID:oldHost.tmuxAPNSBundleID
    ];
   [BKHosts updateHost:updatedHost.host withiCloudId:hostRecord.recordID andLastModifiedTime:hostRecord.modificationDate];
 }

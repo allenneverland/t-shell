@@ -55,13 +55,26 @@ ControlMaster no
                                 password: "password",
                                 hostKey: "id_rsa",
                                 moshServer: "",
+                                moshPredictOverwrite: "",
+                                moshExperimentalIP: BKMoshExperimentalIP(rawValue: 0),
                                 moshPortRange: "",
                                 startUpCmd: "",
                                 prediction: BKMoshPrediction(rawValue: 0),
                                 proxyCmd: "exec nc %h:%p",
                                 proxyJump: "jumphost",
                                 sshConfigAttachment: sshConfigAttachment,
-                                fpDomainsJSON: "")
+                                fpDomainsJSON: "",
+                                agentForwardPrompt: BKAgentForward(rawValue: 0),
+                                agentForwardKeys: [],
+                                tmuxServiceURL: "",
+                                tmuxServiceToken: "",
+                                tmuxPushDeviceId: "",
+                                tmuxPushDeviceName: "",
+                                tmuxPushDeviceApiToken: "",
+                                tmuxPushEnabled: NSNumber(value: false),
+                                tmuxAPNSKeyID: "",
+                                tmuxAPNSTeamID: "",
+                                tmuxAPNSBundleID: "")
   }
   
   override func tearDownWithError() throws {
@@ -92,6 +105,60 @@ func testBKHostsToSSHConfig() throws {
   // Password should be skipped
   XCTAssertFalse(hostString.contains("Password password"))
 }
+
+  func testTmuxNormalizeBaseURLRequiresHTTPS() {
+    XCTAssertEqual(
+      BKHosts.tmuxNormalizeBaseURL("https://example.com/v1/healthz"),
+      "https://example.com"
+    )
+    XCTAssertNil(BKHosts.tmuxNormalizeBaseURL("http://example.com:8787"))
+  }
+
+  func testTmuxResolvedBaseURLUsesDefaultWhenOverrideMissing() throws {
+    guard let host = BKHosts.withHost(hostAlias) else {
+      return XCTFail("Expected test host to exist")
+    }
+    host.hostName = "secure.example.com"
+    host.tmuxServiceURL = ""
+
+    XCTAssertEqual(BKHosts.tmuxResolvedBaseURL(for: host), "https://secure.example.com")
+  }
+
+  func testTmuxResolvedBaseURLRejectsInsecureOverride() throws {
+    guard let host = BKHosts.withHost(hostAlias) else {
+      return XCTFail("Expected test host to exist")
+    }
+    host.tmuxServiceURL = "http://insecure.example.com:8787"
+
+    XCTAssertTrue(BKHosts.tmuxEndpointOverrideRequiresHTTPS(for: host))
+    XCTAssertFalse(BKHosts.tmuxEndpointOverrideIsInvalid(for: host))
+    XCTAssertNil(BKHosts.tmuxResolvedBaseURL(for: host))
+  }
+
+  func testTmuxResolvedBaseURLRejectsInvalidOverride() throws {
+    guard let host = BKHosts.withHost(hostAlias) else {
+      return XCTFail("Expected test host to exist")
+    }
+    host.tmuxServiceURL = "https://"
+
+    XCTAssertFalse(BKHosts.tmuxEndpointOverrideRequiresHTTPS(for: host))
+    XCTAssertTrue(BKHosts.tmuxEndpointOverrideIsInvalid(for: host))
+    XCTAssertNil(BKHosts.tmuxResolvedBaseURL(for: host))
+  }
+
+  func testTmuxLastRegisteredAPNSTokenPersists() {
+    guard let host = BKHosts.withHost(hostAlias) else {
+      return XCTFail("Expected test host to exist")
+    }
+    host.tmuxLastRegisteredAPNSToken = "deadbeef"
+    XCTAssertTrue(BKHosts.save())
+
+    BKHosts.loadHosts()
+    guard let reloaded = BKHosts.withHost(hostAlias) else {
+      return XCTFail("Expected reloaded host to exist")
+    }
+    XCTAssertEqual(reloaded.tmuxLastRegisteredAPNSToken, "deadbeef")
+  }
   
   func testSSHConfigToSSHClientConfig() throws {
     // Test conversion to BKSSHHost.
