@@ -166,20 +166,27 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
 
 + (void)loadDefaults {
   defaults = [[BLKDefaults alloc] init];
-  
+
+  NSString *defaultsPath = [BlinkPaths blinkDefaultsFile];
+  BOOL defaultsFileExists = [[NSFileManager defaultManager] fileExistsAtPath:defaultsPath];
+  BOOL shouldPersistDefaults = !defaultsFileExists;
   NSError *error = nil;
-  NSData *data = [NSData dataWithContentsOfFile:[BlinkPaths blinkDefaultsFile]
+  NSData *data = [NSData dataWithContentsOfFile:defaultsPath
                                         options:NSDataReadingMappedIfSafe
                                           error:&error];
   
   if (error || !data) {
-    NSLog(@"[BLKDefaults] Failed to load data: %@", error);
+    if (defaultsFileExists) {
+      NSLog(@"[BLKDefaults] Failed to load data: %@", error);
+      shouldPersistDefaults = YES;
+    }
   } else {
     BLKDefaults * result = [NSKeyedUnarchiver unarchivedObjectOfClass:[BLKDefaults class]
                                                             fromData:data
                                                                error:&error];
     if (error || !result) {
       NSLog(@"[BLKDefaults] Failed to unarchive: %@", error);
+      shouldPersistDefaults = YES;
 //      CFStringRef str = CFStringCreateWithBytesNoCopy(NULL, data.bytes, data.length, kCFStringEncodingASCII, NO, kCFAllocatorNull);
 //      CFRange range = CFStringFind(str, CFSTR("classnameX$classesZBKDefaults"), 0);
 //      CFRelease(str);
@@ -193,6 +200,7 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
                                                                  error:&error];
       if (error || ! result) {
         NSLog(@"[BLKDefaults] Failed again to unarchive with BKDefaults replacement: %@", error);
+        shouldPersistDefaults = YES;
       } else {
         NSLog(@"[BLKDefaults] loaded with BKDefaults replacement");
         defaults = result;
@@ -238,6 +246,10 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
 
   if(!defaults.globalSSHConfig) {
     [BLKDefaults saveGlobalSSHConfig];
+  }
+
+  if (shouldPersistDefaults) {
+    [BLKDefaults saveDefaults];
   }
 }
 

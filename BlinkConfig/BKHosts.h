@@ -79,11 +79,14 @@ enum BKAgentForward {
 @property (nonatomic, strong) NSString *fpDomainsJSON;
 @property (nonatomic, strong) NSNumber *agentForwardPrompt;
 @property (nonatomic, strong) NSArray<NSString *> *agentForwardKeys;
+// Advanced override for tmux control/push endpoint.
+// Leave empty to derive endpoint from hostName automatically.
 @property (nonatomic, strong) NSString *tmuxServiceURL;
 @property (nonatomic, strong) NSString *tmuxServiceToken;
 @property (nonatomic, strong) NSString *tmuxPushDeviceId;
 @property (nonatomic, strong) NSString *tmuxPushDeviceName;
 @property (nonatomic, strong) NSString *tmuxPushDeviceApiToken;
+@property (nonatomic, strong) NSString *tmuxLastRegisteredAPNSToken;
 @property (nonatomic, strong) NSNumber *tmuxPushEnabled;
 @property (nonatomic, strong) NSString *tmuxAPNSKeyID;
 @property (nonatomic, strong) NSString *tmuxAPNSTeamID;
@@ -132,6 +135,11 @@ enum BKAgentForward {
 + (CKRecord *)recordFromHost:(BKHosts *)host;
 + (BKHosts *)hostFromRecord:(CKRecord *)hostRecord;
 + (instancetype)withiCloudId:(CKRecordID *)record;
++ (NSString * _Nullable)tmuxNormalizeBaseURL:(NSString *)rawURL NS_SWIFT_NAME(tmuxNormalizeBaseURL(_:));
++ (NSString * _Nullable)tmuxDefaultBaseURLForHostName:(NSString *)hostName NS_SWIFT_NAME(tmuxDefaultBaseURL(forHostName:));
++ (NSString * _Nullable)tmuxResolvedBaseURLForHost:(BKHosts *)host NS_SWIFT_NAME(tmuxResolvedBaseURL(for:));
++ (BOOL)tmuxEndpointOverrideRequiresHTTPSForHost:(BKHosts *)host NS_SWIFT_NAME(tmuxEndpointOverrideRequiresHTTPS(for:));
++ (BOOL)tmuxEndpointOverrideIsInvalidForHost:(BKHosts *)host NS_SWIFT_NAME(tmuxEndpointOverrideIsInvalid(for:));
 
 
 - (id)initWithAlias:(NSString *)alias

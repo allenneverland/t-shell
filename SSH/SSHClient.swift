@@ -37,8 +37,19 @@ import LibSSH
 typealias SSHConnection = AnyPublisher<ssh_session, Error>
 typealias SSHChannel = AnyPublisher<ssh_channel, Error>
 
+private enum SSHRuntimeInitializer {
+  static let initializeOnce: Void = {
+    ssh_init()
+  }()
+}
+
+@_cdecl("SSHInitializeRuntime")
+public func SSHInitializeRuntimeBridge() {
+  _ = SSHRuntimeInitializer.initializeOnce
+}
+
 public func SSHInit() {
-  ssh_init()
+  _ = SSHRuntimeInitializer.initializeOnce
 }
 
 // This is a macro in libssh, so we redefine it here

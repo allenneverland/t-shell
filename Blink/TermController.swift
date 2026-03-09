@@ -156,6 +156,7 @@ class TermController: UIViewController {
   
   
   private var _session: MCPSession? = nil
+  private var _pendingProgrammaticCommands: [(line: String, skipHistoryRecord: Bool)] = []
   
   required init(meta: SessionMeta? = nil) {
     _meta = meta ?? SessionMeta()
@@ -451,6 +452,30 @@ extension TermController: TermDeviceDelegate {
   public func lineSubmitted(_ line: String!) {
     _session?.enqueueCommand(line)
   }
+
+  func enqueueProgrammaticCommand(_ line: String, skipHistoryRecord: Bool = true) {
+    let cleanLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanLine.isEmpty else {
+      return
+    }
+
+    guard let session = _session else {
+      _pendingProgrammaticCommands.append((line: cleanLine, skipHistoryRecord: skipHistoryRecord))
+      return
+    }
+    session.enqueueCommand(cleanLine, skipHistoryRecord: skipHistoryRecord)
+  }
+
+  private func _flushPendingProgrammaticCommandsIfNeeded() {
+    guard let session = _session, !_pendingProgrammaticCommands.isEmpty else {
+      return
+    }
+    let pending = _pendingProgrammaticCommands
+    _pendingProgrammaticCommands.removeAll(keepingCapacity: false)
+    pending.forEach { command in
+      session.enqueueCommand(command.line, skipHistoryRecord: command.skipHistoryRecord)
+    }
+  }
   
   @objc public func setLayoutMode(layoutMode: BKLayoutMode) {
     self.sessionParams.layoutMode = layoutMode.rawValue
@@ -486,6 +511,7 @@ extension TermController: SuspendableSession {
     
     _session?.delegate = self
     _session?.execute(withArgs: "")
+    _flushPendingProgrammaticCommandsIfNeeded()
     
     if view.bounds.size != _sessionParams.viewSize {
       _session?.sigwinch()

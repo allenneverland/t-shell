@@ -35,10 +35,11 @@
 #import "BLKDefaults.h"
 #import <BlinkConfig/BKHosts.h>
 #import <BlinkConfig/BKPubKey.h>
+#import <SSH/SSH.h>
 #import "UICKeyChainStore.h"
 #import <ios_system/ios_system.h>
 #import <UserNotifications/UserNotifications.h>
-#include <libssh/callbacks.h>
+#import <math.h>
 #include "xcall.h"
 #include "Blink-Swift.h"
 
@@ -63,49 +64,38 @@ extern void rebind_ports(void);
 static NSString * const BLKAPNsTokenDefaultsKey = @"tmux.apns_device_token";
 static NSString * const BLKTmuxAPNsKeychainService = @"sh.blink.tmux.apns";
 static NSString * const BLKTmuxAPNsKeychainPrefix = @"tmux.apns.private.";
+static NSTimeInterval const BLKTmuxAPNSBackgroundThrottleSeconds = 20;
+static NSInteger const BLKTmuxAPNSBackgroundMaxAttempts = 4;
+
+static dispatch_queue_t _BLKTmuxAPNSRegistrationQueue(void) {
+  static dispatch_queue_t queue;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    queue = dispatch_queue_create("sh.blink.tmux.apns.registration", DISPATCH_QUEUE_SERIAL);
+  });
+  return queue;
+}
+
+static NSMutableSet<NSString *> * _BLKTmuxAPNSInFlightHosts(void) {
+  static NSMutableSet<NSString *> *set;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    set = [NSMutableSet set];
+  });
+  return set;
+}
+
+static NSMutableDictionary<NSString *, NSDate *> * _BLKTmuxAPNSLastAttemptByHost(void) {
+  static NSMutableDictionary<NSString *, NSDate *> *map;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    map = [NSMutableDictionary dictionary];
+  });
+  return map;
+}
 
 static UICKeyChainStore * _BLKTmuxAPNsKeychain(void) {
   return [UICKeyChainStore keyChainStoreWithService:BLKTmuxAPNsKeychainService];
-}
-
-static NSString * _Nullable _BLKTmuxNormalizedServiceBaseURL(NSString *rawURL) {
-  NSString *value = [rawURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-  if (value.length == 0) {
-    return nil;
-  }
-
-  NSURLComponents *components = [NSURLComponents componentsWithString:value];
-  if (!components.host.length) {
-    return nil;
-  }
-  NSString *scheme = components.scheme.lowercaseString;
-  if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
-    return nil;
-  }
-
-  components.scheme = scheme;
-  components.user = nil;
-  components.password = nil;
-  components.query = nil;
-  components.fragment = nil;
-
-  NSString *path = components.percentEncodedPath.lowercaseString ?: @"";
-  if ([path isEqualToString:@"/"] ||
-      [path isEqualToString:@"/healthz"] ||
-      [path isEqualToString:@"/healthz/"] ||
-      [path isEqualToString:@"/v1/healthz"] ||
-      [path isEqualToString:@"/v1/healthz/"]) {
-    components.percentEncodedPath = @"";
-  }
-
-  NSString *normalized = components.string;
-  if (normalized.length == 0) {
-    return nil;
-  }
-  if ([normalized hasSuffix:@"/"]) {
-    return [normalized substringToIndex:normalized.length - 1];
-  }
-  return normalized;
 }
   
 void __on_pipebroken_signal(int signum){
@@ -125,8 +115,7 @@ void __setupProcessEnv(void) {
   setenv("TERM", "xterm-256color", forceOverwrite);
   setenv("LANG", "en_US.UTF-8", forceOverwrite);
   setenv("VIMRUNTIME", [[mainBundle resourcePath] stringByAppendingPathComponent:@"/vim"].UTF8String, 1);
-  ssh_threads_set_callbacks(ssh_threads_get_pthread());
-  ssh_init();
+  SSHInitializeRuntime();
 }
 
 + (void)prepareShellRuntimeSynchronously {
@@ -265,7 +254,8 @@ void __setupProcessEnv(void) {
 }
 
 - (void)_registerAPNsForConfiguredTmuxHostsIfNeeded {
-  NSString *apnsToken = [[NSUserDefaults standardUserDefaults] stringForKey:BLKAPNsTokenDefaultsKey];
+  NSString *apnsToken = [[[NSUserDefaults standardUserDefaults] stringForKey:BLKAPNsTokenDefaultsKey]
+    stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
   if (apnsToken.length == 0) {
     return;
   }
@@ -274,21 +264,106 @@ void __setupProcessEnv(void) {
     if (!(host.tmuxPushEnabled.boolValue)) {
       continue;
     }
-    NSString *serviceURL = [host.tmuxServiceURL stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (serviceURL.length == 0) {
+    NSString *resolvedURL = [BKHosts tmuxResolvedBaseURLForHost:host];
+    if (resolvedURL.length == 0) {
+      NSString *alias = host.host.length > 0 ? host.host : @"(unknown)";
+      if ([BKHosts tmuxEndpointOverrideRequiresHTTPSForHost:host]) {
+        NSLog(@"[tmux] Skipping APNs registration for %@: endpoint override uses insecure HTTP. Migrate to HTTPS.", alias);
+      } else if ([BKHosts tmuxEndpointOverrideIsInvalidForHost:host]) {
+        NSLog(@"[tmux] Skipping APNs registration for %@: endpoint override is invalid. Use a valid HTTPS endpoint.", alias);
+      }
       continue;
     }
-    [self _registerAPNSToken:apnsToken forTmuxHost:host];
+
+    NSString *serviceToken = [host.tmuxServiceToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (serviceToken.length == 0) {
+      continue;
+    }
+
+    NSString *lastRegisteredToken = [host.tmuxLastRegisteredAPNSToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *deviceApiToken = [host.tmuxPushDeviceApiToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (deviceApiToken.length > 0 && [lastRegisteredToken isEqualToString:apnsToken]) {
+      continue;
+    }
+
+    [self _enqueueAPNSTokenRegistration:apnsToken forTmuxHost:host];
   }
 }
 
-- (void)_registerAPNSToken:(NSString *)apnsToken forTmuxHost:(BKHosts *)host {
-  NSString *normalizedURL = _BLKTmuxNormalizedServiceBaseURL(host.tmuxServiceURL ?: @"");
+- (void)_enqueueAPNSTokenRegistration:(NSString *)apnsToken forTmuxHost:(BKHosts *)host {
+  NSString *hostKey = [self _tmuxAPNSHostKey:host];
+  if (hostKey.length == 0) {
+    return;
+  }
+
+  __block BOOL shouldStart = NO;
+  dispatch_sync(_BLKTmuxAPNSRegistrationQueue(), ^{
+    NSMutableSet<NSString *> *inFlight = _BLKTmuxAPNSInFlightHosts();
+    if ([inFlight containsObject:hostKey]) {
+      return;
+    }
+
+    NSDate *lastAttempt = _BLKTmuxAPNSLastAttemptByHost()[hostKey];
+    if (lastAttempt && [[NSDate date] timeIntervalSinceDate:lastAttempt] < BLKTmuxAPNSBackgroundThrottleSeconds) {
+      return;
+    }
+
+    [inFlight addObject:hostKey];
+    _BLKTmuxAPNSLastAttemptByHost()[hostKey] = [NSDate date];
+    shouldStart = YES;
+  });
+
+  if (!shouldStart) {
+    return;
+  }
+
+  [self _registerAPNSToken:apnsToken forTmuxHost:host hostKey:hostKey attempt:1];
+}
+
+- (NSString *)_tmuxAPNSHostKey:(BKHosts *)host {
+  NSString *alias = [host.host stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (alias.length > 0) {
+    return alias;
+  }
+  NSString *hostName = [host.hostName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (hostName.length > 0) {
+    return hostName;
+  }
+  return @"";
+}
+
+- (void)_finishAPNSTokenRegistrationForHostKey:(NSString *)hostKey {
+  if (hostKey.length == 0) {
+    return;
+  }
+  dispatch_async(_BLKTmuxAPNSRegistrationQueue(), ^{
+    [_BLKTmuxAPNSInFlightHosts() removeObject:hostKey];
+  });
+}
+
+- (BOOL)_shouldRetryAPNSTokenRegistrationForError:(NSError *)error statusCode:(NSInteger)statusCode {
+  if (error != nil) {
+    return YES;
+  }
+  return statusCode == 429 || (statusCode >= 500 && statusCode <= 599);
+}
+
+- (NSTimeInterval)_retryDelayForAPNSTokenAttempt:(NSInteger)attempt {
+  NSInteger bounded = MAX(0, MIN(attempt - 1, 4));
+  NSTimeInterval base = pow(2.0, bounded);
+  NSTimeInterval jitter = ((double)arc4random_uniform(1000) / 1000.0) * 0.75;
+  return MIN(base + jitter, 12.0);
+}
+
+- (void)_registerAPNSToken:(NSString *)apnsToken forTmuxHost:(BKHosts *)host hostKey:(NSString *)hostKey attempt:(NSInteger)attempt {
+  NSString *normalizedURL = [BKHosts tmuxResolvedBaseURLForHost:host];
   if (normalizedURL.length == 0) {
+    [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
   NSString *serviceToken = [host.tmuxServiceToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
   if (serviceToken.length == 0) {
+    [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
 
@@ -296,16 +371,19 @@ void __setupProcessEnv(void) {
   NSString *deviceName = host.tmuxPushDeviceName.length > 0 ? host.tmuxPushDeviceName : UIDevice.currentDevice.name;
   NSString *serverName = host.host.length > 0 ? host.host : @"tshell";
   if (deviceId.length == 0) {
+    [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
 
   NSURL *registerURL = [NSURL URLWithString:[normalizedURL stringByAppendingString:@"/v1/push/devices/register"]];
   if (!registerURL) {
+    [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
 
   NSMutableURLRequest *registerRequest = [NSMutableURLRequest requestWithURL:registerURL];
   registerRequest.HTTPMethod = @"POST";
+  registerRequest.timeoutInterval = 8;
   [registerRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
   [registerRequest setValue:[NSString stringWithFormat:@"Bearer %@", serviceToken] forHTTPHeaderField:@"Authorization"];
 
@@ -325,29 +403,46 @@ void __setupProcessEnv(void) {
   NSError *registerBodyError = nil;
   registerRequest.HTTPBody = [NSJSONSerialization dataWithJSONObject:registerBody options:0 error:&registerBodyError];
   if (registerBodyError) {
+    [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
 
   NSURLSessionDataTask *registerTask = [[NSURLSession sharedSession] dataTaskWithRequest:registerRequest completionHandler:^(NSData * _Nullable registerData, NSURLResponse * _Nullable registerResponse, NSError * _Nullable registerError) {
-    if (registerError || !registerData) {
+    NSHTTPURLResponse *registerHTTP = (NSHTTPURLResponse *)registerResponse;
+    NSInteger statusCode = registerHTTP.statusCode;
+    BOOL retryable = [self _shouldRetryAPNSTokenRegistrationForError:registerError statusCode:statusCode];
+    BOOL hasData = registerData.length > 0;
+    if ((registerError || !hasData || statusCode < 200 || statusCode > 299) && retryable && attempt < BLKTmuxAPNSBackgroundMaxAttempts) {
+      NSTimeInterval delay = [self _retryDelayForAPNSTokenAttempt:attempt];
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self _registerAPNSToken:apnsToken forTmuxHost:host hostKey:hostKey attempt:attempt + 1];
+      });
       return;
     }
 
-    NSHTTPURLResponse *registerHTTP = (NSHTTPURLResponse *)registerResponse;
-    if (registerHTTP.statusCode < 200 || registerHTTP.statusCode > 299) {
+    if (registerError || !hasData || statusCode < 200 || statusCode > 299) {
+      [self _finishAPNSTokenRegistrationForHostKey:hostKey];
       return;
     }
 
     NSError *registerJSONError = nil;
     NSDictionary *registerJSON = [NSJSONSerialization JSONObjectWithData:registerData options:0 error:&registerJSONError];
     if (registerJSONError || ![registerJSON isKindOfClass:NSDictionary.class]) {
+      [self _finishAPNSTokenRegistrationForHostKey:hostKey];
       return;
     }
 
-    NSString *deviceApiToken = registerJSON[@"device_api_token"];
+    NSString *deviceApiToken = [registerJSON[@"device_api_token"] isKindOfClass:NSString.class] ? registerJSON[@"device_api_token"] : @"";
+    if (deviceApiToken.length == 0) {
+      [self _finishAPNSTokenRegistrationForHostKey:hostKey];
+      return;
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
-      host.tmuxPushDeviceApiToken = deviceApiToken ?: host.tmuxPushDeviceApiToken;
+      host.tmuxPushDeviceApiToken = deviceApiToken;
+      host.tmuxLastRegisteredAPNSToken = apnsToken;
       [BKHosts saveHosts];
+      [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     });
   }];
   [registerTask resume];

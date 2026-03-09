@@ -31,7 +31,6 @@
 
 
 import SwiftUI
-import RevenueCat
 
 struct SupportView: View {
   @EnvironmentObject private var _nav: Nav
@@ -105,7 +104,7 @@ struct SupportView: View {
 
       Section(header: Text("Internals")) {
         Button {
-          UIPasteboard.general.string = Purchases.shared.appUserID
+          UIPasteboard.general.string = RevenueCatRuntime.appUserID
         } label: {
           Label("Copy User ID", systemImage: "doc.on.clipboard")
         }

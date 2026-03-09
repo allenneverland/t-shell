@@ -214,7 +214,6 @@
 		BDF041142CA363F0005B7138 /* FilesTranslatorConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDF041132CA363F0005B7138 /* FilesTranslatorConnection.swift */; };
 		BDF2B8D32BC480CC00B9C7EA /* vim.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = BDE84C772BB33AD700457391 /* vim.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		BDF2B8D52BC480D100B9C7EA /* xxd.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = BDE84C762BB33AB800457391 /* xxd.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		BDF2B8DD2BC48D2800B9C7EA /* LibSSH.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D2334EC425C1C04700385378 /* LibSSH.xcframework */; };
 		BDF2B8DF2BC48D2D00B9C7EA /* libssh2.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D2F64C9525CA99AD00F2225D /* libssh2.xcframework */; };
 		BDF40FEB2C14A6CE00DF41C1 /* AgentSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDF40FE92C14A6CE00DF41C1 /* AgentSettingsView.swift */; };
 		BDFA97322D7F49EF0020BBF2 /* ConfettiSwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = BDFA97312D7F49EF0020BBF2 /* ConfettiSwiftUI */; };
@@ -312,7 +311,6 @@
 		D2334F0525C1C28F00385378 /* tar.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D2334ECD25C1C04700385378 /* tar.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		D2334F0625C1C28F00385378 /* text.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D2334EC725C1C04700385378 /* text.xcframework */; };
 		D2334F0725C1C28F00385378 /* text.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D2334EC725C1C04700385378 /* text.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		D2334F0C25C1C3C600385378 /* OpenSSH.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D2334F0A25C1C3A000385378 /* OpenSSH.xcframework */; };
 		D23742CA21106ADF00366359 /* bench.m in Sources */ = {isa = PBXBuildFile; fileRef = D23742C921106ADF00366359 /* bench.m */; };
 		D238675426EA76E6003A82A1 /* OwnAlertController.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDB8BEA726E008190093BF48 /* OwnAlertController.swift */; };
 		D23890BD2900175100B5CEA6 /* FeatureColorPalette.swift in Sources */ = {isa = PBXBuildFile; fileRef = D23890BC2900175100B5CEA6 /* FeatureColorPalette.swift */; };
@@ -1396,7 +1394,6 @@
 				D2334EF825C1C28F00385378 /* mosh.xcframework in Frameworks */,
 				D2334F0025C1C28F00385378 /* shell.xcframework in Frameworks */,
 				D2A0C2162600D16300F0DF97 /* Protobuf_C_.xcframework in Frameworks */,
-				D2334F0C25C1C3C600385378 /* OpenSSH.xcframework in Frameworks */,
 				D2C7710726EA49AA001B5659 /* openssl.xcframework in Frameworks */,
 				D222780C2A26216900D4C708 /* TreeSitterBashRunestone in Frameworks */,
 				D2334EF425C1C28F00385378 /* ios_system.xcframework in Frameworks */,
@@ -1408,7 +1405,6 @@
 				D297F00F29012FDB002A24F9 /* CachedAsyncImage in Frameworks */,
 				D22278082A26216900D4C708 /* TreeSitterBash in Frameworks */,
 				07FAB90F25C8E94E00E1CC2C /* ArgumentParser in Frameworks */,
-				BDF2B8DD2BC48D2800B9C7EA /* LibSSH.xcframework in Frameworks */,
 				D2334EFA25C1C28F00385378 /* network_ios.xcframework in Frameworks */,
 				D2A6398928CFA0B90066FD18 /* SwiftCBOR in Frameworks */,
 				BDECEA462CDE7544007BBCF6 /* BlinkFileProvider.framework in Frameworks */,

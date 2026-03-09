@@ -35,5 +35,6 @@ ENABLE_DEBUG_DYLIB[config=Debug] = NO
 
 WHATS_NEW_URL = http:/$()/localhost/whats-new
 CONVERSION_OPPORTUNITY_URL = http:/$()/localhost/conversionOpportunity
+REVCAT_PUBKEY =
 
 BLINK_APP_FONT = JetBrains Mono

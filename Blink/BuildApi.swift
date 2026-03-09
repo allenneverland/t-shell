@@ -178,7 +178,7 @@ enum BuildAPI {
       params: [
         "email": email,
         "region": region.rawValue,
-        "rev_cat_user_id": Purchases.shared.appUserID,
+        "rev_cat_user_id": RevenueCatRuntime.appUserID,
         "receipt_b64": receiptB64
       ]
     )
@@ -233,8 +233,13 @@ enum BuildAPI {
   
   static func loginWithToken(token: Data) async throws {
     try token.write(to: BlinkPaths.blinkBuildTokenURL()!)
-    if let buildId = TokioSignals.getBuildId() {
+    if let buildId = TokioSignals.getBuildId(),
+       RevenueCatRuntime.isEnabled,
+       RevenueCatRuntime.isConfigured
+    {
       let _ = try await Purchases.shared.logIn(buildId)
+    } else if !RevenueCatRuntime.isEnabled || !RevenueCatRuntime.isConfigured {
+      RevenueCatRuntime.logDisabledIfNeeded(context: "BuildAPI.logIn")
     }
   }
 }

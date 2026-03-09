@@ -175,6 +175,10 @@ public class Stream : Reader, Writer, WriterTo {
     let outstream = OutStream(self)
     return outstream.writeTo(w)
   }
+
+  public var exitStatus: Int32 {
+    ssh_channel_get_exit_status(channel)
+  }
   
   public func sendEOF() -> AnyPublisher<Void, Error> {
     return AnyPublisher
