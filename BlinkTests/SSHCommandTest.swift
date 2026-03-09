@@ -184,6 +184,123 @@ abc123
   }
 }
 
+final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
+  func testTailscaleVersionGateRequires152OrNewer() {
+    XCTAssertFalse(TmuxSSHOnboardingService.tailscaleVersionMeetsMinimum("1.51.9"))
+    XCTAssertTrue(TmuxSSHOnboardingService.tailscaleVersionMeetsMinimum("1.52.0"))
+    XCTAssertTrue(TmuxSSHOnboardingService.tailscaleVersionMeetsMinimum("tailscale v1.54.1-tabcdef"))
+  }
+
+  func testClassifyTailscaleServeFailureOperatorPermission() {
+    let output = "Error: permission denied: node is managed by --operator=admin"
+    let message = TmuxSSHOnboardingService.classifyTailscaleServeFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("operator") ?? false)
+  }
+
+  func testClassifyTailscaleServeFailureCertificateConsent() {
+    let output = "HTTPS certificate is not enabled yet, visit admin console to enable certs"
+    let message = TmuxSSHOnboardingService.classifyTailscaleServeFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("certificate") ?? false)
+  }
+
+  func testClassifyTailscaleServeFailureInvalidArgumentFormat() {
+    let output = "Error: invalid argument format\ntry `tailscale serve --help` for usage info"
+    let message = TmuxSSHOnboardingService.classifyTailscaleServeFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("syntax") ?? false)
+  }
+
+  func testClassifyTailscaleServeFailureForegroundListenerConflict() {
+    let output = "sending serve config: updating config: foreground listener already exists for port 443"
+    let message = TmuxSSHOnboardingService.classifyTailscaleServeFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("8787/8443/9443") ?? false)
+  }
+
+  func testClassifyTmuxdStartupFailurePortConflict() {
+    let output = "listen tcp 127.0.0.1:8787: bind: address already in use"
+    let message = TmuxSSHOnboardingService.classifyTmuxdStartupFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("8787/8790/8791") ?? false)
+  }
+
+  func testTailscaleServeScriptUsesNonInteractiveFlags() {
+    let commands = TmuxSSHOnboardingService.tailscaleServeConfigScriptForTesting()
+      .split(separator: "\n")
+      .map(String.init)
+    XCTAssertEqual(commands.count, 3)
+    XCTAssertTrue(commands.allSatisfy { $0.contains("tailscale serve --yes --bg --https=") })
+    XCTAssertTrue(commands.allSatisfy { $0.contains("--set-path=/") })
+    XCTAssertTrue(commands.allSatisfy { $0.contains("http://127.0.0.1:8787") })
+    XCTAssertTrue(commands.contains(where: { $0.contains("--https=8787") }))
+    XCTAssertTrue(commands.contains(where: { $0.contains("--https=8443") }))
+    XCTAssertTrue(commands.contains(where: { $0.contains("--https=9443") }))
+    XCTAssertFalse(commands.contains(where: { $0.contains("--https=8790") }))
+    XCTAssertFalse(commands.contains(where: { $0.contains("--https=443 ") }))
+  }
+
+  func testManagedTmuxdLocalPortCandidates() {
+    XCTAssertEqual(TmuxSSHOnboardingService.tmuxdLocalPortCandidatesForTesting(), [8787, 8790, 8791])
+  }
+
+  func testLocalHealthScriptIncludesPythonFallbackAndDynamicPort() {
+    let script = TmuxSSHOnboardingService.localHealthzScriptForTesting(port: 8790)
+    XCTAssertTrue(script.contains("127.0.0.1:$port/v1/healthz"))
+    XCTAssertTrue(script.contains("command -v python3"))
+    XCTAssertTrue(script.contains("command -v python"))
+    XCTAssertTrue(script.contains("tmuxd process exited before health check succeeded on 127.0.0.1:$port."))
+  }
+
+  func testPreferredServeRoutePrefersManagedFallbackPorts() {
+    let status = """
+    https://host.tailnet.ts.net:8790 (tailnet only)
+    |-- / proxy http://127.0.0.1:8787
+    https://host.tailnet.ts.net:8443 (tailnet only)
+    |-- / proxy http://127.0.0.1:8787
+    """
+    let route = TmuxSSHOnboardingService.preferredTailscaleHTTPSRouteForTesting(statusOutput: status)
+    XCTAssertEqual(route, "https://host.tailnet.ts.net:8443")
+  }
+
+  func testPreferredServeRouteAcceptsTrailingSlashProxyTarget() {
+    let status = """
+    https://host.tailnet.ts.net:8787 (tailnet only)
+    |-- / proxy http://127.0.0.1:8787/
+    """
+    let route = TmuxSSHOnboardingService.preferredTailscaleHTTPSRouteForTesting(statusOutput: status)
+    XCTAssertEqual(route, "https://host.tailnet.ts.net:8787")
+  }
+
+  func testPreferredServeRouteSupportsCustomProxyTarget() {
+    let status = """
+    https://host.tailnet.ts.net:8787 (tailnet only)
+    |-- / proxy http://127.0.0.1:8787
+    https://host.tailnet.ts.net:8443 (tailnet only)
+    |-- / proxy http://127.0.0.1:8790
+    """
+    let route = TmuxSSHOnboardingService.preferredTailscaleHTTPSRouteForTesting(
+      statusOutput: status,
+      target: "http://127.0.0.1:8790"
+    )
+    XCTAssertEqual(route, "https://host.tailnet.ts.net:8443")
+  }
+
+  func testFormatExecFailureIncludesBothStdoutAndStderr() {
+    let message = TmuxSSHOnboardingService.formatExecFailureForTesting(
+      exitStatus: 1,
+      stdout: "serve status: no handler configured",
+      stderr: "permission denied",
+      command: "tailscale serve --yes --bg --https=8787 --set-path=/ http://127.0.0.1:8787"
+    )
+    XCTAssertTrue(message.contains("stderr:"))
+    XCTAssertTrue(message.contains("stdout:"))
+    XCTAssertTrue(message.contains("serve status: no handler configured"))
+    XCTAssertTrue(message.contains("permission denied"))
+  }
+}
+
 final class SecurityScopedFileReaderTests: XCTestCase {
   func testReadUTF8TextTrimsWhitespaceAndNewlines() throws {
     let url = try _temporaryFile(data: " \nmy-key\n ".data(using: .utf8)!)
