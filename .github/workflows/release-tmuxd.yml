@@ -44,13 +44,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
+            {
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+              echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+            } >> "$GITHUB_ENV"
           fi
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
-            echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+            {
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc"
+              echo "CC_x86_64_unknown_linux_musl=musl-gcc"
+            } >> "$GITHUB_ENV"
           fi
 
       - name: Build tmuxd

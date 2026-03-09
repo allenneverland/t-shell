@@ -21,6 +21,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Lint workflow files
+        # Keep this gate strict: actionlint + shellcheck findings should block merges.
         uses: rhysd/actionlint@e7d448ef7507c20fc4c88a95d0c448b848cd6127 # v1.7.8
 
   deprecated-actions-policy:
