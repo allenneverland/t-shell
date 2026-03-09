@@ -19,7 +19,7 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64-gnu
-            apt_packages: ""
+            apt_packages: "tmux"
           - runner: macos-14
             target: aarch64-apple-darwin
             platform: darwin-aarch64
@@ -56,6 +56,12 @@ jobs:
               echo "CC_x86_64_unknown_linux_musl=musl-gcc"
             } >> "$GITHUB_ENV"
           fi
+
+      - name: Run tmux hook integration tests
+        working-directory: vendor/reattach
+        env:
+          TMUXD_REQUIRE_TMUX_INTEGRATION: "1"
+        run: cargo test --package tmuxd tmux_generated_hook_command_sets_cleanly
 
       - name: Build tmuxd
         working-directory: vendor/reattach

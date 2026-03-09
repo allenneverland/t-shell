@@ -936,6 +936,11 @@ const TMUX_BELL_TARGET_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_in
 const TMUX_BELL_TITLE: &str = "tmux bell";
 const TMUX_BELL_BODY: &str = "tmux bell";
 
+struct TmuxBellHookSpec {
+    notify_shell_command: String,
+    hook_command: String,
+}
+
 fn install_tmux_bell_hook() -> Result<(), String> {
     let tmux_conf = match home_file(".tmux.conf") {
         Some(path) => path,
@@ -950,10 +955,10 @@ fn install_tmux_bell_hook() -> Result<(), String> {
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "tmuxd".to_string());
 
-    let run_shell = build_tmux_bell_notify_command(&binary);
-    let escaped = tmux_escape_for_double_quotes(&run_shell);
+    let hook_spec = build_tmux_bell_hook_spec(&binary);
     let managed = format!(
-        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\nset-hook -g alert-bell \"run-shell -b \\\"{escaped}\\\"\"\n{TMUX_MANAGED_END}\n"
+        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\nset-hook -g alert-bell {}\n{TMUX_MANAGED_END}\n",
+        hook_spec.hook_command
     );
 
     let updated = upsert_managed_tmux_block(&existing, &managed);
@@ -963,7 +968,7 @@ fn install_tmux_bell_hook() -> Result<(), String> {
         println!("Updated {}", tmux_conf.display());
     }
 
-    match apply_runtime_tmux_bell_hook(&run_shell)? {
+    match apply_runtime_tmux_bell_hook(&hook_spec.hook_command)? {
         RuntimeApplyResult::Applied => {
             println!("Applied tmux alert-bell runtime hook");
         }
@@ -1012,8 +1017,8 @@ fn uninstall_tmux_bell_hook() -> Result<(), String> {
 }
 
 fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
-    let run_shell = build_tmux_bell_notify_command(binary);
-    let expected_fragment = format!("run-shell -b \"{}\"", run_shell);
+    let hook_spec = build_tmux_bell_hook_spec(binary);
+    let expected_fragment = hook_spec.hook_command.clone();
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
 
@@ -1038,9 +1043,9 @@ fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
                                 .to_string(),
                         );
                         false
-                    } else if !block.contains(&expected_fragment) {
+                    } else if !block.contains(expected_fragment.as_str()) {
                         reasons.push(
-                            "managed tmux block exists but hook command does not match current tmuxd binary path"
+                            "managed tmux block exists but hook command does not match current tmuxd binary path or escaping format"
                                 .to_string(),
                         );
                         false
@@ -1112,7 +1117,7 @@ enum RuntimeApplyResult {
     NoServerRunning,
 }
 
-fn apply_runtime_tmux_bell_hook(run_shell: &str) -> Result<RuntimeApplyResult, String> {
+fn apply_runtime_tmux_bell_hook(hook_command: &str) -> Result<RuntimeApplyResult, String> {
     ensure_tmux_binary_available()?;
 
     if !tmux_server_is_running()? {
@@ -1128,9 +1133,8 @@ fn apply_runtime_tmux_bell_hook(run_shell: &str) -> Result<RuntimeApplyResult, S
         "set bell-action",
     )?;
 
-    let hook_value = format!("run-shell -b \"{}\"", run_shell);
     let output = std::process::Command::new("tmux")
-        .args(["set-hook", "-g", "alert-bell", hook_value.as_str()])
+        .args(["set-hook", "-g", "alert-bell", hook_command])
         .output()
         .map_err(|e| format!("failed to execute `tmux set-hook`: {e}"))?;
     if !output.status.success() {
@@ -1303,6 +1307,18 @@ fn build_tmux_bell_notify_command(binary: &str) -> String {
     )
 }
 
+fn build_tmux_bell_hook_spec(binary: &str) -> TmuxBellHookSpec {
+    let notify_shell_command = build_tmux_bell_notify_command(binary);
+    let hook_command = format!(
+        "run-shell -b {}",
+        shell_escape_single_quoted(&notify_shell_command)
+    );
+    TmuxBellHookSpec {
+        notify_shell_command,
+        hook_command,
+    }
+}
+
 fn shell_escape_double_quoted(raw: &str) -> String {
     let mut escaped = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -1317,16 +1333,23 @@ fn shell_escape_double_quoted(raw: &str) -> String {
     escaped
 }
 
-fn tmux_escape_for_double_quotes(raw: &str) -> String {
-    raw.replace('\\', "\\\\").replace('"', "\\\"")
+fn shell_escape_single_quoted(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tmux_bell_notify_command, is_tmux_no_server_output, resolve_notify_port,
-        TMUX_BELL_TARGET_FORMAT,
+        build_tmux_bell_hook_spec, build_tmux_bell_notify_command, is_tmux_no_server_output,
+        resolve_notify_port, TMUX_BELL_TARGET_FORMAT,
     };
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn notify_port_prefers_override() {
@@ -1347,6 +1370,14 @@ mod tests {
     }
 
     #[test]
+    fn bell_hook_command_uses_single_quoted_run_shell_payload() {
+        let spec = build_tmux_bell_hook_spec("/home/allen/.local/bin/tmuxd");
+        assert!(spec.hook_command.starts_with("run-shell -b '"));
+        assert!(spec.hook_command.contains("notify --source bell"));
+        assert!(!spec.hook_command.contains("run-shell -b \"\""));
+    }
+
+    #[test]
     fn tmux_no_server_output_detection_handles_common_messages() {
         assert!(is_tmux_no_server_output(
             "failed to connect to server: Connection refused"
@@ -1363,5 +1394,131 @@ mod tests {
     fn tmux_no_server_output_detection_ignores_other_errors() {
         assert!(!is_tmux_no_server_output("unknown option: --foo"));
         assert!(!is_tmux_no_server_output("permission denied"));
+    }
+
+    #[test]
+    fn tmux_generated_hook_command_sets_cleanly() {
+        let require_integration = std::env::var("TMUXD_REQUIRE_TMUX_INTEGRATION")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        let tmux_version = match Command::new("tmux").arg("-V").output() {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                if require_integration {
+                    panic!(
+                        "tmux exists but `tmux -V` failed: {}",
+                        format_output(&output)
+                    );
+                }
+                eprintln!("Skipping tmux integration test: {}", format_output(&output));
+                return;
+            }
+            Err(err) => {
+                if require_integration {
+                    panic!("tmux is required for integration tests: {err}");
+                }
+                eprintln!("Skipping tmux integration test: {err}");
+                return;
+            }
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let tmux_tmpdir = Path::new("/tmp").join(format!("tmuxd-it-{}-{now}", std::process::id()));
+        fs::create_dir_all(&tmux_tmpdir).expect("create tmux tmpdir");
+
+        let socket = format!("ti{}{}", std::process::id(), now);
+        let new_session = run_tmux_with_tmpdir(
+            &tmux_tmpdir,
+            &socket,
+            &["-f", "/dev/null", "new-session", "-d"],
+        );
+        if !new_session.status.success() {
+            let detail = format_output(&new_session);
+            if require_integration {
+                panic!("failed to start isolated tmux server: {detail}");
+            }
+            eprintln!("Skipping tmux integration test: {detail}");
+            return;
+        }
+
+        let list_sessions = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["list-sessions"]);
+        if !list_sessions.status.success() {
+            let detail = format_output(&list_sessions);
+            let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
+            if require_integration {
+                panic!("isolated tmux server did not stay up: {detail}");
+            }
+            eprintln!("Skipping tmux integration test: {detail}");
+            return;
+        }
+
+        let binary = "/home/allen/.local/bin/tmuxd";
+        let spec = build_tmux_bell_hook_spec(binary);
+        let set_hook = run_tmux_with_tmpdir(
+            &tmux_tmpdir,
+            &socket,
+            &["set-hook", "-g", "alert-bell", spec.hook_command.as_str()],
+        );
+        if !set_hook.status.success() {
+            let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
+            panic!(
+                "generated hook command rejected by tmux {}: {}",
+                String::from_utf8_lossy(&tmux_version.stdout).trim(),
+                format_output(&set_hook)
+            );
+        }
+
+        let show_hooks =
+            run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["show-hooks", "-g", "alert-bell"]);
+        let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
+        assert!(
+            show_hooks.status.success(),
+            "show-hooks failed: {}",
+            format_output(&show_hooks)
+        );
+        let hooks_output = String::from_utf8_lossy(&show_hooks.stdout);
+        assert!(
+            hooks_output.contains("notify --source bell"),
+            "hook output missing notify route: {hooks_output}"
+        );
+        assert!(
+            !hooks_output.contains("run-shell -b \"\""),
+            "hook output contains broken quoting: {hooks_output}"
+        );
+        let normalized_hooks_output = hooks_output.replace("\\\"", "\"");
+        assert!(
+            normalized_hooks_output.contains(spec.notify_shell_command.as_str()),
+            "hook output does not contain expected notify shell command:\nexpected: {}\nactual: {}",
+            spec.notify_shell_command,
+            hooks_output
+        );
+    }
+
+    fn run_tmux_with_tmpdir(
+        tmux_tmpdir: &Path,
+        socket: &str,
+        args: &[&str],
+    ) -> std::process::Output {
+        Command::new("tmux")
+            .env("TMUX_TMPDIR", tmux_tmpdir)
+            .args(["-L", socket])
+            .args(args)
+            .output()
+            .expect("execute tmux command")
+    }
+
+    fn format_output(output: &std::process::Output) -> String {
+        let status = output.status;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stdout.is_empty() && stderr.is_empty() {
+            return format!("exit status {status}");
+        }
+        format!("exit status {status}; stdout={stdout:?}; stderr={stderr:?}")
     }
 }

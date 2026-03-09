@@ -500,6 +500,14 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("runtime") ?? false)
   }
 
+  func testClassifyTmuxBellHookFailureForSetHookSyntaxError() {
+    let output = "Remote command failed with exit status 1.\nstderr:\ntmuxd fatal error: internal error: `tmux set-hook` failed: syntax error"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("syntax") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("tmuxd") ?? false)
+  }
+
   func testParseTmuxBellHookVerifyJSON() {
     let json = """
     {"persistent_config_ok":true,"runtime_server_present":false,"runtime_hook_ok":false,"overall_ok":true,"reasons":[],"warnings":["runtime tmux server is not running"]}

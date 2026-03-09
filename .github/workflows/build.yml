@@ -8,6 +8,29 @@ permissions:
   contents: read
 
 jobs:
+  tmuxd-hook-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+
+      - name: tmuxd hook integration tests
+        working-directory: vendor/reattach
+        env:
+          TMUXD_REQUIRE_TMUX_INTEGRATION: "1"
+        run: cargo test --package tmuxd tmux_generated_hook_command_sets_cleanly
+
   build:
     runs-on: macos-14
     timeout-minutes: 60

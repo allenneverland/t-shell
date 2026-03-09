@@ -1454,6 +1454,10 @@ enum TmuxSSHOnboardingService {
       return "Installed tmuxd is outdated and does not support structured bell hook verification. Re-run onboarding to install the latest tmuxd release."
     }
 
+    if lower.contains("set-hook") && lower.contains("syntax error") {
+      return "tmux rejected the generated alert-bell hook command due to syntax/escaping mismatch. Re-run onboarding to install the latest tmuxd release; if the host tmux version is very old, upgrade tmux and retry."
+    }
+
     if lower.contains("runtime alert-bell hook is empty") ||
       lower.contains("runtime tmux bell hook verification failed") ||
       (lower.contains("alert-bell") && lower.contains("stdout:")) {
