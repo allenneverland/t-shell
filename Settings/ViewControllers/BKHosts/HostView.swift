@@ -1067,6 +1067,7 @@ struct HostView: View {
         try await TmuxSSHOnboardingService.sendTestBellNotificationWithRetry(
           serviceBaseURL: resolvedServiceURL,
           serviceToken: serviceToken,
+          deviceApiToken: deviceApiToken,
           serverName: prerequisites.alias,
           onProgress: { status in
             self._tmuxOnboardingStatus = status
@@ -1278,6 +1279,21 @@ enum TmuxSSHOnboardingService {
     let muted: UInt64
     let delivered: UInt64
     let failed: UInt64
+  }
+
+  private enum PushSelfTestStatus: String, Decodable {
+    case delivered
+    case apnsUnconfigured = "apns_unconfigured"
+    case badDeviceToken = "bad_device_token"
+    case dispatchFailed = "dispatch_failed"
+  }
+
+  private struct PushSelfTestResponse: Decodable {
+    let attempted: UInt64
+    let delivered: UInt64
+    let failed: UInt64
+    let status: PushSelfTestStatus
+    let detail: String
   }
 
   private struct TmuxBellHookVerifyResponse: Decodable {
@@ -1532,6 +1548,27 @@ enum TmuxSSHOnboardingService {
     formatExecFailure(RemoteExecResult(command: command, stdout: stdout, stderr: stderr, exitStatus: exitStatus))
   }
 
+  static func classifySelfTestFailureForTesting(
+    statusRaw: String,
+    attempted: UInt64,
+    delivered: UInt64,
+    failed: UInt64,
+    detail: String
+  ) -> (message: String, retryable: Bool, score: Int)? {
+    guard let status = PushSelfTestStatus(rawValue: statusRaw) else {
+      return nil
+    }
+    return classifySelfTestFailure(
+      response: PushSelfTestResponse(
+        attempted: attempted,
+        delivered: delivered,
+        failed: failed,
+        status: status,
+        detail: detail
+      )
+    )
+  }
+
   static func requireAPNSToken(timeoutNanos: UInt64 = 12_000_000_000) async throws -> String {
     let center = UNUserNotificationCenter.current()
     let settings = await withCheckedContinuation { continuation in
@@ -1715,41 +1752,53 @@ enum TmuxSSHOnboardingService {
   static func sendTestBellNotificationWithRetry(
     serviceBaseURL: String,
     serviceToken: String,
+    deviceApiToken: String,
     serverName: String,
     attempts: Int = 3,
     baseDelayNanos: UInt64 = 700_000_000,
     onProgress: ((String) -> Void)? = nil
   ) async throws {
     let totalAttempts = max(attempts, 1)
-    var lastError: Error?
+    var bestError: (score: Int, error: Error)?
     for attempt in 1...totalAttempts {
       onProgress?("Sending test bell notification (\(attempt)/\(totalAttempts))…")
+      var shouldRetry = true
       do {
-        let response = try await sendTestBellNotification(
+        let response = try await sendDeviceScopedSelfTestBellNotification(
           serviceBaseURL: serviceBaseURL,
+          deviceApiToken: deviceApiToken,
           serviceToken: serviceToken,
           serverName: serverName
         )
-        if response.delivered > 0 {
+        if response.delivered > 0, response.status == .delivered {
           return
         }
 
-        let summary = "attempted=\(response.attempted), muted=\(response.muted), delivered=\(response.delivered), failed=\(response.failed)"
-        lastError = ValidationError.general(
-          message: "Test bell notification was accepted but not delivered (\(summary))."
-        )
+        let failure = classifySelfTestFailure(response: response)
+        let error = ValidationError.general(message: failure.message)
+        bestError = keepHigherPriorityFailure(existing: bestError, candidate: (failure.score, error))
+        shouldRetry = failure.retryable
       } catch {
-        lastError = error
+        let message = error.localizedDescription
+        let retryable = isRetryableBellVerificationError(message)
+        let score = retryable ? 35 : 85
+        let wrapped = ValidationError.general(message: message)
+        bestError = keepHigherPriorityFailure(existing: bestError, candidate: (score, wrapped))
+        shouldRetry = retryable
       }
 
-      if attempt < totalAttempts {
+      if !shouldRetry {
+        break
+      }
+
+      if attempt < totalAttempts, shouldRetry {
         let delay = retryDelayNanos(baseDelayNanos: baseDelayNanos, attempt: attempt)
         try await Task.sleep(nanoseconds: delay)
       }
     }
 
     throw ValidationError.general(
-      message: "Onboarding verification failed: test bell notification could not be delivered (\(lastError?.localizedDescription ?? "unknown error"))."
+      message: "Onboarding verification failed: test bell notification could not be delivered (\(bestError?.error.localizedDescription ?? "unknown error"))."
     )
   }
 
@@ -1800,11 +1849,7 @@ enum TmuxSSHOnboardingService {
     registerRequest.setValue("Bearer \(serviceToken)", forHTTPHeaderField: "Authorization")
     registerRequest.timeoutInterval = 8
 
-    #if DEBUG
-    let sandbox = true
-    #else
-    let sandbox = false
-    #endif
+    let sandbox = AppDelegate.isAPNSSandboxEnvironment()
 
     registerRequest.httpBody = try JSONSerialization.data(withJSONObject: [
       "token": apnsToken,
@@ -1875,6 +1920,157 @@ enum TmuxSSHOnboardingService {
     } catch {
       throw ValidationError.general(message: "Test bell response decode failed: \(error.localizedDescription)")
     }
+  }
+
+  private static func sendDeviceSelfTest(
+    serviceBaseURL: String,
+    deviceApiToken: String,
+    serverName: String
+  ) async throws -> PushSelfTestResponse {
+    guard let baseURL = normalizeServiceBaseURL(serviceBaseURL),
+          let selfTestURL = URL(string: "\(baseURL)/v1/push/self-test")
+    else {
+      throw ValidationError.general(message: "Tmux endpoint is invalid.")
+    }
+
+    var request = URLRequest(url: selfTestURL)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(deviceApiToken)", forHTTPHeaderField: "Authorization")
+    request.timeoutInterval = 8
+
+    let testToken = String(UUID().uuidString.prefix(8))
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+      "title": "tmux bell",
+      "body": "\(serverName) onboarding bell test \(testToken)"
+    ])
+
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await networkSession.data(for: request)
+    } catch {
+      throw ValidationError.general(message: "Device self-test transport error: \(transportErrorMessage(error)).")
+    }
+
+    let http = response as? HTTPURLResponse
+    guard let http else {
+      throw ValidationError.general(message: "Device self-test returned non-HTTP response.")
+    }
+
+    guard (200...299).contains(http.statusCode) else {
+      throw ValidationError.general(message: "Device self-test request failed (HTTP \(http.statusCode)).")
+    }
+
+    do {
+      return try JSONDecoder().decode(PushSelfTestResponse.self, from: data)
+    } catch {
+      throw ValidationError.general(message: "Device self-test response decode failed: \(error.localizedDescription)")
+    }
+  }
+
+  private static func sendDeviceScopedSelfTestBellNotification(
+    serviceBaseURL: String,
+    deviceApiToken: String,
+    serviceToken: String,
+    serverName: String
+  ) async throws -> PushSelfTestResponse {
+    do {
+      return try await sendDeviceSelfTest(
+        serviceBaseURL: serviceBaseURL,
+        deviceApiToken: deviceApiToken,
+        serverName: serverName
+      )
+    } catch {
+      let message = error.localizedDescription.lowercased()
+      if message.contains("http 404") || message.contains("http 405") {
+        let legacy = try await sendTestBellNotification(
+          serviceBaseURL: serviceBaseURL,
+          serviceToken: serviceToken,
+          serverName: serverName
+        )
+        if legacy.delivered > 0 {
+          return PushSelfTestResponse(
+            attempted: legacy.attempted,
+            delivered: legacy.delivered,
+            failed: legacy.failed,
+            status: .delivered,
+            detail: "Legacy bell ingest endpoint delivered the test notification."
+          )
+        }
+
+        if legacy.attempted == 0 && legacy.muted == 0 {
+          return PushSelfTestResponse(
+            attempted: legacy.attempted,
+            delivered: legacy.delivered,
+            failed: legacy.failed,
+            status: .dispatchFailed,
+            detail: "Legacy endpoint reports zero active recipients (attempted=0, muted=0). This usually indicates endpoint mismatch or revoked/absent device registration."
+          )
+        }
+
+        if legacy.failed > 0 {
+          return PushSelfTestResponse(
+            attempted: legacy.attempted,
+            delivered: legacy.delivered,
+            failed: legacy.failed,
+            status: .dispatchFailed,
+            detail: "Legacy endpoint failed APNs dispatch for the registered recipients."
+          )
+        }
+
+        return PushSelfTestResponse(
+          attempted: legacy.attempted,
+          delivered: legacy.delivered,
+          failed: legacy.failed,
+          status: .dispatchFailed,
+          detail: "Legacy endpoint accepted bell event but did not deliver."
+        )
+      }
+      throw error
+    }
+  }
+
+  private static func classifySelfTestFailure(response: PushSelfTestResponse) -> (message: String, retryable: Bool, score: Int) {
+    let summary = "attempted=\(response.attempted), delivered=\(response.delivered), failed=\(response.failed), status=\(response.status.rawValue)"
+    switch response.status {
+    case .delivered:
+      return ("Bell verification succeeded.", false, 0)
+    case .apnsUnconfigured:
+      return ("tmuxd APNs is not configured, so notifications cannot be delivered (\(summary)). \(response.detail)", false, 100)
+    case .badDeviceToken:
+      return ("APNs rejected this device token (\(summary)). This usually means APNs environment/profile mismatch or a stale token. \(response.detail)", false, 95)
+    case .dispatchFailed:
+      if response.attempted == 0 {
+        return ("Test bell notification had no active recipients (\(summary)). This indicates endpoint mismatch or missing device registration. \(response.detail)", false, 90)
+      }
+      return ("Test bell notification dispatch failed (\(summary)). \(response.detail)", true, 70)
+    }
+  }
+
+  private static func keepHigherPriorityFailure(
+    existing: (score: Int, error: Error)?,
+    candidate: (score: Int, error: Error)
+  ) -> (score: Int, error: Error) {
+    guard let existing else {
+      return candidate
+    }
+    return candidate.score >= existing.score ? candidate : existing
+  }
+
+  private static func isRetryableBellVerificationError(_ message: String) -> Bool {
+    let lower = message.lowercased()
+    if lower.contains("transport error") ||
+      lower.contains("timed out") ||
+      lower.contains("timeout") ||
+      lower.contains("network connection was lost") ||
+      lower.contains("temporarily unavailable") ||
+      lower.contains("http 502") ||
+      lower.contains("http 503") ||
+      lower.contains("http 504") {
+      return true
+    }
+    return false
   }
 
   private static func checkServiceHealth(serviceBaseURL: String) async throws {

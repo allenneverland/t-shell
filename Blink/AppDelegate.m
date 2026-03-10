@@ -97,6 +97,47 @@ static NSMutableDictionary<NSString *, NSDate *> * _BLKTmuxAPNSLastAttemptByHost
 static UICKeyChainStore * _BLKTmuxAPNsKeychain(void) {
   return [UICKeyChainStore keyChainStoreWithService:BLKTmuxAPNsKeychainService];
 }
+
+static NSString * _Nullable _BLKAPNSEnvironmentFromEmbeddedProvision(void) {
+  NSURL *provisionURL = [NSBundle.mainBundle URLForResource:@"embedded" withExtension:@"mobileprovision"];
+  if (!provisionURL) {
+    return nil;
+  }
+
+  NSData *rawData = [NSData dataWithContentsOfURL:provisionURL];
+  if (rawData.length == 0) {
+    return nil;
+  }
+
+  NSString *rawText = [[NSString alloc] initWithData:rawData encoding:NSISOLatin1StringEncoding];
+  if (rawText.length == 0) {
+    return nil;
+  }
+
+  NSRange plistStart = [rawText rangeOfString:@"<?xml"];
+  NSRange plistEnd = [rawText rangeOfString:@"</plist>"];
+  if (plistStart.location == NSNotFound || plistEnd.location == NSNotFound || plistEnd.location <= plistStart.location) {
+    return nil;
+  }
+
+  NSUInteger plistLength = (plistEnd.location + plistEnd.length) - plistStart.location;
+  NSString *plistSlice = [rawText substringWithRange:NSMakeRange(plistStart.location, plistLength)];
+  NSData *plistData = [plistSlice dataUsingEncoding:NSUTF8StringEncoding];
+  if (plistData.length == 0) {
+    return nil;
+  }
+
+  NSError *error = nil;
+  id root = [NSPropertyListSerialization propertyListWithData:plistData options:NSPropertyListImmutable format:nil error:&error];
+  if (error || ![root isKindOfClass:NSDictionary.class]) {
+    return nil;
+  }
+
+  NSDictionary *dict = (NSDictionary *)root;
+  NSDictionary *entitlements = [dict[@"Entitlements"] isKindOfClass:NSDictionary.class] ? dict[@"Entitlements"] : nil;
+  NSString *environment = [entitlements[@"aps-environment"] isKindOfClass:NSString.class] ? entitlements[@"aps-environment"] : nil;
+  return environment.length > 0 ? environment : nil;
+}
   
 void __on_pipebroken_signal(int signum){
   NSLog(@"PIPE is broken");
@@ -387,11 +428,7 @@ void __setupProcessEnv(void) {
   [registerRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
   [registerRequest setValue:[NSString stringWithFormat:@"Bearer %@", serviceToken] forHTTPHeaderField:@"Authorization"];
 
-  #if DEBUG
-    BOOL sandbox = YES;
-  #else
-    BOOL sandbox = NO;
-  #endif
+  BOOL sandbox = [AppDelegate isAPNSSandboxEnvironment];
 
   NSDictionary *registerBody = @{
     @"token": apnsToken,
@@ -468,6 +505,36 @@ void __setupProcessEnv(void) {
 
 + (NSString * _Nullable)currentAPNSToken {
   return [[NSUserDefaults standardUserDefaults] stringForKey:BLKAPNsTokenDefaultsKey];
+}
+
++ (BOOL)isAPNSSandboxEnvironment {
+  static dispatch_once_t onceToken;
+  static BOOL sandbox = YES;
+
+  dispatch_once(&onceToken, ^{
+    BOOL resolved = NO;
+    NSString *environment = _BLKAPNSEnvironmentFromEmbeddedProvision();
+    if (environment.length > 0) {
+      NSString *lower = environment.lowercaseString;
+      if ([lower isEqualToString:@"development"]) {
+        sandbox = YES;
+        resolved = YES;
+      } else if ([lower isEqualToString:@"production"]) {
+        sandbox = NO;
+        resolved = YES;
+      }
+    }
+
+    if (!resolved) {
+      #if DEBUG
+        sandbox = YES;
+      #else
+        sandbox = NO;
+      #endif
+    }
+  });
+
+  return sandbox;
 }
 
 + (void)requestRemoteNotificationsRegistrationIfNeeded {

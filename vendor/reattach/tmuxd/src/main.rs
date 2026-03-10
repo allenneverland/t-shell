@@ -545,6 +545,7 @@ async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
         ));
 
     let push_device_api_routes = Router::new()
+        .route("/v1/push/self-test", post(push_api::push_self_test))
         .route(
             "/v1/push/mutes",
             get(push_api::list_mutes).post(push_api::create_mute),

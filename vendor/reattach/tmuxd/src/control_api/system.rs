@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use crate::tmux;
 
-const CAPABILITIES_SCHEMA_VERSION: u32 = 5;
+const CAPABILITIES_SCHEMA_VERSION: u32 = 6;
 const INPUT_EVENTS_MAX_BATCH: u32 = 128;
 
 #[derive(Serialize)]
@@ -40,6 +40,7 @@ pub struct EndpointCapabilities {
     pub sessions: bool,
     pub panes: bool,
     pub pane_input_events: bool,
+    pub push_self_test: bool,
     pub notify: bool,
 }
 
@@ -66,6 +67,7 @@ pub async fn capabilities() -> Json<CapabilitiesResponse> {
             sessions: true,
             panes: true,
             pane_input_events: true,
+            push_self_test: true,
             notify: false,
         },
     })
@@ -86,7 +88,7 @@ mod tests {
         let payload = CapabilitiesResponse {
             daemon: "tmuxd",
             version: "1.0.22",
-            capabilities_schema_version: 5,
+            capabilities_schema_version: 6,
             features: FeatureCapabilities {
                 input_events_v1: InputEventsCapability {
                     enabled: true,
@@ -101,6 +103,7 @@ mod tests {
                 sessions: true,
                 panes: true,
                 pane_input_events: true,
+                push_self_test: true,
                 notify: false,
             },
         };
@@ -110,7 +113,7 @@ mod tests {
             value
                 .get("capabilities_schema_version")
                 .and_then(|v| v.as_u64()),
-            Some(5)
+            Some(6)
         );
         assert_eq!(
             value
@@ -133,6 +136,12 @@ mod tests {
         assert_eq!(
             value
                 .pointer("/endpoints/pane_input_events")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .pointer("/endpoints/push_self_test")
                 .and_then(|v| v.as_bool()),
             Some(true)
         );

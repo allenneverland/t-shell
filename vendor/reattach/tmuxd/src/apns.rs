@@ -93,24 +93,75 @@ impl ApnsService {
                 }
             }
 
-            let client = if device.sandbox {
+            let primary_is_sandbox = device.sandbox;
+            let primary_client = if primary_is_sandbox {
                 &self.sandbox_client
             } else {
                 &self.production_client
             };
+            let secondary_client = if primary_is_sandbox {
+                &self.production_client
+            } else {
+                &self.sandbox_client
+            };
 
-            match client.send(payload).await {
+            match primary_client.send(payload.clone()).await {
                 Ok(_) => {
                     sent += 1;
                 }
                 Err(a2::Error::ResponseError(ref response)) => {
-                    if let Some(ref error_body) = response.error {
-                        if error_body.reason == a2::ErrorReason::BadDeviceToken {
-                            failed += 1;
-                            invalid_device_ids.push(device.id.clone());
-                            continue;
+                    let primary_bad_device_token = response
+                        .error
+                        .as_ref()
+                        .map(|body| body.reason == a2::ErrorReason::BadDeviceToken)
+                        .unwrap_or(false);
+
+                    if primary_bad_device_token {
+                        tracing::warn!(
+                            token = %device.apns_token,
+                            primary_sandbox = primary_is_sandbox,
+                            "APNs returned BadDeviceToken on primary endpoint; retrying opposite APNs environment"
+                        );
+
+                        match secondary_client.send(payload).await {
+                            Ok(_) => {
+                                sent += 1;
+                                tracing::info!(
+                                    token = %device.apns_token,
+                                    primary_sandbox = primary_is_sandbox,
+                                    "APNs delivery succeeded after opposite-endpoint retry"
+                                );
+                            }
+                            Err(a2::Error::ResponseError(ref secondary_response)) => {
+                                let secondary_bad_device_token = secondary_response
+                                    .error
+                                    .as_ref()
+                                    .map(|body| body.reason == a2::ErrorReason::BadDeviceToken)
+                                    .unwrap_or(false);
+                                failed += 1;
+                                if secondary_bad_device_token {
+                                    invalid_device_ids.push(device.id.clone());
+                                }
+                                tracing::error!(
+                                    token = %device.apns_token,
+                                    primary_sandbox = primary_is_sandbox,
+                                    "APNs response error after opposite-endpoint retry: {:?}",
+                                    secondary_response
+                                );
+                            }
+                            Err(secondary_error) => {
+                                failed += 1;
+                                tracing::error!(
+                                    token = %device.apns_token,
+                                    primary_sandbox = primary_is_sandbox,
+                                    "APNs send error after opposite-endpoint retry: {:?}",
+                                    secondary_error
+                                );
+                            }
                         }
+                        continue;
                     }
+
                     failed += 1;
                     tracing::error!(
                         token = %device.apns_token,

@@ -37,6 +37,7 @@
 + (void)prepareShellRuntimeSynchronously;
 + (NSArray<NSString *> * _Nonnull)availableShellCommands;
 + (NSString * _Nullable)currentAPNSToken;
++ (BOOL)isAPNSSandboxEnvironment;
 + (void)requestRemoteNotificationsRegistrationIfNeeded;
 + (NSString * _Nullable)tmuxAPNsPrivateKeyForHostAlias:(NSString * _Nonnull)hostAlias;
 + (void)setTmuxAPNsPrivateKey:(NSString * _Nullable)privateKey forHostAlias:(NSString * _Nonnull)hostAlias;

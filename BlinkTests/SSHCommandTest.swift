@@ -508,6 +508,32 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("tmuxd") ?? false)
   }
 
+  func testClassifySelfTestFailureBadDeviceTokenIsNonRetryable() {
+    let classified = TmuxSSHOnboardingService.classifySelfTestFailureForTesting(
+      statusRaw: "bad_device_token",
+      attempted: 1,
+      delivered: 0,
+      failed: 1,
+      detail: "APNs rejected token"
+    )
+    XCTAssertNotNil(classified)
+    XCTAssertFalse(classified?.retryable ?? true)
+    XCTAssertTrue(classified?.message.localizedCaseInsensitiveContains("rejected") ?? false)
+  }
+
+  func testClassifySelfTestFailureAttemptedZeroIsNonRetryable() {
+    let classified = TmuxSSHOnboardingService.classifySelfTestFailureForTesting(
+      statusRaw: "dispatch_failed",
+      attempted: 0,
+      delivered: 0,
+      failed: 0,
+      detail: "no recipients"
+    )
+    XCTAssertNotNil(classified)
+    XCTAssertFalse(classified?.retryable ?? true)
+    XCTAssertTrue(classified?.message.localizedCaseInsensitiveContains("no active recipients") ?? false)
+  }
+
   func testParseTmuxBellHookVerifyJSON() {
     let json = """
     {"persistent_config_ok":true,"runtime_server_present":false,"runtime_hook_ok":false,"overall_ok":true,"reasons":[],"warnings":["runtime tmux server is not running"]}

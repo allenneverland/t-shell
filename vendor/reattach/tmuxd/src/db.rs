@@ -915,6 +915,29 @@ impl Database {
         Ok(out)
     }
 
+    pub fn active_device_by_row_id(&self, row_id: &str) -> AppResult<Option<DeviceRecord>> {
+        let conn = lock_conn(&self.conn)?;
+        let device = conn
+            .query_row(
+                "SELECT id, device_id, server_name, apns_token, sandbox
+                 FROM devices
+                 WHERE id = ?1 AND revoked_at IS NULL
+                 LIMIT 1",
+                params![row_id],
+                |row| {
+                    Ok(DeviceRecord {
+                        id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        server_name: row.get(2)?,
+                        apns_token: row.get(3)?,
+                        sandbox: row.get::<_, i64>(4)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(device)
+    }
+
     pub fn create_mute(
         &self,
         subject_device_row_id: &str,

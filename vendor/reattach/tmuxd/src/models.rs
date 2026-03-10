@@ -64,6 +64,30 @@ pub struct IngestEventResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PushSelfTestRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PushSelfTestStatus {
+    Delivered,
+    ApnsUnconfigured,
+    BadDeviceToken,
+    DispatchFailed,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PushSelfTestResponse {
+    pub attempted: u64,
+    pub delivered: u64,
+    pub failed: u64,
+    pub status: PushSelfTestStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct IosMetricsIngestRequest {
     #[serde(default)]
     pub notification_tap_total: u64,

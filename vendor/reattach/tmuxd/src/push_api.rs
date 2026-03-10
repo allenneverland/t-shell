@@ -13,7 +13,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ApnsEvent, CreateMuteRequest, EventSource, IngestEventRequest, IngestEventResponse,
-        IosMetricsIngestRequest, RegisterDeviceRequest,
+        IosMetricsIngestRequest, PushSelfTestRequest, PushSelfTestResponse, PushSelfTestStatus,
+        RegisterDeviceRequest,
     },
     state::AppState,
 };
@@ -56,6 +57,94 @@ pub async fn ingest_agent(
     Json(req): Json<IngestEventRequest>,
 ) -> AppResult<Json<IngestEventResponse>> {
     ingest_event(&state, req, EventSource::Agent).await
+}
+
+pub async fn push_self_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PushSelfTestRequest>,
+) -> AppResult<Json<PushSelfTestResponse>> {
+    let token = authorize_device_api(&state.db, &headers)?;
+    let device = state
+        .db
+        .active_device_by_row_id(&token.subject_id)?
+        .ok_or_else(|| AppError::unauthorized("device token subject is invalid"))?;
+
+    let event = ApnsEvent {
+        source: EventSource::Bell,
+        title: req.title.unwrap_or_else(|| "tmux bell".to_string()),
+        body: req
+            .body
+            .unwrap_or_else(|| "tmux bell self-test".to_string()),
+        pane_target: None,
+        event_ts: Utc::now(),
+    };
+
+    let attempted = 1u64;
+    let (delivered, failed, status, detail) = if let Some(apns) = &state.apns {
+        let dispatch = apns
+            .send_to_devices(std::slice::from_ref(&device), &event)
+            .await;
+        if !dispatch.invalid_device_ids.is_empty() {
+            state
+                .metrics
+                .invalid_token_detected_total
+                .fetch_add(dispatch.invalid_device_ids.len() as u64, Ordering::Relaxed);
+            let removed = state.db.revoke_devices(&dispatch.invalid_device_ids)?;
+            state
+                .metrics
+                .invalid_token_removed_total
+                .fetch_add(removed, Ordering::Relaxed);
+        }
+
+        if dispatch.sent > 0 {
+            (
+                dispatch.sent,
+                dispatch.failed,
+                PushSelfTestStatus::Delivered,
+                "APNs delivery accepted.".to_string(),
+            )
+        } else if !dispatch.invalid_device_ids.is_empty() {
+            (
+                dispatch.sent,
+                dispatch.failed,
+                PushSelfTestStatus::BadDeviceToken,
+                "APNs rejected the device token (BadDeviceToken) across available APNs environments."
+                    .to_string(),
+            )
+        } else {
+            (
+                dispatch.sent,
+                dispatch.failed,
+                PushSelfTestStatus::DispatchFailed,
+                "APNs dispatch failed for the registered device.".to_string(),
+            )
+        }
+    } else {
+        (
+            0,
+            attempted,
+            PushSelfTestStatus::ApnsUnconfigured,
+            "APNs is not configured on tmuxd.".to_string(),
+        )
+    };
+
+    state
+        .metrics
+        .apns_sent_total
+        .fetch_add(delivered, Ordering::Relaxed);
+    state
+        .metrics
+        .apns_failed_total
+        .fetch_add(failed, Ordering::Relaxed);
+
+    Ok(Json(PushSelfTestResponse {
+        attempted,
+        delivered,
+        failed,
+        status,
+        detail,
+    }))
 }
 
 pub async fn create_mute(
