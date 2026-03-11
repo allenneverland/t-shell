@@ -1300,6 +1300,11 @@ enum TmuxSSHOnboardingService {
     let persistentConfigOK: Bool
     let runtimeServerPresent: Bool
     let runtimeHookOK: Bool
+    let runtimeOptionsOK: Bool
+    let runtimeProbePerformed: Bool
+    let runtimeProbeHookOK: Bool
+    let runtimeProbeRawBelOK: Bool
+    let runtimeProbeReasonCodes: [String]
     let overallOK: Bool
     let reasons: [String]
     let warnings: [String]
@@ -1308,9 +1313,29 @@ enum TmuxSSHOnboardingService {
       case persistentConfigOK = "persistent_config_ok"
       case runtimeServerPresent = "runtime_server_present"
       case runtimeHookOK = "runtime_hook_ok"
+      case runtimeOptionsOK = "runtime_options_ok"
+      case runtimeProbePerformed = "runtime_probe_performed"
+      case runtimeProbeHookOK = "runtime_probe_hook_ok"
+      case runtimeProbeRawBelOK = "runtime_probe_raw_bel_ok"
+      case runtimeProbeReasonCodes = "runtime_probe_reason_codes"
       case overallOK = "overall_ok"
       case reasons
       case warnings
+    }
+
+    init(from decoder: Decoder) throws {
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      persistentConfigOK = try container.decode(Bool.self, forKey: .persistentConfigOK)
+      runtimeServerPresent = try container.decode(Bool.self, forKey: .runtimeServerPresent)
+      runtimeHookOK = try container.decode(Bool.self, forKey: .runtimeHookOK)
+      runtimeOptionsOK = try container.decodeIfPresent(Bool.self, forKey: .runtimeOptionsOK) ?? runtimeHookOK
+      runtimeProbePerformed = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbePerformed) ?? false
+      runtimeProbeHookOK = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbeHookOK) ?? true
+      runtimeProbeRawBelOK = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbeRawBelOK) ?? true
+      runtimeProbeReasonCodes = try container.decodeIfPresent([String].self, forKey: .runtimeProbeReasonCodes) ?? []
+      overallOK = try container.decode(Bool.self, forKey: .overallOK)
+      reasons = try container.decodeIfPresent([String].self, forKey: .reasons) ?? []
+      warnings = try container.decodeIfPresent([String].self, forKey: .warnings) ?? []
     }
   }
 
@@ -1365,6 +1390,15 @@ enum TmuxSSHOnboardingService {
   private static let tmuxdLocalProxyTarget = "http://127.0.0.1:8787"
   private static let tailscaleHTTPSFallbackPorts = [8787, 8443, 9443]
   private static let tmuxdStateLogPath = "$HOME/.local/state/tmuxd/tmuxd.log"
+  private static let tmuxVerifyReasonRuntimeServerNotRunning = "runtime_server_not_running"
+  private static let tmuxVerifyReasonRuntimeHookEmpty = "runtime_hook_empty"
+  private static let tmuxVerifyReasonRuntimeHookNotRouted = "runtime_hook_not_routed"
+  private static let tmuxVerifyReasonRuntimeMonitorBellOff = "runtime_monitor_bell_off"
+  private static let tmuxVerifyReasonRuntimeBellActionNone = "runtime_bell_action_none"
+  private static let tmuxVerifyReasonRuntimeProbeRunHookFailed = "runtime_probe_run_hook_failed"
+  private static let tmuxVerifyReasonRuntimeProbeRunHookNotObserved = "runtime_probe_run_hook_not_observed"
+  private static let tmuxVerifyReasonRuntimeProbeRawBelNotObserved = "runtime_probe_raw_bel_not_observed"
+  private static let tmuxVerifyReasonRuntimeProbeRestoreHookFailed = "runtime_probe_restore_hook_failed"
   private static let networkSession: URLSession = {
     let config = URLSessionConfiguration.ephemeral
     config.timeoutIntervalForRequest = 8
@@ -1474,6 +1508,26 @@ enum TmuxSSHOnboardingService {
       return "tmux rejected the generated alert-bell hook command due to syntax/escaping mismatch. Re-run onboarding to install the latest tmuxd release; if the host tmux version is very old, upgrade tmux and retry."
     }
 
+    if lower.contains("runtime tmux server is not running") ||
+      lower.contains(tmuxVerifyReasonRuntimeServerNotRunning) {
+      return "tmux runtime verification requires an active tmux server. Start tmux on the host first (for example, `tmux new -s onboarding`), then rerun onboarding."
+    }
+
+    if lower.contains(tmuxVerifyReasonRuntimeMonitorBellOff) ||
+      lower.contains(tmuxVerifyReasonRuntimeBellActionNone) ||
+      (lower.contains("monitor-bell") && lower.contains("bell-action")) {
+      return "tmux runtime bell options are disabled on active sessions/windows (monitor-bell/bell-action). Re-run onboarding after starting tmux so tmuxd can re-apply runtime bell options."
+    }
+
+    if lower.contains(tmuxVerifyReasonRuntimeProbeRunHookFailed) ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeRunHookNotObserved) {
+      return "tmux alert-bell runtime hook exists but cannot be executed reliably. Re-run onboarding to re-install runtime hook; if issue persists, upgrade tmux on the host."
+    }
+
+    if lower.contains(tmuxVerifyReasonRuntimeProbeRawBelNotObserved) {
+      return "tmux accepted hook installation but raw BEL (`printf '\\a'`) in tmux pane did not trigger `alert-bell`. Re-run onboarding with an active tmux session and retry the tmux-pane BEL test."
+    }
+
     if lower.contains("runtime alert-bell hook is empty") ||
       lower.contains("runtime tmux bell hook verification failed") ||
       (lower.contains("alert-bell") && lower.contains("stdout:")) {
@@ -1493,6 +1547,45 @@ enum TmuxSSHOnboardingService {
     }
 
     return nil
+  }
+
+  private static func tmuxBellHookVerificationFailureMessage(report: TmuxBellHookVerifyResponse) -> String {
+    let reasonCodes = Set(report.runtimeProbeReasonCodes.map { $0.lowercased() })
+    let reasons = report.reasons.isEmpty ? "unknown reason" : report.reasons.joined(separator: "; ")
+
+    if !report.persistentConfigOK {
+      return "tmux persistent bell hook configuration is incomplete: \(reasons)"
+    }
+
+    if !report.runtimeServerPresent || reasonCodes.contains(tmuxVerifyReasonRuntimeServerNotRunning) {
+      return "tmux runtime verification requires an active tmux server. Start tmux on the host first (for example, `tmux new -s onboarding`), then rerun onboarding."
+    }
+
+    if !report.runtimeHookOK ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeHookEmpty) ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeHookNotRouted) {
+      return "tmux runtime alert-bell hook is empty or not routed to tmuxd notify: \(reasons)"
+    }
+
+    if !report.runtimeOptionsOK ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeMonitorBellOff) ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeBellActionNone) {
+      return "tmux runtime bell options are disabled on active sessions/windows (monitor-bell/bell-action): \(reasons)"
+    }
+
+    if report.runtimeProbePerformed && !report.runtimeProbeHookOK {
+      return "tmux runtime hook probe failed (`run-hook alert-bell` path is unhealthy): \(reasons)"
+    }
+
+    if report.runtimeProbePerformed && !report.runtimeProbeRawBelOK {
+      return "tmux pane raw BEL probe failed (`printf '\\a'` did not trigger alert-bell): \(reasons)"
+    }
+
+    if reasonCodes.contains(tmuxVerifyReasonRuntimeProbeRestoreHookFailed) {
+      return "tmux runtime probe completed but failed to restore `alert-bell` hook cleanly: \(reasons)"
+    }
+
+    return "tmux bell hook verification failed: \(reasons)"
   }
 
   private static func decodeTmuxBellHookVerifyResponse(_ raw: String) -> TmuxBellHookVerifyResponse? {
@@ -1663,6 +1756,9 @@ enum TmuxSSHOnboardingService {
 
     await MainActor.run { onProgress("Validating local tmuxd health…") }
     try await runChecked(script: waitForLocalHealthzScript(localPort: runtime.localPort), on: client)
+
+    await MainActor.run { onProgress("Ensuring tmux server is running…") }
+    try await runChecked(script: requireActiveTmuxServerScript(), on: client)
 
     await MainActor.run { onProgress("Installing tmux bell hook…") }
     try await installTmuxBellHook(on: client)
@@ -2263,24 +2359,22 @@ enum TmuxSSHOnboardingService {
   private static func installTmuxBellHook(on client: SSH.SSHClient) async throws {
     do {
       try await runChecked(script: installTmuxBellHookScript(), on: client)
-      let validation = try await runChecked(script: verifyTmuxBellHookScript(), on: client)
+      let validation = try await runExec(
+        command: "sh -lc \(shellQuote(verifyTmuxBellHookScript()))",
+        on: client
+      )
       guard let report = decodeTmuxBellHookVerifyResponse(validation.stdout) else {
-        throw ValidationError.general(
-          message: "tmuxd hooks verify returned invalid JSON output."
-        )
+        if validation.exitStatus == 0 {
+          throw ValidationError.general(
+            message: "tmuxd hooks verify returned invalid JSON output."
+          )
+        }
+        throw ValidationError.general(message: formatExecFailure(validation))
       }
 
-      if !report.persistentConfigOK {
-        let reason = report.reasons.first ?? "unknown reason"
+      if !report.overallOK || validation.exitStatus != 0 {
         throw ValidationError.general(
-          message: "tmux persistent bell hook configuration is incomplete: \(reason)"
-        )
-      }
-
-      if report.runtimeServerPresent && !report.runtimeHookOK {
-        let reason = report.reasons.first ?? "runtime hook not configured"
-        throw ValidationError.general(
-          message: "tmux runtime alert-bell hook is not routed to tmuxd notify: \(reason)"
+          message: tmuxBellHookVerificationFailureMessage(report: report)
         )
       }
     } catch {
@@ -2488,10 +2582,24 @@ enum TmuxSSHOnboardingService {
     """
   }
 
+  private static func requireActiveTmuxServerScript() -> String {
+    """
+    set -eu
+    if ! command -v tmux >/dev/null 2>&1; then
+      echo "tmux is required on host before bell onboarding." >&2
+      exit 1
+    fi
+    if ! tmux list-sessions >/dev/null 2>&1; then
+      echo "runtime tmux server is not running; start tmux and retry onboarding." >&2
+      exit 1
+    fi
+    """
+  }
+
   private static func verifyTmuxBellHookScript() -> String {
     """
     set -eu
-    "$HOME/.local/bin/tmuxd" hooks verify --json
+    "$HOME/.local/bin/tmuxd" hooks verify --json --strict --probe-runtime
     """
   }
 

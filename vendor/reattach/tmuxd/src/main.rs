@@ -113,6 +113,9 @@ struct HookVerifyArgs {
     /// Return non-zero when verification is not fully healthy
     #[arg(long)]
     strict: bool,
+    /// Perform runtime bell probes (`run-hook` and raw BEL in tmux)
+    #[arg(long)]
+    probe_runtime: bool,
 }
 
 #[tokio::main]
@@ -618,7 +621,7 @@ fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_string))
                 .unwrap_or_else(|| "tmuxd".to_string());
-            let report = verify_tmux_bell_hook(&binary);
+            let report = verify_tmux_bell_hook(&binary, args.probe_runtime);
 
             if args.json {
                 let json = serde_json::to_string(&report)
@@ -650,9 +653,47 @@ fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
                     }
                 );
                 println!(
+                    "runtime_options_ok={}",
+                    if report.runtime_options_ok {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "runtime_probe_performed={}",
+                    if report.runtime_probe_performed {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "runtime_probe_hook_ok={}",
+                    if report.runtime_probe_hook_ok {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
+                    "runtime_probe_raw_bel_ok={}",
+                    if report.runtime_probe_raw_bel_ok {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!(
                     "overall_ok={}",
                     if report.overall_ok { "true" } else { "false" }
                 );
+                if !report.runtime_probe_reason_codes.is_empty() {
+                    println!("runtime_probe_reason_codes:");
+                    for code in &report.runtime_probe_reason_codes {
+                        println!("  - {code}");
+                    }
+                }
                 if !report.reasons.is_empty() {
                     println!("reasons:");
                     for reason in &report.reasons {
@@ -668,9 +709,16 @@ fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
             }
 
             if args.strict && !report.overall_ok {
+                let detail = if !report.reasons.is_empty() {
+                    report.reasons.join("; ")
+                } else if !report.runtime_probe_reason_codes.is_empty() {
+                    report.runtime_probe_reason_codes.join(", ")
+                } else {
+                    "unknown verification failure".to_string()
+                };
                 return Err(format!(
                     "tmux bell hook verification failed: {}",
-                    report.reasons.join("; ")
+                    detail
                 ));
             }
             Ok(())
@@ -683,6 +731,11 @@ struct HookVerifyReport {
     persistent_config_ok: bool,
     runtime_server_present: bool,
     runtime_hook_ok: bool,
+    runtime_options_ok: bool,
+    runtime_probe_performed: bool,
+    runtime_probe_hook_ok: bool,
+    runtime_probe_raw_bel_ok: bool,
+    runtime_probe_reason_codes: Vec<String>,
     overall_ok: bool,
     reasons: Vec<String>,
     warnings: Vec<String>,
@@ -694,6 +747,28 @@ enum RuntimeHookProbe {
     MissingTmuxBinary,
     QueryFailed(String),
 }
+
+#[derive(Default)]
+struct RuntimeBellProbeReport {
+    hook_ok: bool,
+    raw_bel_ok: bool,
+    reason_codes: Vec<String>,
+    reasons: Vec<String>,
+}
+
+const REASON_RUNTIME_SERVER_NOT_RUNNING: &str = "runtime_server_not_running";
+const REASON_RUNTIME_HOOK_EMPTY: &str = "runtime_hook_empty";
+const REASON_RUNTIME_HOOK_NOT_ROUTED: &str = "runtime_hook_not_routed";
+const REASON_RUNTIME_MONITOR_BELL_OFF: &str = "runtime_monitor_bell_off";
+const REASON_RUNTIME_BELL_ACTION_NONE: &str = "runtime_bell_action_none";
+const REASON_RUNTIME_OPTIONS_QUERY_FAILED: &str = "runtime_options_query_failed";
+const REASON_RUNTIME_PROBE_SET_HOOK_FAILED: &str = "runtime_probe_set_hook_failed";
+const REASON_RUNTIME_PROBE_RUN_HOOK_FAILED: &str = "runtime_probe_run_hook_failed";
+const REASON_RUNTIME_PROBE_RUN_HOOK_NOT_OBSERVED: &str = "runtime_probe_run_hook_not_observed";
+const REASON_RUNTIME_PROBE_NEW_WINDOW_FAILED: &str = "runtime_probe_new_window_failed";
+const REASON_RUNTIME_PROBE_SEND_BEL_FAILED: &str = "runtime_probe_send_bel_failed";
+const REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED: &str = "runtime_probe_raw_bel_not_observed";
+const REASON_RUNTIME_PROBE_RESTORE_HOOK_FAILED: &str = "runtime_probe_restore_hook_failed";
 
 fn home_file(path: &str) -> Option<std::path::PathBuf> {
     let mut home = dirs::home_dir()?;
@@ -980,14 +1055,14 @@ fn install_tmux_bell_hook() -> Result<(), String> {
         }
     }
 
-    let report = verify_tmux_bell_hook(&binary);
+    let report = verify_tmux_bell_hook(&binary, false);
     if !report.persistent_config_ok {
         return Err(format!(
             "persistent tmux bell hook verification failed: {}",
             report.reasons.join("; ")
         ));
     }
-    if report.runtime_server_present && !report.runtime_hook_ok {
+    if report.runtime_server_present && (!report.runtime_hook_ok || !report.runtime_options_ok) {
         return Err(format!(
             "runtime tmux bell hook verification failed: {}",
             report.reasons.join("; ")
@@ -1017,11 +1092,12 @@ fn uninstall_tmux_bell_hook() -> Result<(), String> {
     Ok(())
 }
 
-fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
+fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport {
     let hook_spec = build_tmux_bell_hook_spec(binary);
     let expected_fragment = hook_spec.hook_command.clone();
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
+    let mut runtime_probe_reason_codes = Vec::new();
 
     let persistent_config_ok = match home_file(".tmux.conf") {
         None => {
@@ -1074,19 +1150,35 @@ fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
                     "runtime alert-bell hook is empty (`tmux show-hooks` returned only `alert-bell`)"
                         .to_string(),
                 );
+                push_unique(
+                    &mut runtime_probe_reason_codes,
+                    REASON_RUNTIME_HOOK_EMPTY.to_string(),
+                );
                 (true, false)
             } else {
                 reasons.push(format!(
                     "runtime alert-bell hook is present but not routed to tmuxd notify: {output}"
                 ));
+                push_unique(
+                    &mut runtime_probe_reason_codes,
+                    REASON_RUNTIME_HOOK_NOT_ROUTED.to_string(),
+                );
                 (true, false)
             }
         }
         RuntimeHookProbe::ServerNotRunning(detail) => {
-            if !detail.is_empty() {
-                warnings.push(format!("runtime tmux server is not running ({detail})"));
+            let warning = if !detail.is_empty() {
+                format!("runtime tmux server is not running ({detail})")
             } else {
-                warnings.push("runtime tmux server is not running".to_string());
+                "runtime tmux server is not running".to_string()
+            };
+            warnings.push(warning.clone());
+            if probe_runtime {
+                reasons.push(warning);
+                push_unique(
+                    &mut runtime_probe_reason_codes,
+                    REASON_RUNTIME_SERVER_NOT_RUNNING.to_string(),
+                );
             }
             (false, false)
         }
@@ -1102,11 +1194,46 @@ fn verify_tmux_bell_hook(binary: &str) -> HookVerifyReport {
         }
     };
 
-    let overall_ok = persistent_config_ok && (!runtime_server_present || runtime_hook_ok);
+    let runtime_options_ok = if runtime_server_present {
+        verify_runtime_tmux_bell_options(&mut reasons, &mut runtime_probe_reason_codes)
+    } else {
+        false
+    };
+
+    let mut runtime_probe_performed = false;
+    let mut runtime_probe_hook_ok = !probe_runtime;
+    let mut runtime_probe_raw_bel_ok = !probe_runtime;
+    if probe_runtime && runtime_server_present {
+        runtime_probe_performed = true;
+        let probe = execute_runtime_tmux_bell_probe(&hook_spec.hook_command);
+        runtime_probe_hook_ok = probe.hook_ok;
+        runtime_probe_raw_bel_ok = probe.raw_bel_ok;
+        for code in probe.reason_codes {
+            push_unique(&mut runtime_probe_reason_codes, code);
+        }
+        reasons.extend(probe.reasons);
+    }
+
+    let overall_ok = if probe_runtime {
+        persistent_config_ok
+            && runtime_server_present
+            && runtime_hook_ok
+            && runtime_options_ok
+            && runtime_probe_hook_ok
+            && runtime_probe_raw_bel_ok
+    } else {
+        persistent_config_ok && (!runtime_server_present || (runtime_hook_ok && runtime_options_ok))
+    };
+
     HookVerifyReport {
         persistent_config_ok,
         runtime_server_present,
         runtime_hook_ok,
+        runtime_options_ok,
+        runtime_probe_performed,
+        runtime_probe_hook_ok,
+        runtime_probe_raw_bel_ok,
+        runtime_probe_reason_codes,
         overall_ok,
         reasons,
         warnings,
@@ -1133,17 +1260,11 @@ fn apply_runtime_tmux_bell_hook(hook_command: &str) -> Result<RuntimeApplyResult
         &["set-option", "-g", "bell-action", "any"],
         "set bell-action",
     )?;
-
-    let output = std::process::Command::new("tmux")
-        .args(["set-hook", "-g", "alert-bell", hook_command])
-        .output()
-        .map_err(|e| format!("failed to execute `tmux set-hook`: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`tmux set-hook` failed: {}",
-            format_tmux_command_output(&output)
-        ));
-    }
+    enforce_runtime_tmux_bell_options()?;
+    run_tmux_command(
+        &["set-hook", "-g", "alert-bell", hook_command],
+        "set alert-bell hook",
+    )?;
     Ok(RuntimeApplyResult::Applied)
 }
 
@@ -1212,6 +1333,376 @@ fn probe_runtime_tmux_alert_hook() -> RuntimeHookProbe {
         return RuntimeHookProbe::ServerNotRunning(detail);
     }
     RuntimeHookProbe::QueryFailed(detail)
+}
+
+fn verify_runtime_tmux_bell_options(
+    reasons: &mut Vec<String>,
+    reason_codes: &mut Vec<String>,
+) -> bool {
+    let mut runtime_options_ok = true;
+
+    let sessions = match tmux_list_sessions() {
+        Ok(sessions) => sessions,
+        Err(detail) => {
+            runtime_options_ok = false;
+            reasons.push(format!(
+                "failed to inspect runtime tmux sessions for bell-action: {detail}"
+            ));
+            push_unique(
+                reason_codes,
+                REASON_RUNTIME_OPTIONS_QUERY_FAILED.to_string(),
+            );
+            Vec::new()
+        }
+    };
+
+    for session in sessions {
+        let context = format!("inspect bell-action for session {session}");
+        match run_tmux_command_capture(
+            &["show-options", "-v", "-t", session.as_str(), "bell-action"],
+            context.as_str(),
+        ) {
+            Ok(value) => {
+                if value.trim().eq_ignore_ascii_case("none") {
+                    runtime_options_ok = false;
+                    reasons.push(format!(
+                        "runtime bell-action is disabled (`none`) for session `{session}`"
+                    ));
+                    push_unique(reason_codes, REASON_RUNTIME_BELL_ACTION_NONE.to_string());
+                }
+            }
+            Err(detail) => {
+                runtime_options_ok = false;
+                reasons.push(format!(
+                    "failed to read runtime bell-action for session `{session}`: {detail}"
+                ));
+                push_unique(
+                    reason_codes,
+                    REASON_RUNTIME_OPTIONS_QUERY_FAILED.to_string(),
+                );
+            }
+        }
+    }
+
+    let windows = match tmux_list_windows() {
+        Ok(windows) => windows,
+        Err(detail) => {
+            runtime_options_ok = false;
+            reasons.push(format!(
+                "failed to inspect runtime tmux windows for monitor-bell: {detail}"
+            ));
+            push_unique(
+                reason_codes,
+                REASON_RUNTIME_OPTIONS_QUERY_FAILED.to_string(),
+            );
+            Vec::new()
+        }
+    };
+
+    for window in windows {
+        let context = format!("inspect monitor-bell for window {window}");
+        match run_tmux_command_capture(
+            &[
+                "show-window-options",
+                "-v",
+                "-t",
+                window.as_str(),
+                "monitor-bell",
+            ],
+            context.as_str(),
+        ) {
+            Ok(value) => {
+                if !value.trim().eq_ignore_ascii_case("on") {
+                    runtime_options_ok = false;
+                    reasons.push(format!(
+                        "runtime monitor-bell is not `on` for window `{window}` (actual: `{}`)",
+                        value.trim()
+                    ));
+                    push_unique(reason_codes, REASON_RUNTIME_MONITOR_BELL_OFF.to_string());
+                }
+            }
+            Err(detail) => {
+                runtime_options_ok = false;
+                reasons.push(format!(
+                    "failed to read runtime monitor-bell for window `{window}`: {detail}"
+                ));
+                push_unique(
+                    reason_codes,
+                    REASON_RUNTIME_OPTIONS_QUERY_FAILED.to_string(),
+                );
+            }
+        }
+    }
+
+    runtime_options_ok
+}
+
+fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellProbeReport {
+    let mut report = RuntimeBellProbeReport::default();
+
+    let probe_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let base_dir = std::env::temp_dir().join("tmuxd-runtime-probe");
+    let _ = std::fs::create_dir_all(&base_dir);
+
+    let run_hook_marker = base_dir.join(format!("run-hook-{probe_id}.ok"));
+    let raw_bel_marker = base_dir.join(format!("raw-bell-{probe_id}.ok"));
+    let _ = std::fs::remove_file(&run_hook_marker);
+    let _ = std::fs::remove_file(&raw_bel_marker);
+
+    let run_hook_script = format!(
+        "touch {}",
+        shell_escape_single_quoted(run_hook_marker.to_string_lossy().as_ref())
+    );
+    let probe_hook_command = format!(
+        "run-shell -b {}",
+        shell_escape_single_quoted(&run_hook_script)
+    );
+
+    if let Err(detail) = run_tmux_command(
+        &["set-hook", "-g", "alert-bell", probe_hook_command.as_str()],
+        "configure runtime bell probe hook",
+    ) {
+        report.reasons.push(format!(
+            "failed to configure runtime bell probe hook: {detail}"
+        ));
+        push_unique(
+            &mut report.reason_codes,
+            REASON_RUNTIME_PROBE_SET_HOOK_FAILED.to_string(),
+        );
+    } else {
+        match run_tmux_command(
+            &["run-hook", "-g", "alert-bell"],
+            "execute runtime `run-hook alert-bell` probe",
+        ) {
+            Ok(()) => {
+                if wait_for_file_marker(run_hook_marker.as_path(), 1500) {
+                    report.hook_ok = true;
+                } else {
+                    report.reasons.push(
+                        "runtime `run-hook alert-bell` probe did not execute hook payload"
+                            .to_string(),
+                    );
+                    push_unique(
+                        &mut report.reason_codes,
+                        REASON_RUNTIME_PROBE_RUN_HOOK_NOT_OBSERVED.to_string(),
+                    );
+                }
+            }
+            Err(detail) => {
+                report.reasons.push(format!(
+                    "runtime `run-hook alert-bell` probe failed: {detail}"
+                ));
+                push_unique(
+                    &mut report.reason_codes,
+                    REASON_RUNTIME_PROBE_RUN_HOOK_FAILED.to_string(),
+                );
+            }
+        }
+
+        if let Some(session) = tmux_list_sessions().ok().and_then(|v| v.into_iter().next()) {
+            let created_window = run_tmux_command_capture(
+                &[
+                    "new-window",
+                    "-d",
+                    "-t",
+                    session.as_str(),
+                    "-P",
+                    "-F",
+                    "#{session_name}:#{window_index}.#{pane_index}",
+                ],
+                "create runtime raw BEL probe window",
+            );
+
+            match created_window {
+                Ok(pane_target) => {
+                    let pane_target = pane_target.trim().to_string();
+                    let window_target = pane_target
+                        .split('.')
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| pane_target.clone());
+
+                    let _ = run_tmux_command(
+                        &[
+                            "set-window-option",
+                            "-t",
+                            window_target.as_str(),
+                            "monitor-bell",
+                            "on",
+                        ],
+                        "set monitor-bell on probe window",
+                    );
+
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    match run_tmux_command(
+                        &[
+                            "send-keys",
+                            "-t",
+                            pane_target.as_str(),
+                            "printf '\\a'",
+                            "Enter",
+                        ],
+                        "send runtime raw BEL probe command",
+                    ) {
+                        Ok(()) => {
+                            if wait_for_file_marker(raw_bel_marker.as_path(), 1800) {
+                                report.raw_bel_ok = true;
+                            } else {
+                                report.reasons.push(
+                                    "runtime raw BEL probe did not trigger `alert-bell` hook"
+                                        .to_string(),
+                                );
+                                push_unique(
+                                    &mut report.reason_codes,
+                                    REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED.to_string(),
+                                );
+                            }
+                        }
+                        Err(detail) => {
+                            report.reasons.push(format!(
+                                "failed to send runtime raw BEL probe command: {detail}"
+                            ));
+                            push_unique(
+                                &mut report.reason_codes,
+                                REASON_RUNTIME_PROBE_SEND_BEL_FAILED.to_string(),
+                            );
+                        }
+                    }
+
+                    let _ = run_tmux_command(
+                        &["kill-window", "-t", window_target.as_str()],
+                        "cleanup runtime raw BEL probe window",
+                    );
+                }
+                Err(detail) => {
+                    report.reasons.push(format!(
+                        "failed to create runtime raw BEL probe window: {detail}"
+                    ));
+                    push_unique(
+                        &mut report.reason_codes,
+                        REASON_RUNTIME_PROBE_NEW_WINDOW_FAILED.to_string(),
+                    );
+                }
+            }
+        } else {
+            report
+                .reasons
+                .push("runtime raw BEL probe could not find an active tmux session".to_string());
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_SERVER_NOT_RUNNING.to_string(),
+            );
+        }
+    }
+
+    if let Err(detail) = run_tmux_command(
+        &["set-hook", "-g", "alert-bell", expected_hook_command],
+        "restore runtime alert-bell hook after probe",
+    ) {
+        report.reasons.push(format!(
+            "failed to restore runtime alert-bell hook after probe: {detail}"
+        ));
+        push_unique(
+            &mut report.reason_codes,
+            REASON_RUNTIME_PROBE_RESTORE_HOOK_FAILED.to_string(),
+        );
+    }
+
+    let _ = std::fs::remove_file(&run_hook_marker);
+    let _ = std::fs::remove_file(&raw_bel_marker);
+    report
+}
+
+fn wait_for_file_marker(path: &std::path::Path, timeout_ms: u64) -> bool {
+    let mut waited = 0u64;
+    while waited <= timeout_ms {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited = waited.saturating_add(50);
+    }
+    path.exists()
+}
+
+fn enforce_runtime_tmux_bell_options() -> Result<(), String> {
+    for session in tmux_list_sessions()? {
+        run_tmux_command(
+            &["set-option", "-t", session.as_str(), "bell-action", "any"],
+            format!("set bell-action for session {session}").as_str(),
+        )?;
+    }
+
+    for window in tmux_list_windows()? {
+        run_tmux_command(
+            &[
+                "set-window-option",
+                "-t",
+                window.as_str(),
+                "monitor-bell",
+                "on",
+            ],
+            format!("set monitor-bell for window {window}").as_str(),
+        )?;
+    }
+    Ok(())
+}
+
+fn tmux_list_sessions() -> Result<Vec<String>, String> {
+    run_tmux_capture_lines(
+        &["list-sessions", "-F", "#{session_name}"],
+        "list tmux sessions",
+    )
+}
+
+fn tmux_list_windows() -> Result<Vec<String>, String> {
+    run_tmux_capture_lines(
+        &[
+            "list-windows",
+            "-a",
+            "-F",
+            "#{session_name}:#{window_index}",
+        ],
+        "list tmux windows",
+    )
+}
+
+fn run_tmux_capture_lines(args: &[&str], context: &str) -> Result<Vec<String>, String> {
+    let output = run_tmux_command_capture(args, context)?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_tmux_command_capture(args: &[&str], context: &str) -> Result<String, String> {
+    let output = std::process::Command::new("tmux")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute `tmux` for {context}: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8(output.stdout).unwrap_or_default())
+    } else {
+        Err(format!(
+            "tmux command failed while {context}: {}",
+            format_tmux_command_output(&output)
+        ))
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn run_tmux_command(args: &[&str], context: &str) -> Result<(), String> {
@@ -1345,7 +1836,7 @@ fn shell_escape_single_quoted(raw: &str) -> String {
 mod tests {
     use super::{
         build_tmux_bell_hook_spec, build_tmux_bell_notify_command, is_tmux_no_server_output,
-        resolve_notify_port, TMUX_BELL_TARGET_FORMAT,
+        push_unique, resolve_notify_port, wait_for_file_marker, TMUX_BELL_TARGET_FORMAT,
     };
     use std::fs;
     use std::path::Path;
@@ -1395,6 +1886,29 @@ mod tests {
     fn tmux_no_server_output_detection_ignores_other_errors() {
         assert!(!is_tmux_no_server_output("unknown option: --foo"));
         assert!(!is_tmux_no_server_output("permission denied"));
+    }
+
+    #[test]
+    fn push_unique_preserves_reason_code_uniqueness() {
+        let mut values = vec!["runtime_server_not_running".to_string()];
+        push_unique(&mut values, "runtime_server_not_running".to_string());
+        push_unique(&mut values, "runtime_hook_not_routed".to_string());
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn wait_for_file_marker_detects_existing_marker() {
+        let marker_path = Path::new("/tmp").join(format!(
+            "tmuxd-marker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        fs::write(&marker_path, b"ok").expect("create marker");
+        assert!(wait_for_file_marker(marker_path.as_path(), 100));
+        let _ = fs::remove_file(marker_path);
     }
 
     #[test]

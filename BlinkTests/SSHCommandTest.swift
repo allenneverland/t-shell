@@ -483,7 +483,7 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
 
   func testTmuxBellHookVerifyScriptChecksNotifyBellHook() {
     let script = TmuxSSHOnboardingService.tmuxBellHookVerifyScriptForTesting()
-    XCTAssertTrue(script.contains("\"$HOME/.local/bin/tmuxd\" hooks verify --json"))
+    XCTAssertTrue(script.contains("\"$HOME/.local/bin/tmuxd\" hooks verify --json --strict --probe-runtime"))
   }
 
   func testClassifyTmuxBellHookFailurePermissionDeniedMentionsTmuxConf() {
@@ -536,9 +536,16 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
 
   func testParseTmuxBellHookVerifyJSON() {
     let json = """
-    {"persistent_config_ok":true,"runtime_server_present":false,"runtime_hook_ok":false,"overall_ok":true,"reasons":[],"warnings":["runtime tmux server is not running"]}
+    {"persistent_config_ok":true,"runtime_server_present":true,"runtime_hook_ok":true,"runtime_options_ok":true,"runtime_probe_performed":true,"runtime_probe_hook_ok":true,"runtime_probe_raw_bel_ok":true,"runtime_probe_reason_codes":[],"overall_ok":true,"reasons":[],"warnings":[]}
     """
     XCTAssertTrue(TmuxSSHOnboardingService.parseTmuxBellHookVerifyJSONForTesting(json))
+  }
+
+  func testClassifyTmuxBellHookFailureForRuntimeServerNotRunning() {
+    let output = "runtime tmux server is not running; start tmux and retry onboarding."
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("active tmux server") ?? false)
   }
 
   func testManagedTmuxdLocalPortCandidates() {

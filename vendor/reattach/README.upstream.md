@@ -128,11 +128,11 @@ After onboarding, verify notification readiness on the host:
 
 ```bash
 ~/.local/bin/host-agent status --json
-sleep 4 && true
+~/.local/bin/tmuxd hooks verify --json --strict --probe-runtime
 ```
 
 Ensure `notification_ready` is `true` and `readiness_errors` is empty.
-Use a long-running command (`sleep 4 && true`) for verification. `printf '\a'` can ring the terminal without triggering tmux's `alert-bell` hook.
+`hooks verify --probe-runtime` validates both runtime hook execution and raw BEL (`printf '\a'`) delivery inside tmux.
 
 If legacy Bash auto-notify files still exist from older releases, `host-agent status --json` reports them in `warnings` (for manual cleanup).
 
