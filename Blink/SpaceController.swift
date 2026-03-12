@@ -70,6 +70,7 @@ class SpaceController: UIViewController {
   private var _snippetsVC: SnippetsViewController? = nil
   private var _blinkMenu: BlinkMenu? = nil
   private var _bottomTapAreaView = UIView()
+  private var _didPresentInitialTmuxPaneInbox: Bool = false
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   
   var safeFrame: CGRect {
@@ -152,6 +153,8 @@ class SpaceController: UIViewController {
     let selector = NSSelectorFromString("tuneStyle")
     object.perform(selector)
     #endif
+
+    _presentInitialTmuxPaneInboxIfNeeded()
   }
   
   @objc func _relayout() {
@@ -209,12 +212,11 @@ class SpaceController: UIViewController {
     
     _registerForNotifications()
     
-    if _viewportsKeys.isEmpty {
-      _createShell(userActivity: nil, animated: false)
-    } else if let key = _currentKey {
+    if let key = _currentKey ?? _viewportsKeys.first {
       let term: TermController = SessionRegistry.shared[key]
       term.delegate = self
       term.bgColor = view.backgroundColor ?? .black
+      _currentKey = key
       _viewportsController.setViewControllers([term], direction: .forward, animated: false)
     }
     
@@ -443,6 +445,66 @@ Please go to your subscriptions and cancel one of them!
   
   @objc func _focusOnShell() {
     _attachInputToCurrentTerm()
+  }
+
+  private func _presentInitialTmuxPaneInboxIfNeeded() {
+    guard
+      sceneRole == .windowApplication,
+      !_didPresentInitialTmuxPaneInbox,
+      presentedViewController == nil
+    else {
+      return
+    }
+    _didPresentInitialTmuxPaneInbox = true
+    _presentTmuxPaneInbox(animated: false)
+  }
+
+  private func _presentTmuxPaneInbox(animated: Bool) {
+    guard !_isPresentingTmuxPaneInbox else {
+      return
+    }
+
+    let inbox = TmuxPaneInboxViewController(
+      onPaneSelected: { [weak self] request in
+        guard let self else {
+          return
+        }
+        self._dismissTmuxPaneInboxIfNeeded {
+          self._openTmuxPane(
+            hostAlias: request.hostAlias,
+            sessionName: request.sessionName,
+            paneTarget: request.paneTarget
+          )
+        }
+      },
+      onCreateTerminal: { [weak self] in
+        guard let self else {
+          return
+        }
+        self._dismissTmuxPaneInboxIfNeeded {
+          self._createShell(userActivity: nil, animated: true)
+          self._focusOnShell()
+        }
+      }
+    )
+    let nav = UINavigationController(rootViewController: inbox)
+    nav.modalPresentationStyle = .fullScreen
+    present(nav, animated: animated)
+  }
+
+  private var _isPresentingTmuxPaneInbox: Bool {
+    guard let nav = presentedViewController as? UINavigationController else {
+      return false
+    }
+    return nav.viewControllers.first is TmuxPaneInboxViewController
+  }
+
+  private func _dismissTmuxPaneInboxIfNeeded(completion: @escaping () -> Void) {
+    guard _isPresentingTmuxPaneInbox else {
+      completion()
+      return
+    }
+    dismiss(animated: true, completion: completion)
   }
   
   @objc private func _termViewIsReady(n: Notification) {
@@ -818,7 +880,9 @@ extension SpaceController {
   }
   
   @objc func newShellAction() {
-    _createShell(userActivity: nil, animated: true)
+    _dismissTmuxPaneInboxIfNeeded { [weak self] in
+      self?._createShell(userActivity: nil, animated: true)
+    }
   }
   
   @objc func closeShellAction() {
@@ -1259,13 +1323,18 @@ extension SpaceController {
       return
     }
 
-    _createShell(userActivity: nil, animated: true) { [weak self] _ in
-      guard let self,
-            let term = self.currentTerm()
-      else {
+    _dismissTmuxPaneInboxIfNeeded { [weak self] in
+      guard let self else {
         return
       }
-      term.enqueueProgrammaticCommand(cleanCommand, skipHistoryRecord: skipHistoryRecord)
+      self._createShell(userActivity: nil, animated: true) { [weak self] _ in
+        guard let self,
+              let term = self.currentTerm()
+        else {
+          return
+        }
+        term.enqueueProgrammaticCommand(cleanCommand, skipHistoryRecord: skipHistoryRecord)
+      }
     }
   }
 
@@ -1551,6 +1620,369 @@ func tmuxPanePickerTitle(
   let marker = (active && showActiveStar) ? "★ " : ""
   let path = currentPath.blink_lastPathComponent
   return "\(marker)\(windowName) • pane \(paneIndex) • \(path)"
+}
+
+fileprivate struct TmuxPaneInboxItem: Equatable {
+  let hostAlias: String
+  let hostName: String
+  let sessionName: String
+  let sessionAttached: Bool
+  let windowIndex: Int
+  let windowName: String
+  let paneIndex: Int
+  let paneTarget: String
+  let currentPath: String
+  let active: Bool
+}
+
+fileprivate enum TmuxPaneInboxRow: Equatable {
+  case pane(TmuxPaneInboxItem)
+  case message(String, isError: Bool)
+}
+
+fileprivate struct TmuxPaneInboxSection: Equatable {
+  let hostAlias: String
+  let hostName: String
+  let rows: [TmuxPaneInboxRow]
+}
+
+fileprivate struct TmuxPaneInboxHostDescriptor {
+  let host: BKHosts
+  let alias: String
+  let hostName: String
+}
+
+fileprivate func tmuxPaneInboxFlattenPanes(
+  hostAlias: String,
+  hostName: String,
+  sessions: [TmuxControlSession]
+) -> [TmuxPaneInboxItem] {
+  var panes: [TmuxPaneInboxItem] = []
+  panes.reserveCapacity(sessions.reduce(0) { partialResult, session in
+    partialResult + session.windows.reduce(0) { $0 + $1.panes.count }
+  })
+
+  for session in sessions {
+    let normalizedSession = session.name.blink_trimmed.isEmpty ? "(unnamed session)" : session.name.blink_trimmed
+    for window in session.windows {
+      let normalizedWindowName = window.name.blink_trimmed.isEmpty ? "window \(window.index)" : window.name.blink_trimmed
+      for pane in window.panes {
+        panes.append(
+          TmuxPaneInboxItem(
+            hostAlias: hostAlias,
+            hostName: hostName,
+            sessionName: normalizedSession,
+            sessionAttached: session.attached,
+            windowIndex: window.index,
+            windowName: normalizedWindowName,
+            paneIndex: pane.index,
+            paneTarget: pane.target,
+            currentPath: pane.currentPath,
+            active: pane.active
+          )
+        )
+      }
+    }
+  }
+
+  return panes.sorted { lhs, rhs in
+    if lhs.sessionName.caseInsensitiveCompare(rhs.sessionName) != .orderedSame {
+      return lhs.sessionName.caseInsensitiveCompare(rhs.sessionName) == .orderedAscending
+    }
+    if lhs.windowIndex != rhs.windowIndex {
+      return lhs.windowIndex < rhs.windowIndex
+    }
+    if lhs.paneIndex != rhs.paneIndex {
+      return lhs.paneIndex < rhs.paneIndex
+    }
+    return lhs.paneTarget.caseInsensitiveCompare(rhs.paneTarget) == .orderedAscending
+  }
+}
+
+@MainActor
+fileprivate final class TmuxPaneInboxViewController: UITableViewController {
+  private enum Constants {
+    static let cellID = "tmux-pane-inbox-cell"
+    static let refreshIntervalNanoseconds: UInt64 = 20_000_000_000
+  }
+
+  private let onPaneSelected: (TmuxNotificationRequest) -> Void
+  private let onCreateTerminal: () -> Void
+
+  private var sections: [TmuxPaneInboxSection] = []
+  private var autoRefreshTask: Task<Void, Never>?
+  private var refreshInFlight = false
+  private var hasLoadedOnce = false
+
+  init(
+    onPaneSelected: @escaping (TmuxNotificationRequest) -> Void,
+    onCreateTerminal: @escaping () -> Void
+  ) {
+    self.onPaneSelected = onPaneSelected
+    self.onCreateTerminal = onCreateTerminal
+    super.init(style: .insetGrouped)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    autoRefreshTask?.cancel()
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = "Tmux Chats"
+    tableView.register(UITableViewCell.self, forCellReuseIdentifier: Constants.cellID)
+    tableView.keyboardDismissMode = .onDrag
+
+    let refresh = UIRefreshControl()
+    refresh.addTarget(self, action: #selector(_pullToRefresh), for: .valueChanged)
+    refreshControl = refresh
+
+    navigationItem.rightBarButtonItem = UIBarButtonItem(
+      title: "New Terminal",
+      style: .plain,
+      target: self,
+      action: #selector(_newTerminalTapped)
+    )
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    _startAutoRefreshLoopIfNeeded()
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    autoRefreshTask?.cancel()
+    autoRefreshTask = nil
+  }
+
+  @objc private func _newTerminalTapped() {
+    onCreateTerminal()
+  }
+
+  @objc private func _pullToRefresh() {
+    Task { [weak self] in
+      await self?._reloadSections(showRefreshControl: false)
+    }
+  }
+
+  private func _startAutoRefreshLoopIfNeeded() {
+    guard autoRefreshTask == nil else {
+      return
+    }
+
+    autoRefreshTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+
+      await self._reloadSections(showRefreshControl: !self.hasLoadedOnce)
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: Constants.refreshIntervalNanoseconds)
+        if Task.isCancelled {
+          return
+        }
+        await self._reloadSections(showRefreshControl: false)
+      }
+    }
+  }
+
+  private func _eligibleHosts() -> [TmuxPaneInboxHostDescriptor] {
+    (BKHosts.allHosts() ?? [])
+      .compactMap { host -> TmuxPaneInboxHostDescriptor? in
+        guard let resolved = BKHosts.tmuxResolvedBaseURL(for: host)?.blink_trimmed, !resolved.isEmpty else {
+          return nil
+        }
+        let aliasRaw = (host.host ?? "").blink_trimmed
+        let hostName = (host.hostName ?? "").blink_trimmed
+        let alias = aliasRaw.isEmpty ? (hostName.isEmpty ? "(unknown)" : hostName) : aliasRaw
+        return TmuxPaneInboxHostDescriptor(host: host, alias: alias, hostName: hostName)
+      }
+      .sorted {
+        $0.alias.caseInsensitiveCompare($1.alias) == .orderedAscending
+      }
+  }
+
+  private func _reloadSections(showRefreshControl: Bool) async {
+    guard !refreshInFlight else {
+      return
+    }
+    refreshInFlight = true
+    defer {
+      refreshInFlight = false
+      refreshControl?.endRefreshing()
+    }
+
+    if showRefreshControl, refreshControl?.isRefreshing == false {
+      refreshControl?.beginRefreshing()
+      if tableView.contentOffset.y >= 0 {
+        tableView.setContentOffset(CGPoint(x: 0, y: -64), animated: true)
+      }
+    }
+
+    let hosts = _eligibleHosts()
+    guard !hosts.isEmpty else {
+      sections = []
+      hasLoadedOnce = true
+      tableView.reloadData()
+      _updateBackgroundView()
+      return
+    }
+
+    var nextSections: [TmuxPaneInboxSection] = []
+    nextSections.reserveCapacity(hosts.count)
+
+    for descriptor in hosts {
+      do {
+        let sessions = try await TmuxControlPlaneClient.listSessions(for: descriptor.host)
+        let panes = tmuxPaneInboxFlattenPanes(
+          hostAlias: descriptor.alias,
+          hostName: descriptor.hostName,
+          sessions: sessions
+        )
+        if panes.isEmpty {
+          nextSections.append(
+            TmuxPaneInboxSection(
+              hostAlias: descriptor.alias,
+              hostName: descriptor.hostName,
+              rows: [.message("No tmux panes found.", isError: false)]
+            )
+          )
+        } else {
+          nextSections.append(
+            TmuxPaneInboxSection(
+              hostAlias: descriptor.alias,
+              hostName: descriptor.hostName,
+              rows: panes.map { .pane($0) }
+            )
+          )
+        }
+      } catch {
+        nextSections.append(
+          TmuxPaneInboxSection(
+            hostAlias: descriptor.alias,
+            hostName: descriptor.hostName,
+            rows: [.message(error.localizedDescription, isError: true)]
+          )
+        )
+      }
+    }
+
+    sections = nextSections
+    hasLoadedOnce = true
+    tableView.reloadData()
+    _updateBackgroundView()
+  }
+
+  private func _updateBackgroundView() {
+    guard sections.isEmpty else {
+      tableView.backgroundView = nil
+      return
+    }
+
+    let titleLabel = UILabel()
+    titleLabel.textAlignment = .center
+    titleLabel.numberOfLines = 0
+    titleLabel.textColor = .secondaryLabel
+    titleLabel.font = .preferredFont(forTextStyle: .body)
+    titleLabel.text = "No valid tmux hosts found.\nConfigure a host in Settings > Hosts > SSH."
+
+    let button = UIButton(type: .system)
+    button.setTitle("New Terminal", for: .normal)
+    button.addTarget(self, action: #selector(_newTerminalTapped), for: .touchUpInside)
+
+    let stack = UIStackView(arrangedSubviews: [titleLabel, button])
+    stack.axis = .vertical
+    stack.spacing = 12
+    stack.alignment = .center
+    stack.layoutMargins = UIEdgeInsets(top: 16, left: 24, bottom: 16, right: 24)
+    stack.isLayoutMarginsRelativeArrangement = true
+
+    let container = UIView()
+    container.addSubview(stack)
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+      stack.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 24),
+      stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -24)
+    ])
+    tableView.backgroundView = container
+  }
+
+  override func numberOfSections(in tableView: UITableView) -> Int {
+    sections.count
+  }
+
+  override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    sections[section].rows.count
+  }
+
+  override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+    let item = sections[section]
+    let hostLabel: String
+    if item.hostName.isEmpty || item.hostName == item.hostAlias {
+      hostLabel = item.hostAlias
+    } else {
+      hostLabel = "\(item.hostAlias) (\(item.hostName))"
+    }
+    let paneCount = item.rows.reduce(0) { partialResult, row in
+      switch row {
+      case .pane:
+        return partialResult + 1
+      case .message:
+        return partialResult
+      }
+    }
+    return paneCount > 0 ? "\(hostLabel) • \(paneCount)" : hostLabel
+  }
+
+  override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+    let cell = tableView.dequeueReusableCell(withIdentifier: Constants.cellID, for: indexPath)
+    var content = cell.defaultContentConfiguration()
+    switch sections[indexPath.section].rows[indexPath.row] {
+    case .pane(let pane):
+      let showPaneStar = BLKDefaults.isTmuxPaneStarVisible()
+      let star = (showPaneStar && pane.active) ? "★ " : ""
+      let attached = (BLKDefaults.isTmuxSessionAttachedVisible() && pane.sessionAttached) ? " • attached" : ""
+      content.text = "\(star)\(pane.sessionName)\(attached)"
+      content.secondaryText = "\(pane.windowName) • pane \(pane.paneIndex) • \(pane.currentPath.blink_lastPathComponent)"
+      content.textProperties.color = .label
+      content.secondaryTextProperties.color = .secondaryLabel
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
+    case .message(let message, let isError):
+      content.text = message
+      content.textProperties.color = isError ? .systemRed : .secondaryLabel
+      content.secondaryText = nil
+      cell.accessoryType = .none
+      cell.selectionStyle = .none
+    }
+    cell.contentConfiguration = content
+    return cell
+  }
+
+  override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    defer {
+      tableView.deselectRow(at: indexPath, animated: true)
+    }
+
+    guard case .pane(let pane) = sections[indexPath.section].rows[indexPath.row] else {
+      return
+    }
+
+    onPaneSelected(
+      TmuxNotificationRequest(
+        hostAlias: pane.hostAlias,
+        sessionName: pane.sessionName,
+        paneTarget: pane.paneTarget
+      )
+    )
+  }
 }
 
 fileprivate struct TmuxControlSession: Decodable {

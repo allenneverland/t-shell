@@ -478,6 +478,13 @@ extension SceneDelegate {
     }
 
     guard let term = _spCtrl.currentTerm() else {
+      _spCtrl.newShellAction()
+      guard let newTerm = _spCtrl.currentTerm() else {
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
+        newTerm.termDevice.write(sshCommand)
+      }
       return
     }
 
@@ -574,8 +581,15 @@ extension SceneDelegate {
     }
 
     guard let term = _spCtrl.currentTerm() else {
-      if let xErrorURL = xErrorURL {
-        blink_openurl(xErrorURL)
+      _spCtrl.newShellAction()
+      guard let newTerm = _spCtrl.currentTerm() else {
+        if let xErrorURL = xErrorURL {
+          blink_openurl(xErrorURL)
+        }
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
+        newTerm.xCallbackLineSubmitted(cmdItem, xSuccessURL)
       }
       return
     }
@@ -641,6 +655,14 @@ extension SceneDelegate {
 
     // Call 'code'
     guard let term = _spCtrl.currentTerm() else {
+      _spCtrl.newShellAction()
+      guard let newTerm = _spCtrl.currentTerm() else {
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
+        newTerm.termDevice.write(codeCommand)
+        newTerm.termDevice.write("\n")
+      }
       return
     }
 
