@@ -516,6 +516,14 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertFalse(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? true)
   }
 
+  func testClassifyTmuxBellHookFailureForRawBellProbeMessage() {
+    let output = "tmux pane raw BEL probe failed (`printf '\\a'` did not trigger alert-bell): runtime raw BEL probe did not trigger `alert-bell` hook"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("detached probe pane") ?? false)
+    XCTAssertFalse(message?.localizedCaseInsensitiveContains("~/.tmux.conf is writable") ?? true)
+  }
+
   func testClassifySelfTestFailureBadDeviceTokenIsNonRetryable() {
     let classified = TmuxSSHOnboardingService.classifySelfTestFailureForTesting(
       statusRaw: "bad_device_token",

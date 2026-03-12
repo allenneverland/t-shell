@@ -797,7 +797,6 @@ const REASON_RUNTIME_PROBE_SET_HOOK_FAILED: &str = "runtime_probe_set_hook_faile
 const REASON_RUNTIME_PROBE_TRIGGER_HOOK_FAILED: &str = "runtime_probe_trigger_hook_failed";
 const REASON_RUNTIME_PROBE_TRIGGER_HOOK_NOT_OBSERVED: &str = "runtime_probe_trigger_hook_not_observed";
 const REASON_RUNTIME_PROBE_NEW_WINDOW_FAILED: &str = "runtime_probe_new_window_failed";
-const REASON_RUNTIME_PROBE_SEND_BEL_FAILED: &str = "runtime_probe_send_bel_failed";
 const REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED: &str = "runtime_probe_raw_bel_not_observed";
 const REASON_RUNTIME_PROBE_RESTORE_HOOK_FAILED: &str = "runtime_probe_restore_hook_failed";
 
@@ -1510,13 +1509,31 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
         "touch {}",
         shell_escape_single_quoted(trigger_hook_marker.to_string_lossy().as_ref())
     );
-    let probe_hook_command = format!(
+    let trigger_probe_hook_command = format!(
         "run-shell -b {}",
         shell_escape_single_quoted(&trigger_hook_script)
     );
+    let raw_bel_hook_script = format!(
+        "touch {}",
+        shell_escape_single_quoted(raw_bel_marker.to_string_lossy().as_ref())
+    );
+    let raw_bel_probe_hook_command = format!(
+        "run-shell -b {}",
+        shell_escape_single_quoted(&raw_bel_hook_script)
+    );
+    // Avoid send-keys timing races: run BEL from a detached one-shot window command.
+    let raw_bel_probe_command = format!(
+        "sh -lc {}",
+        shell_escape_single_quoted("sleep 0.20; printf '\\a'; sleep 0.05")
+    );
 
     if let Err(detail) = run_tmux_command(
-        &["set-hook", "-g", "alert-bell", probe_hook_command.as_str()],
+        &[
+            "set-hook",
+            "-g",
+            "alert-bell",
+            trigger_probe_hook_command.as_str(),
+        ],
         "configure runtime bell probe hook",
     ) {
         report.reasons.push(format!(
@@ -1556,7 +1573,23 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
             }
         }
 
-        if let Some(session) = tmux_list_sessions().ok().and_then(|v| v.into_iter().next()) {
+        if let Err(detail) = run_tmux_command(
+            &[
+                "set-hook",
+                "-g",
+                "alert-bell",
+                raw_bel_probe_hook_command.as_str(),
+            ],
+            "configure runtime raw BEL probe hook",
+        ) {
+            report
+                .reasons
+                .push(format!("failed to configure runtime raw BEL probe hook: {detail}"));
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_PROBE_SET_HOOK_FAILED.to_string(),
+            );
+        } else if let Some(session) = tmux_list_sessions().ok().and_then(|v| v.into_iter().next()) {
             let created_window = run_tmux_command_capture(
                 &[
                     "new-window",
@@ -1566,6 +1599,7 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
                     "-P",
                     "-F",
                     "#{session_name}:#{window_index}.#{pane_index}",
+                    raw_bel_probe_command.as_str(),
                 ],
                 "create runtime raw BEL probe window",
             );
@@ -1579,7 +1613,7 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
                         .map(str::to_string)
                         .unwrap_or_else(|| pane_target.clone());
 
-                    let _ = run_tmux_command(
+                    if let Err(detail) = run_tmux_command(
                         &[
                             "set-window-option",
                             "-t",
@@ -1588,58 +1622,22 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
                             "on",
                         ],
                         "set monitor-bell on probe window",
-                    );
-
-                    std::thread::sleep(std::time::Duration::from_millis(180));
-
-                    let mut send_error: Option<String> = None;
-                    for attempt in 1..=3 {
-                        match run_tmux_command(
-                            &[
-                                "send-keys",
-                                "-t",
-                                pane_target.as_str(),
-                                "printf '\\a'",
-                                "Enter",
-                            ],
-                            format!(
-                                "send runtime raw BEL probe command (attempt {attempt}/3)"
-                            )
-                            .as_str(),
-                        ) {
-                            Ok(()) => {
-                                if wait_for_file_marker(raw_bel_marker.as_path(), 900) {
-                                    report.raw_bel_ok = true;
-                                    break;
-                                }
-                            }
-                            Err(detail) => {
-                                send_error = Some(detail);
-                                break;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(220));
+                    ) {
+                        report.reasons.push(format!(
+                            "failed to set monitor-bell on runtime raw BEL probe window: {detail}"
+                        ));
                     }
 
-                    if !report.raw_bel_ok {
-                        if let Some(detail) = send_error {
-                            report.reasons.push(format!(
-                                "failed to send runtime raw BEL probe command: {detail}"
-                            ));
-                            push_unique(
-                                &mut report.reason_codes,
-                                REASON_RUNTIME_PROBE_SEND_BEL_FAILED.to_string(),
-                            );
-                        } else {
-                            report.reasons.push(
-                                "runtime raw BEL probe did not trigger `alert-bell` hook"
-                                    .to_string(),
-                            );
-                            push_unique(
-                                &mut report.reason_codes,
-                                REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED.to_string(),
-                            );
-                        }
+                    if wait_for_file_marker(raw_bel_marker.as_path(), 2500) {
+                        report.raw_bel_ok = true;
+                    } else {
+                        report.reasons.push(
+                            "runtime raw BEL probe did not trigger `alert-bell` hook".to_string(),
+                        );
+                        push_unique(
+                            &mut report.reason_codes,
+                            REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED.to_string(),
+                        );
                     }
 
                     let _ = run_tmux_command(

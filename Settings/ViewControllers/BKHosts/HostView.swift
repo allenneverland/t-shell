@@ -1551,8 +1551,10 @@ enum TmuxSSHOnboardingService {
       return "tmux alert-bell runtime hook exists but cannot be triggered reliably. Re-run onboarding to re-install runtime hook; if issue persists, restart tmux server and retry."
     }
 
-    if lower.contains(tmuxVerifyReasonRuntimeProbeRawBelNotObserved) {
-      return "tmux accepted hook installation but raw BEL (`printf '\\a'`) in tmux pane did not trigger `alert-bell`. Re-run onboarding with an active tmux session and retry the tmux-pane BEL test."
+    if lower.contains("tmux pane raw bel probe failed") ||
+      lower.contains("runtime raw bel probe did not trigger") ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeRawBelNotObserved) {
+      return "tmux runtime raw BEL probe could not observe `alert-bell` from the detached probe pane. Re-run onboarding once; if it persists, restart tmux server and retry."
     }
 
     if lower.contains("runtime alert-bell hook is empty") ||
@@ -2422,9 +2424,14 @@ enum TmuxSSHOnboardingService {
       }
     } catch {
       let raw = error.localizedDescription
+      let lowerRaw = raw.lowercased()
       var message = "Failed to install tmux bell hook."
       if let guidance = classifyTmuxBellHookFailureMessage(raw) {
         message += "\n\(guidance)"
+      } else if lowerRaw.contains("tmux bell hook verification failed") ||
+        lowerRaw.contains("tmux runtime hook probe failed") ||
+        lowerRaw.contains("tmux pane raw bel probe failed") {
+        message += "\nBell hook verification failed during runtime probing. Start tmux on host, rerun onboarding once, then retry."
       } else {
         message += "\nEnsure ~/.local/bin/tmuxd is executable and ~/.tmux.conf is writable, then retry onboarding."
       }
