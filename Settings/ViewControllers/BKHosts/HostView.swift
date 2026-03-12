@@ -1410,8 +1410,8 @@ enum TmuxSSHOnboardingService {
   private static let tmuxVerifyReasonRuntimeHookNotRouted = "runtime_hook_not_routed"
   private static let tmuxVerifyReasonRuntimeMonitorBellOff = "runtime_monitor_bell_off"
   private static let tmuxVerifyReasonRuntimeBellActionNone = "runtime_bell_action_none"
-  private static let tmuxVerifyReasonRuntimeProbeRunHookFailed = "runtime_probe_run_hook_failed"
-  private static let tmuxVerifyReasonRuntimeProbeRunHookNotObserved = "runtime_probe_run_hook_not_observed"
+  private static let tmuxVerifyReasonRuntimeProbeTriggerHookFailed = "runtime_probe_trigger_hook_failed"
+  private static let tmuxVerifyReasonRuntimeProbeTriggerHookNotObserved = "runtime_probe_trigger_hook_not_observed"
   private static let tmuxVerifyReasonRuntimeProbeRawBelNotObserved = "runtime_probe_raw_bel_not_observed"
   private static let tmuxVerifyReasonRuntimeProbeRestoreHookFailed = "runtime_probe_restore_hook_failed"
   private static let tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported = "runtime_probe_tmux_version_unsupported"
@@ -1532,7 +1532,7 @@ enum TmuxSSHOnboardingService {
       lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported) ||
       lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
       lower.contains(tmuxVerifyReasonRuntimeProbeCapabilityQueryFailed) {
-      return "Remote tmux version is unsupported for runtime bell verification (missing `run-hook` capability or below minimum version). Upgrade tmux on host, then retry onboarding."
+      return "Installed tmuxd is using a deprecated runtime bell probe path. Re-run onboarding to install the latest tmuxd release, then retry."
     }
 
     if lower.contains("runtime tmux server is not running") ||
@@ -1546,9 +1546,9 @@ enum TmuxSSHOnboardingService {
       return "tmux runtime bell options are disabled on active sessions/windows (monitor-bell/bell-action). Re-run onboarding after starting tmux so tmuxd can re-apply runtime bell options."
     }
 
-    if lower.contains(tmuxVerifyReasonRuntimeProbeRunHookFailed) ||
-      lower.contains(tmuxVerifyReasonRuntimeProbeRunHookNotObserved) {
-      return "tmux alert-bell runtime hook exists but cannot be executed reliably. Re-run onboarding to re-install runtime hook; if issue persists, upgrade tmux on the host."
+    if lower.contains(tmuxVerifyReasonRuntimeProbeTriggerHookFailed) ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeTriggerHookNotObserved) {
+      return "tmux alert-bell runtime hook exists but cannot be triggered reliably. Re-run onboarding to re-install runtime hook; if issue persists, restart tmux server and retry."
     }
 
     if lower.contains(tmuxVerifyReasonRuntimeProbeRawBelNotObserved) {
@@ -1606,15 +1606,11 @@ enum TmuxSSHOnboardingService {
       reasonCodes.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
       reasonCodes.contains(tmuxVerifyReasonRuntimeProbeMissingRunHook) ||
       missingCapabilities.contains("run-hook") {
-      let detected = report.detectedTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
-      let detectedDescription = (detected?.isEmpty == false) ? detected! : "unknown"
-      let minimum = report.minimumTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
-      let minimumDescription = (minimum?.isEmpty == false) ? minimum! : "required minimum"
-      return "Remote tmux \(detectedDescription) is unsupported for runtime bell verification (requires >= \(minimumDescription) and `run-hook`). Upgrade tmux on host, then retry onboarding."
+      return "Installed tmuxd reported a deprecated runtime probe compatibility failure. Re-run onboarding to install the latest tmuxd release, then retry."
     }
 
     if report.runtimeProbePerformed && !report.runtimeProbeHookOK {
-      return "tmux runtime hook probe failed (`run-hook alert-bell` path is unhealthy): \(reasons)"
+      return "tmux runtime hook probe failed (`set-hook -R alert-bell` path is unhealthy): \(reasons)"
     }
 
     if report.runtimeProbePerformed && !report.runtimeProbeRawBelOK {

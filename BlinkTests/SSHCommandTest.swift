@@ -512,8 +512,8 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     let output = "Remote command failed with exit status 1.\nstderr:\nunknown command: run-hook"
     let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
     XCTAssertNotNil(message)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("run-hook") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("latest tmuxd release") ?? false)
+    XCTAssertFalse(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? true)
   }
 
   func testClassifySelfTestFailureBadDeviceTokenIsNonRetryable() {
@@ -555,9 +555,8 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     """
     let message = TmuxSSHOnboardingService.tmuxBellHookVerificationFailureMessageForTesting(json)
     XCTAssertNotNil(message)
-    XCTAssertTrue(message?.contains("tmux 2.9") ?? false)
-    XCTAssertTrue(message?.contains("3.1.0") ?? false)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("deprecated runtime probe compatibility failure") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("latest tmuxd release") ?? false)
   }
 
   func testClassifyTmuxBellHookFailureForRuntimeServerNotRunning() {
