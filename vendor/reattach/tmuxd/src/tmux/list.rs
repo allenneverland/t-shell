@@ -26,6 +26,10 @@ pub struct Session {
     pub windows: Vec<Window>,
 }
 
+fn parse_session_attached(value: &str) -> bool {
+    value.parse::<u32>().map(|count| count > 0).unwrap_or(false)
+}
+
 pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
     let output = Command::new("tmux")
         .args([
@@ -58,7 +62,7 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
         }
 
         let session_name = parts[0].to_string();
-        let session_attached = parts[1] == "1";
+        let session_attached = parse_session_attached(parts[1]);
         let window_index: u32 = parts[2].parse().unwrap_or(0);
         let window_name = parts[3].to_string();
         let window_active = parts[4] == "1";
@@ -109,4 +113,22 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
     }
 
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_session_attached;
+
+    #[test]
+    fn parse_session_attached_treats_positive_counts_as_attached() {
+        assert!(!parse_session_attached("0"));
+        assert!(parse_session_attached("1"));
+        assert!(parse_session_attached("2"));
+    }
+
+    #[test]
+    fn parse_session_attached_rejects_invalid_values() {
+        assert!(!parse_session_attached(""));
+        assert!(!parse_session_attached("attached"));
+    }
 }

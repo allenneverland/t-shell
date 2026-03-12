@@ -58,6 +58,8 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
   } else {
     _overscanCompensation = 0;
   }
+  _tmuxPaneStarVisible = YES;
+  _tmuxSessionAttachedVisible = YES;
 
   return self;
 }
@@ -97,6 +99,16 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
   _oscNotifications = [coder decodeBoolForKey:@"oscNotifications"];
   _invertVerticalScroll = [coder decodeBoolForKey:@"invertVerticalScroll"];
   _compactQuickActions = [coder decodeBoolForKey:@"compactQuickActions"];
+  if ([coder containsValueForKey:@"tmuxPaneStarVisible"]) {
+    _tmuxPaneStarVisible = [coder decodeBoolForKey:@"tmuxPaneStarVisible"];
+  } else {
+    _tmuxPaneStarVisible = YES;
+  }
+  if ([coder containsValueForKey:@"tmuxSessionAttachedVisible"]) {
+    _tmuxSessionAttachedVisible = [coder decodeBoolForKey:@"tmuxSessionAttachedVisible"];
+  } else {
+    _tmuxSessionAttachedVisible = YES;
+  }
   
   _dontUseBlinkSnippetsIndex = [coder decodeBoolForKey:@"dontUseBlinkSnippetsIndex"];
   _snippetsDefaultLocation = [coder decodeIntegerForKey:@"snippetsDefaultLocation"];
@@ -129,6 +141,8 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
   [encoder encodeBool:_oscNotifications forKey:@"oscNotifications"];
   [encoder encodeBool:_invertVerticalScroll forKey:@"invertVerticalScroll"];
   [encoder encodeBool:_compactQuickActions forKey:@"compactQuickActions"];
+  [encoder encodeBool:_tmuxPaneStarVisible forKey:@"tmuxPaneStarVisible"];
+  [encoder encodeBool:_tmuxSessionAttachedVisible forKey:@"tmuxSessionAttachedVisible"];
   [encoder encodeBool:_dontUseBlinkSnippetsIndex forKey:@"dontUseBlinkSnippetsIndex"];
   [encoder encodeInteger:_snippetsDefaultLocation forKey:@"snippetsDefaultLocation"];
   
@@ -466,12 +480,28 @@ NSString *const BKAppearanceChanged = @"BKAppearanceChanged";
   defaults.compactQuickActions = value;
 }
 
++ (void)setTmuxPaneStarVisible:(BOOL)value {
+  defaults.tmuxPaneStarVisible = value;
+}
+
++ (void)setTmuxSessionAttachedVisible:(BOOL)value {
+  defaults.tmuxSessionAttachedVisible = value;
+}
+
 + (BOOL)dontUseBlinkSnippetsIndex {
   return defaults.dontUseBlinkSnippetsIndex;
 }
 
 + (BKSnippetDefaultLocation)snippetsDefaultLocation {
   return defaults.snippetsDefaultLocation;
+}
+
++ (BOOL)isTmuxPaneStarVisible {
+  return defaults.tmuxPaneStarVisible;
+}
+
++ (BOOL)isTmuxSessionAttachedVisible {
+  return defaults.tmuxSessionAttachedVisible;
 }
 
 

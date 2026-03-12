@@ -156,3 +156,43 @@ class NotificationConfig: ObservableObject {
     notifyNotifications = BLKDefaults.isOscNotificationsOn()
   }
 }
+
+struct TmuxDisplaySettingsView: View {
+  @StateObject var config = TmuxDisplayConfig()
+
+  var body: some View {
+    List {
+      Section(
+        header: Text("Session & Pane Picker"),
+        footer: Text("Control whether the tmux picker shows the active pane star (★) and attached session label.")
+      ) {
+        Toggle("Show active pane star (★)", isOn: $config.showPaneStar)
+        Toggle("Show attached session label", isOn: $config.showSessionAttached)
+      }
+    }
+    .listStyle(GroupedListStyle())
+    .navigationBarTitle("Tmux")
+    .onDisappear(perform: {
+      BLKDefaults.save()
+    })
+  }
+}
+
+class TmuxDisplayConfig: ObservableObject {
+  @Published var showPaneStar: Bool {
+    didSet {
+      BLKDefaults.setTmuxPaneStarVisible(showPaneStar)
+    }
+  }
+
+  @Published var showSessionAttached: Bool {
+    didSet {
+      BLKDefaults.setTmuxSessionAttachedVisible(showSessionAttached)
+    }
+  }
+
+  init() {
+    showPaneStar = BLKDefaults.isTmuxPaneStarVisible()
+    showSessionAttached = BLKDefaults.isTmuxSessionAttachedVisible()
+  }
+}

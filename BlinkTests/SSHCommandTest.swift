@@ -117,6 +117,40 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
   }
 }
 
+final class TmuxPickerDisplayTests: XCTestCase {
+  func testSessionTitleShowsAttachedIndicatorWhenEnabled() {
+    let title = tmuxSessionPickerTitle(name: "work", attached: true, showAttachedIndicator: true)
+    XCTAssertEqual(title, "work • attached")
+  }
+
+  func testSessionTitleHidesAttachedIndicatorWhenDisabled() {
+    let title = tmuxSessionPickerTitle(name: "work", attached: true, showAttachedIndicator: false)
+    XCTAssertEqual(title, "work")
+  }
+
+  func testPaneTitleShowsStarWhenEnabled() {
+    let title = tmuxPanePickerTitle(
+      windowName: "editor",
+      paneIndex: 2,
+      currentPath: "/tmp/project",
+      active: true,
+      showActiveStar: true
+    )
+    XCTAssertEqual(title, "★ editor • pane 2 • project")
+  }
+
+  func testPaneTitleHidesStarWhenDisabled() {
+    let title = tmuxPanePickerTitle(
+      windowName: "editor",
+      paneIndex: 2,
+      currentPath: "/tmp/project",
+      active: true,
+      showActiveStar: false
+    )
+    XCTAssertEqual(title, "editor • pane 2 • project")
+  }
+}
+
 final class TmuxPaneBridgeCodecTests: XCTestCase {
   private let esc: UInt8 = 0x1b
 

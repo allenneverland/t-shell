@@ -1152,9 +1152,14 @@ extension SpaceController {
     }
 
     let alert = UIAlertController(title: "Tmux Sessions", message: "Select session", preferredStyle: .actionSheet)
+    let showAttachedIndicator = BLKDefaults.isTmuxSessionAttachedVisible()
     for session in sessions.sorted(by: { $0.name < $1.name }) {
-      let indicator = session.attached ? " • attached" : ""
-      alert.addAction(UIAlertAction(title: "\(session.name)\(indicator)", style: .default, handler: { [weak self] _ in
+      let title = tmuxSessionPickerTitle(
+        name: session.name,
+        attached: session.attached,
+        showAttachedIndicator: showAttachedIndicator
+      )
+      alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
         self?._showTmuxPanePicker(hostAlias: hostAlias, session: session)
       }))
     }
@@ -1177,10 +1182,15 @@ extension SpaceController {
     }
 
     let alert = UIAlertController(title: "Session: \(session.name)", message: "Tap a pane to enter", preferredStyle: .actionSheet)
+    let showPaneStar = BLKDefaults.isTmuxPaneStarVisible()
     for entry in panes {
-      let marker = entry.pane.active ? "★ " : ""
-      let path = entry.pane.currentPath.blink_lastPathComponent
-      let title = "\(marker)\(entry.window.name) • pane \(entry.pane.index) • \(path)"
+      let title = tmuxPanePickerTitle(
+        windowName: entry.window.name,
+        paneIndex: entry.pane.index,
+        currentPath: entry.pane.currentPath,
+        active: entry.pane.active,
+        showActiveStar: showPaneStar
+      )
       alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
         self?._openTmuxPane(hostAlias: hostAlias, sessionName: session.name, paneTarget: entry.pane.target)
       }))
@@ -1520,6 +1530,27 @@ enum TmuxNotificationPayloadResolver {
 
     return nil
   }
+}
+
+func tmuxSessionPickerTitle(
+  name: String,
+  attached: Bool,
+  showAttachedIndicator: Bool
+) -> String {
+  let indicator = (attached && showAttachedIndicator) ? " • attached" : ""
+  return "\(name)\(indicator)"
+}
+
+func tmuxPanePickerTitle(
+  windowName: String,
+  paneIndex: Int,
+  currentPath: String,
+  active: Bool,
+  showActiveStar: Bool
+) -> String {
+  let marker = (active && showActiveStar) ? "★ " : ""
+  let path = currentPath.blink_lastPathComponent
+  return "\(marker)\(windowName) • pane \(paneIndex) • \(path)"
 }
 
 fileprivate struct TmuxControlSession: Decodable {

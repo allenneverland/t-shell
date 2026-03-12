@@ -86,6 +86,8 @@ typedef NS_ENUM(NSInteger, BKSnippetDefaultLocation) {
 @property (nonatomic) BOOL oscNotifications;
 @property (nonatomic) BOOL invertVerticalScroll;
 @property (nonatomic) BOOL compactQuickActions;
+@property (nonatomic) BOOL tmuxPaneStarVisible;
+@property (nonatomic) BOOL tmuxSessionAttachedVisible;
 @property (nonatomic) BOOL dontUseBlinkSnippetsIndex;
 @property (nonatomic) BKSnippetDefaultLocation snippetsDefaultLocation;
 
@@ -109,6 +111,8 @@ typedef NS_ENUM(NSInteger, BKSnippetDefaultLocation) {
 + (void)setOscNotifications:(BOOL)state;
 + (void)setInvertedVerticalScroll:(BOOL) state;
 + (void)setCompactQuickActions:(BOOL)value;
++ (void)setTmuxPaneStarVisible:(BOOL)value;
++ (void)setTmuxSessionAttachedVisible:(BOOL)value;
 + (void)setDontUseBlinkSnippetsIndex: (BOOL)state;
 + (void)setSnippetsDefaultLocation:(BKSnippetDefaultLocation) value;
 + (NSString *)selectedFontName;
@@ -138,6 +142,8 @@ typedef NS_ENUM(NSInteger, BKSnippetDefaultLocation) {
 + (BOOL)isOscNotificationsOn;
 + (BOOL)doInvertVerticalScroll;
 + (BOOL)compactQuickActions;
++ (BOOL)isTmuxPaneStarVisible;
++ (BOOL)isTmuxSessionAttachedVisible;
 + (BOOL) dontUseBlinkSnippetsIndex;
 + (BKSnippetDefaultLocation) snippetsDefaultLocation;
 

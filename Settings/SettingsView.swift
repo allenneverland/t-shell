@@ -135,6 +135,11 @@ struct SettingsView: View {
         } details: {
           BKNotificationsView()
         }
+        Row {
+          Label("Tmux", systemImage: "rectangle.split.3x1")
+        } details: {
+          TmuxDisplaySettingsView()
+        }
 #if TARGET_OS_MACCATALYST
         Row {
           Label("Gestures", systemImage: "rectangle.and.hand.point.up.left.filled")
