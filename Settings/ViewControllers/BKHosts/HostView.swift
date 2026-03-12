@@ -1304,6 +1304,11 @@ enum TmuxSSHOnboardingService {
     let runtimeProbePerformed: Bool
     let runtimeProbeHookOK: Bool
     let runtimeProbeRawBelOK: Bool
+    let runtimeProbeCompatible: Bool
+    let minimumTmuxVersion: String?
+    let detectedTmuxVersion: String?
+    let requiredCapabilities: [String]
+    let missingCapabilities: [String]
     let runtimeProbeReasonCodes: [String]
     let overallOK: Bool
     let reasons: [String]
@@ -1317,6 +1322,11 @@ enum TmuxSSHOnboardingService {
       case runtimeProbePerformed = "runtime_probe_performed"
       case runtimeProbeHookOK = "runtime_probe_hook_ok"
       case runtimeProbeRawBelOK = "runtime_probe_raw_bel_ok"
+      case runtimeProbeCompatible = "runtime_probe_compatible"
+      case minimumTmuxVersion = "minimum_tmux_version"
+      case detectedTmuxVersion = "detected_tmux_version"
+      case requiredCapabilities = "required_capabilities"
+      case missingCapabilities = "missing_capabilities"
       case runtimeProbeReasonCodes = "runtime_probe_reason_codes"
       case overallOK = "overall_ok"
       case reasons
@@ -1332,6 +1342,11 @@ enum TmuxSSHOnboardingService {
       runtimeProbePerformed = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbePerformed) ?? false
       runtimeProbeHookOK = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbeHookOK) ?? true
       runtimeProbeRawBelOK = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbeRawBelOK) ?? true
+      runtimeProbeCompatible = try container.decodeIfPresent(Bool.self, forKey: .runtimeProbeCompatible) ?? true
+      minimumTmuxVersion = try container.decodeIfPresent(String.self, forKey: .minimumTmuxVersion)
+      detectedTmuxVersion = try container.decodeIfPresent(String.self, forKey: .detectedTmuxVersion)
+      requiredCapabilities = try container.decodeIfPresent([String].self, forKey: .requiredCapabilities) ?? []
+      missingCapabilities = try container.decodeIfPresent([String].self, forKey: .missingCapabilities) ?? []
       runtimeProbeReasonCodes = try container.decodeIfPresent([String].self, forKey: .runtimeProbeReasonCodes) ?? []
       overallOK = try container.decode(Bool.self, forKey: .overallOK)
       reasons = try container.decodeIfPresent([String].self, forKey: .reasons) ?? []
@@ -1399,6 +1414,10 @@ enum TmuxSSHOnboardingService {
   private static let tmuxVerifyReasonRuntimeProbeRunHookNotObserved = "runtime_probe_run_hook_not_observed"
   private static let tmuxVerifyReasonRuntimeProbeRawBelNotObserved = "runtime_probe_raw_bel_not_observed"
   private static let tmuxVerifyReasonRuntimeProbeRestoreHookFailed = "runtime_probe_restore_hook_failed"
+  private static let tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported = "runtime_probe_tmux_version_unsupported"
+  private static let tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable = "runtime_probe_tmux_version_unavailable"
+  private static let tmuxVerifyReasonRuntimeProbeCapabilityQueryFailed = "runtime_probe_capability_query_failed"
+  private static let tmuxVerifyReasonRuntimeProbeMissingRunHook = "runtime_probe_missing_run_hook"
   private static let networkSession: URLSession = {
     let config = URLSessionConfiguration.ephemeral
     config.timeoutIntervalForRequest = 8
@@ -1508,6 +1527,14 @@ enum TmuxSSHOnboardingService {
       return "tmux rejected the generated alert-bell hook command due to syntax/escaping mismatch. Re-run onboarding to install the latest tmuxd release; if the host tmux version is very old, upgrade tmux and retry."
     }
 
+    if lower.contains("unknown command: run-hook") ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeMissingRunHook) ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported) ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
+      lower.contains(tmuxVerifyReasonRuntimeProbeCapabilityQueryFailed) {
+      return "Remote tmux version is unsupported for runtime bell verification (missing `run-hook` capability or below minimum version). Upgrade tmux on host, then retry onboarding."
+    }
+
     if lower.contains("runtime tmux server is not running") ||
       lower.contains(tmuxVerifyReasonRuntimeServerNotRunning) {
       return "tmux runtime verification requires an active tmux server. Start tmux on the host first (for example, `tmux new -s onboarding`), then rerun onboarding."
@@ -1551,6 +1578,7 @@ enum TmuxSSHOnboardingService {
 
   private static func tmuxBellHookVerificationFailureMessage(report: TmuxBellHookVerifyResponse) -> String {
     let reasonCodes = Set(report.runtimeProbeReasonCodes.map { $0.lowercased() })
+    let missingCapabilities = Set(report.missingCapabilities.map { $0.lowercased() })
     let reasons = report.reasons.isEmpty ? "unknown reason" : report.reasons.joined(separator: "; ")
 
     if !report.persistentConfigOK {
@@ -1571,6 +1599,18 @@ enum TmuxSSHOnboardingService {
       reasonCodes.contains(tmuxVerifyReasonRuntimeMonitorBellOff) ||
       reasonCodes.contains(tmuxVerifyReasonRuntimeBellActionNone) {
       return "tmux runtime bell options are disabled on active sessions/windows (monitor-bell/bell-action): \(reasons)"
+    }
+
+    if !report.runtimeProbeCompatible ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported) ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
+      reasonCodes.contains(tmuxVerifyReasonRuntimeProbeMissingRunHook) ||
+      missingCapabilities.contains("run-hook") {
+      let detected = report.detectedTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let detectedDescription = (detected?.isEmpty == false) ? detected! : "unknown"
+      let minimum = report.minimumTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let minimumDescription = (minimum?.isEmpty == false) ? minimum! : "required minimum"
+      return "Remote tmux \(detectedDescription) is unsupported for runtime bell verification (requires >= \(minimumDescription) and `run-hook`). Upgrade tmux on host, then retry onboarding."
     }
 
     if report.runtimeProbePerformed && !report.runtimeProbeHookOK {
@@ -1615,6 +1655,13 @@ enum TmuxSSHOnboardingService {
 
   static func parseTmuxBellHookVerifyJSONForTesting(_ raw: String) -> Bool {
     decodeTmuxBellHookVerifyResponse(raw) != nil
+  }
+
+  static func tmuxBellHookVerificationFailureMessageForTesting(_ raw: String) -> String? {
+    guard let report = decodeTmuxBellHookVerifyResponse(raw) else {
+      return nil
+    }
+    return tmuxBellHookVerificationFailureMessage(report: report)
   }
 
   static func tmuxdLocalPortCandidatesForTesting() -> [Int] {

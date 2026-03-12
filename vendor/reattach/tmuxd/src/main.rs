@@ -685,9 +685,35 @@ fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
                     }
                 );
                 println!(
+                    "runtime_probe_compatible={}",
+                    if report.runtime_probe_compatible {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                );
+                println!("minimum_tmux_version={}", report.minimum_tmux_version);
+                if let Some(version) = &report.detected_tmux_version {
+                    println!("detected_tmux_version={version}");
+                } else {
+                    println!("detected_tmux_version=<unknown>");
+                }
+                println!(
                     "overall_ok={}",
                     if report.overall_ok { "true" } else { "false" }
                 );
+                if !report.required_capabilities.is_empty() {
+                    println!("required_capabilities:");
+                    for capability in &report.required_capabilities {
+                        println!("  - {capability}");
+                    }
+                }
+                if !report.missing_capabilities.is_empty() {
+                    println!("missing_capabilities:");
+                    for capability in &report.missing_capabilities {
+                        println!("  - {capability}");
+                    }
+                }
                 if !report.runtime_probe_reason_codes.is_empty() {
                     println!("runtime_probe_reason_codes:");
                     for code in &report.runtime_probe_reason_codes {
@@ -735,10 +761,38 @@ struct HookVerifyReport {
     runtime_probe_performed: bool,
     runtime_probe_hook_ok: bool,
     runtime_probe_raw_bel_ok: bool,
+    runtime_probe_compatible: bool,
+    minimum_tmux_version: String,
+    detected_tmux_version: Option<String>,
+    required_capabilities: Vec<String>,
+    missing_capabilities: Vec<String>,
     runtime_probe_reason_codes: Vec<String>,
     overall_ok: bool,
     reasons: Vec<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TmuxSemanticVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+
+impl std::fmt::Display for TmuxSemanticVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+struct RuntimeProbeCompatibilityReport {
+    minimum_tmux_version: String,
+    detected_tmux_version: Option<String>,
+    required_capabilities: Vec<String>,
+    missing_capabilities: Vec<String>,
+    reason_codes: Vec<String>,
+    reasons: Vec<String>,
+    compatible: bool,
 }
 
 enum RuntimeHookProbe {
@@ -769,6 +823,16 @@ const REASON_RUNTIME_PROBE_NEW_WINDOW_FAILED: &str = "runtime_probe_new_window_f
 const REASON_RUNTIME_PROBE_SEND_BEL_FAILED: &str = "runtime_probe_send_bel_failed";
 const REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED: &str = "runtime_probe_raw_bel_not_observed";
 const REASON_RUNTIME_PROBE_RESTORE_HOOK_FAILED: &str = "runtime_probe_restore_hook_failed";
+const REASON_RUNTIME_PROBE_TMUX_VERSION_UNSUPPORTED: &str = "runtime_probe_tmux_version_unsupported";
+const REASON_RUNTIME_PROBE_TMUX_VERSION_UNAVAILABLE: &str = "runtime_probe_tmux_version_unavailable";
+const REASON_RUNTIME_PROBE_CAPABILITY_QUERY_FAILED: &str = "runtime_probe_capability_query_failed";
+const REASON_RUNTIME_PROBE_MISSING_RUN_HOOK: &str = "runtime_probe_missing_run_hook";
+
+const RUNTIME_PROBE_MIN_TMUX_VERSION: TmuxSemanticVersion = TmuxSemanticVersion {
+    major: 3,
+    minor: 1,
+    patch: 0,
+};
 
 fn home_file(path: &str) -> Option<std::path::PathBuf> {
     let mut home = dirs::home_dir()?;
@@ -1098,6 +1162,7 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
     let mut runtime_probe_reason_codes = Vec::new();
+    let runtime_probe_compatibility = inspect_runtime_probe_compatibility();
 
     let persistent_config_ok = match home_file(".tmux.conf") {
         None => {
@@ -1204,14 +1269,23 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
     let mut runtime_probe_hook_ok = !probe_runtime;
     let mut runtime_probe_raw_bel_ok = !probe_runtime;
     if probe_runtime && runtime_server_present {
-        runtime_probe_performed = true;
-        let probe = execute_runtime_tmux_bell_probe(&hook_spec.hook_command);
-        runtime_probe_hook_ok = probe.hook_ok;
-        runtime_probe_raw_bel_ok = probe.raw_bel_ok;
-        for code in probe.reason_codes {
-            push_unique(&mut runtime_probe_reason_codes, code);
+        if runtime_probe_compatibility.compatible {
+            runtime_probe_performed = true;
+            let probe = execute_runtime_tmux_bell_probe(&hook_spec.hook_command);
+            runtime_probe_hook_ok = probe.hook_ok;
+            runtime_probe_raw_bel_ok = probe.raw_bel_ok;
+            for code in probe.reason_codes {
+                push_unique(&mut runtime_probe_reason_codes, code);
+            }
+            reasons.extend(probe.reasons);
+        } else {
+            runtime_probe_hook_ok = false;
+            runtime_probe_raw_bel_ok = false;
+            for code in &runtime_probe_compatibility.reason_codes {
+                push_unique(&mut runtime_probe_reason_codes, code.to_string());
+            }
+            reasons.extend(runtime_probe_compatibility.reasons.iter().cloned());
         }
-        reasons.extend(probe.reasons);
     }
 
     let overall_ok = if probe_runtime {
@@ -1219,6 +1293,7 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
             && runtime_server_present
             && runtime_hook_ok
             && runtime_options_ok
+            && runtime_probe_compatibility.compatible
             && runtime_probe_hook_ok
             && runtime_probe_raw_bel_ok
     } else {
@@ -1233,6 +1308,11 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
         runtime_probe_performed,
         runtime_probe_hook_ok,
         runtime_probe_raw_bel_ok,
+        runtime_probe_compatible: runtime_probe_compatibility.compatible,
+        minimum_tmux_version: runtime_probe_compatibility.minimum_tmux_version,
+        detected_tmux_version: runtime_probe_compatibility.detected_tmux_version,
+        required_capabilities: runtime_probe_compatibility.required_capabilities,
+        missing_capabilities: runtime_probe_compatibility.missing_capabilities,
         runtime_probe_reason_codes,
         overall_ok,
         reasons,
@@ -1309,6 +1389,118 @@ fn tmux_server_is_running() -> Result<bool, String> {
     } else {
         Err(format!("`tmux list-sessions` failed: {detail}"))
     }
+}
+
+fn inspect_runtime_probe_compatibility() -> RuntimeProbeCompatibilityReport {
+    let mut report = RuntimeProbeCompatibilityReport {
+        minimum_tmux_version: RUNTIME_PROBE_MIN_TMUX_VERSION.to_string(),
+        detected_tmux_version: None,
+        required_capabilities: vec!["run-hook".to_string()],
+        missing_capabilities: Vec::new(),
+        reason_codes: Vec::new(),
+        reasons: Vec::new(),
+        compatible: true,
+    };
+
+    match std::process::Command::new("tmux").arg("-V").output() {
+        Ok(output) if output.status.success() => {
+            let raw = String::from_utf8(output.stdout).unwrap_or_default();
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                report.detected_tmux_version = Some(trimmed.to_string());
+            }
+
+            match extract_tmux_semantic_version(trimmed) {
+                Some(version) if version >= RUNTIME_PROBE_MIN_TMUX_VERSION => {}
+                Some(version) => {
+                    report.compatible = false;
+                    push_unique(
+                        &mut report.reason_codes,
+                        REASON_RUNTIME_PROBE_TMUX_VERSION_UNSUPPORTED.to_string(),
+                    );
+                    report.reasons.push(format!(
+                        "tmux {} is too old for runtime bell probe (requires >= {})",
+                        version, RUNTIME_PROBE_MIN_TMUX_VERSION
+                    ));
+                }
+                None => {
+                    report.compatible = false;
+                    push_unique(
+                        &mut report.reason_codes,
+                        REASON_RUNTIME_PROBE_TMUX_VERSION_UNAVAILABLE.to_string(),
+                    );
+                    report.reasons.push(format!(
+                        "unable to parse tmux version from `tmux -V` output `{trimmed}`; requires >= {}",
+                        RUNTIME_PROBE_MIN_TMUX_VERSION
+                    ));
+                }
+            }
+        }
+        Ok(output) => {
+            report.compatible = false;
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_PROBE_TMUX_VERSION_UNAVAILABLE.to_string(),
+            );
+            report.reasons.push(format!(
+                "failed to query tmux version via `tmux -V`: {}",
+                format_tmux_command_output(&output)
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            report.compatible = false;
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_PROBE_TMUX_VERSION_UNAVAILABLE.to_string(),
+            );
+            report
+                .reasons
+                .push("tmux command not found while checking runtime probe compatibility".to_string());
+        }
+        Err(e) => {
+            report.compatible = false;
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_PROBE_TMUX_VERSION_UNAVAILABLE.to_string(),
+            );
+            report
+                .reasons
+                .push(format!("failed to execute `tmux -V` for runtime probe compatibility: {e}"));
+        }
+    }
+
+    match run_tmux_command_capture(
+        &["list-commands"],
+        "inspect tmux command capabilities for runtime bell probe",
+    ) {
+        Ok(commands) => {
+            if !tmux_command_available(commands.as_str(), "run-hook") {
+                report.compatible = false;
+                report.missing_capabilities.push("run-hook".to_string());
+                push_unique(
+                    &mut report.reason_codes,
+                    REASON_RUNTIME_PROBE_MISSING_RUN_HOOK.to_string(),
+                );
+                report.reasons.push(
+                    "tmux runtime probe requires `run-hook`, but this tmux build does not expose that command"
+                        .to_string(),
+                );
+            }
+        }
+        Err(detail) => {
+            report.compatible = false;
+            report.missing_capabilities.push("run-hook".to_string());
+            push_unique(
+                &mut report.reason_codes,
+                REASON_RUNTIME_PROBE_CAPABILITY_QUERY_FAILED.to_string(),
+            );
+            report.reasons.push(format!(
+                "failed to query tmux command capabilities via `tmux list-commands`: {detail}"
+            ));
+        }
+    }
+
+    report
 }
 
 fn probe_runtime_tmux_alert_hook() -> RuntimeHookProbe {
@@ -1540,38 +1732,54 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
                         "set monitor-bell on probe window",
                     );
 
-                    std::thread::sleep(std::time::Duration::from_millis(120));
-                    match run_tmux_command(
-                        &[
-                            "send-keys",
-                            "-t",
-                            pane_target.as_str(),
-                            "printf '\\a'",
-                            "Enter",
-                        ],
-                        "send runtime raw BEL probe command",
-                    ) {
-                        Ok(()) => {
-                            if wait_for_file_marker(raw_bel_marker.as_path(), 1800) {
-                                report.raw_bel_ok = true;
-                            } else {
-                                report.reasons.push(
-                                    "runtime raw BEL probe did not trigger `alert-bell` hook"
-                                        .to_string(),
-                                );
-                                push_unique(
-                                    &mut report.reason_codes,
-                                    REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED.to_string(),
-                                );
+                    std::thread::sleep(std::time::Duration::from_millis(180));
+
+                    let mut send_error: Option<String> = None;
+                    for attempt in 1..=3 {
+                        match run_tmux_command(
+                            &[
+                                "send-keys",
+                                "-t",
+                                pane_target.as_str(),
+                                "printf '\\a'",
+                                "Enter",
+                            ],
+                            format!(
+                                "send runtime raw BEL probe command (attempt {attempt}/3)"
+                            )
+                            .as_str(),
+                        ) {
+                            Ok(()) => {
+                                if wait_for_file_marker(raw_bel_marker.as_path(), 900) {
+                                    report.raw_bel_ok = true;
+                                    break;
+                                }
+                            }
+                            Err(detail) => {
+                                send_error = Some(detail);
+                                break;
                             }
                         }
-                        Err(detail) => {
+                        std::thread::sleep(std::time::Duration::from_millis(220));
+                    }
+
+                    if !report.raw_bel_ok {
+                        if let Some(detail) = send_error {
                             report.reasons.push(format!(
                                 "failed to send runtime raw BEL probe command: {detail}"
                             ));
                             push_unique(
                                 &mut report.reason_codes,
                                 REASON_RUNTIME_PROBE_SEND_BEL_FAILED.to_string(),
+                            );
+                        } else {
+                            report.reasons.push(
+                                "runtime raw BEL probe did not trigger `alert-bell` hook"
+                                    .to_string(),
+                            );
+                            push_unique(
+                                &mut report.reason_codes,
+                                REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED.to_string(),
                             );
                         }
                     }
@@ -1742,6 +1950,65 @@ fn format_tmux_command_output(output: &std::process::Output) -> String {
     parts.join(" | ")
 }
 
+fn tmux_command_available(list_commands_output: &str, command: &str) -> bool {
+    list_commands_output.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .map(|token| token == command)
+            .unwrap_or(false)
+    })
+}
+
+fn extract_tmux_semantic_version(raw: &str) -> Option<TmuxSemanticVersion> {
+    for token in raw.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '-') {
+        if token.is_empty() {
+            continue;
+        }
+
+        let Some(start_idx) = token.find(|ch: char| ch.is_ascii_digit()) else {
+            continue;
+        };
+        let candidate = &token[start_idx..];
+        let mut numeric = String::new();
+        for ch in candidate.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                numeric.push(ch);
+            } else {
+                break;
+            }
+        }
+
+        if numeric.is_empty() || !numeric.contains('.') {
+            continue;
+        }
+
+        let mut parts = numeric.split('.');
+        let Some(major_raw) = parts.next() else {
+            continue;
+        };
+        let Some(minor_raw) = parts.next() else {
+            continue;
+        };
+        let Some(major) = major_raw.parse::<u16>().ok() else {
+            continue;
+        };
+        let Some(minor) = minor_raw.parse::<u16>().ok() else {
+            continue;
+        };
+        let patch = parts
+            .next()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(0);
+
+        return Some(TmuxSemanticVersion {
+            major,
+            minor,
+            patch,
+        });
+    }
+    None
+}
+
 fn is_tmux_no_server_output(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("no server running")
@@ -1835,8 +2102,9 @@ fn shell_escape_single_quoted(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tmux_bell_hook_spec, build_tmux_bell_notify_command, is_tmux_no_server_output,
-        push_unique, resolve_notify_port, wait_for_file_marker, TMUX_BELL_TARGET_FORMAT,
+        build_tmux_bell_hook_spec, build_tmux_bell_notify_command, extract_tmux_semantic_version,
+        is_tmux_no_server_output, push_unique, resolve_notify_port, tmux_command_available,
+        wait_for_file_marker, TmuxSemanticVersion, TMUX_BELL_TARGET_FORMAT,
     };
     use std::fs;
     use std::path::Path;
@@ -1894,6 +2162,47 @@ mod tests {
         push_unique(&mut values, "runtime_server_not_running".to_string());
         push_unique(&mut values, "runtime_hook_not_routed".to_string());
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn extract_tmux_semantic_version_handles_common_outputs() {
+        assert_eq!(
+            extract_tmux_semantic_version("tmux 3.4"),
+            Some(TmuxSemanticVersion {
+                major: 3,
+                minor: 4,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            extract_tmux_semantic_version("tmux next-3.5"),
+            Some(TmuxSemanticVersion {
+                major: 3,
+                minor: 5,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            extract_tmux_semantic_version("tmux 2.9a"),
+            Some(TmuxSemanticVersion {
+                major: 2,
+                minor: 9,
+                patch: 0
+            })
+        );
+    }
+
+    #[test]
+    fn extract_tmux_semantic_version_rejects_non_semver_outputs() {
+        assert_eq!(extract_tmux_semantic_version("tmux master"), None);
+        assert_eq!(extract_tmux_semantic_version(""), None);
+    }
+
+    #[test]
+    fn tmux_command_available_detects_run_hook_capability() {
+        let commands = "attach-session (attach)\nrun-hook (runh)\nset-hook (seth)";
+        assert!(tmux_command_available(commands, "run-hook"));
+        assert!(!tmux_command_available(commands, "run-shell"));
     }
 
     #[test]

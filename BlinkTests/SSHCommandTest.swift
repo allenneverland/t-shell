@@ -508,6 +508,14 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("tmuxd") ?? false)
   }
 
+  func testClassifyTmuxBellHookFailureForMissingRunHookCapability() {
+    let output = "Remote command failed with exit status 1.\nstderr:\nunknown command: run-hook"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("run-hook") ?? false)
+  }
+
   func testClassifySelfTestFailureBadDeviceTokenIsNonRetryable() {
     let classified = TmuxSSHOnboardingService.classifySelfTestFailureForTesting(
       statusRaw: "bad_device_token",
@@ -539,6 +547,17 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     {"persistent_config_ok":true,"runtime_server_present":true,"runtime_hook_ok":true,"runtime_options_ok":true,"runtime_probe_performed":true,"runtime_probe_hook_ok":true,"runtime_probe_raw_bel_ok":true,"runtime_probe_reason_codes":[],"overall_ok":true,"reasons":[],"warnings":[]}
     """
     XCTAssertTrue(TmuxSSHOnboardingService.parseTmuxBellHookVerifyJSONForTesting(json))
+  }
+
+  func testTmuxBellHookVerifyFailureMessageForUnsupportedTmuxVersion() {
+    let json = """
+    {"persistent_config_ok":true,"runtime_server_present":true,"runtime_hook_ok":true,"runtime_options_ok":true,"runtime_probe_performed":false,"runtime_probe_hook_ok":false,"runtime_probe_raw_bel_ok":false,"runtime_probe_compatible":false,"minimum_tmux_version":"3.1.0","detected_tmux_version":"tmux 2.9","required_capabilities":["run-hook"],"missing_capabilities":["run-hook"],"runtime_probe_reason_codes":["runtime_probe_tmux_version_unsupported","runtime_probe_missing_run_hook"],"overall_ok":false,"reasons":["tmux 2.9 is too old"],"warnings":[]}
+    """
+    let message = TmuxSSHOnboardingService.tmuxBellHookVerificationFailureMessageForTesting(json)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.contains("tmux 2.9") ?? false)
+    XCTAssertTrue(message?.contains("3.1.0") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
   }
 
   func testClassifyTmuxBellHookFailureForRuntimeServerNotRunning() {
