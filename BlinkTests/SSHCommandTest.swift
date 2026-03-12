@@ -151,6 +151,72 @@ final class TmuxPickerDisplayTests: XCTestCase {
   }
 }
 
+final class TmuxPaneInboxSortingTests: XCTestCase {
+  private func _item(
+    hostAlias: String,
+    sessionName: String,
+    windowIndex: Int,
+    paneIndex: Int,
+    paneTarget: String,
+    paneActivity: Int64
+  ) -> TmuxPaneInboxItem {
+    TmuxPaneInboxItem(
+      hostAlias: hostAlias,
+      hostName: hostAlias,
+      sessionName: sessionName,
+      sessionAttached: false,
+      windowIndex: windowIndex,
+      windowName: "window \(windowIndex)",
+      paneIndex: paneIndex,
+      paneTarget: paneTarget,
+      currentPath: "/tmp",
+      active: false,
+      paneActivity: paneActivity
+    )
+  }
+
+  func testSortPanesOrdersByMostRecentActivityFirst() {
+    let older = _item(
+      hostAlias: "beta",
+      sessionName: "build",
+      windowIndex: 1,
+      paneIndex: 0,
+      paneTarget: "build:1.0",
+      paneActivity: 1000
+    )
+    let newer = _item(
+      hostAlias: "alpha",
+      sessionName: "ops",
+      windowIndex: 3,
+      paneIndex: 2,
+      paneTarget: "ops:3.2",
+      paneActivity: 2000
+    )
+
+    let sorted = tmuxPaneInboxSortPanesByRecentActivity([older, newer])
+    XCTAssertEqual(sorted.map(\.paneTarget), ["ops:3.2", "build:1.0"])
+  }
+
+  func testSortPanesUsesDeterministicTieBreakers() {
+    let items = [
+      _item(hostAlias: "zeta", sessionName: "work", windowIndex: 2, paneIndex: 0, paneTarget: "work:2.0", paneActivity: 3000),
+      _item(hostAlias: "alpha", sessionName: "zeta", windowIndex: 1, paneIndex: 0, paneTarget: "zeta:1.0", paneActivity: 3000),
+      _item(hostAlias: "alpha", sessionName: "alpha", windowIndex: 2, paneIndex: 0, paneTarget: "alpha:2.0", paneActivity: 3000),
+      _item(hostAlias: "alpha", sessionName: "alpha", windowIndex: 1, paneIndex: 1, paneTarget: "alpha:1.1", paneActivity: 3000),
+      _item(hostAlias: "alpha", sessionName: "alpha", windowIndex: 1, paneIndex: 0, paneTarget: "alpha:1.0", paneActivity: 3000)
+    ]
+
+    let sortedTargets = tmuxPaneInboxSortPanesByRecentActivity(items).map(\.paneTarget)
+    XCTAssertEqual(sortedTargets, [
+      "alpha:1.0",
+      "alpha:1.1",
+      "alpha:2.0",
+      "zeta:1.0",
+      "work:2.0"
+    ])
+  }
+}
+
 final class TmuxPaneBridgeCodecTests: XCTestCase {
   private let esc: UInt8 = 0x1b
 

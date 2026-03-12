@@ -1622,7 +1622,7 @@ func tmuxPanePickerTitle(
   return "\(marker)\(windowName) • pane \(paneIndex) • \(path)"
 }
 
-fileprivate struct TmuxPaneInboxItem: Equatable {
+struct TmuxPaneInboxItem: Equatable {
   let hostAlias: String
   let hostName: String
   let sessionName: String
@@ -1633,6 +1633,7 @@ fileprivate struct TmuxPaneInboxItem: Equatable {
   let paneTarget: String
   let currentPath: String
   let active: Bool
+  let paneActivity: Int64
 }
 
 fileprivate enum TmuxPaneInboxRow: Equatable {
@@ -1641,8 +1642,7 @@ fileprivate enum TmuxPaneInboxRow: Equatable {
 }
 
 fileprivate struct TmuxPaneInboxSection: Equatable {
-  let hostAlias: String
-  let hostName: String
+  let title: String
   let rows: [TmuxPaneInboxRow]
 }
 
@@ -1650,6 +1650,13 @@ fileprivate struct TmuxPaneInboxHostDescriptor {
   let host: BKHosts
   let alias: String
   let hostName: String
+}
+
+func tmuxPaneInboxHostLabel(alias: String, hostName: String) -> String {
+  if hostName.isEmpty || hostName == alias {
+    return alias
+  }
+  return "\(alias) (\(hostName))"
 }
 
 fileprivate func tmuxPaneInboxFlattenPanes(
@@ -1678,14 +1685,25 @@ fileprivate func tmuxPaneInboxFlattenPanes(
             paneIndex: pane.index,
             paneTarget: pane.target,
             currentPath: pane.currentPath,
-            active: pane.active
+            active: pane.active,
+            paneActivity: pane.paneActivity
           )
         )
       }
     }
   }
 
-  return panes.sorted { lhs, rhs in
+  return panes
+}
+
+func tmuxPaneInboxSortPanesByRecentActivity(_ panes: [TmuxPaneInboxItem]) -> [TmuxPaneInboxItem] {
+  panes.sorted { lhs, rhs in
+    if lhs.paneActivity != rhs.paneActivity {
+      return lhs.paneActivity > rhs.paneActivity
+    }
+    if lhs.hostAlias.caseInsensitiveCompare(rhs.hostAlias) != .orderedSame {
+      return lhs.hostAlias.caseInsensitiveCompare(rhs.hostAlias) == .orderedAscending
+    }
     if lhs.sessionName.caseInsensitiveCompare(rhs.sessionName) != .orderedSame {
       return lhs.sessionName.caseInsensitiveCompare(rhs.sessionName) == .orderedAscending
     }
@@ -1833,10 +1851,13 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       return
     }
 
-    var nextSections: [TmuxPaneInboxSection] = []
-    nextSections.reserveCapacity(hosts.count)
+    var allPanes: [TmuxPaneInboxItem] = []
+    var statusRows: [TmuxPaneInboxRow] = []
+    allPanes.reserveCapacity(hosts.count * 2)
+    statusRows.reserveCapacity(hosts.count)
 
     for descriptor in hosts {
+      let hostLabel = tmuxPaneInboxHostLabel(alias: descriptor.alias, hostName: descriptor.hostName)
       do {
         let sessions = try await TmuxControlPlaneClient.listSessions(for: descriptor.host)
         let panes = tmuxPaneInboxFlattenPanes(
@@ -1845,31 +1866,32 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
           sessions: sessions
         )
         if panes.isEmpty {
-          nextSections.append(
-            TmuxPaneInboxSection(
-              hostAlias: descriptor.alias,
-              hostName: descriptor.hostName,
-              rows: [.message("No tmux panes found.", isError: false)]
-            )
-          )
+          statusRows.append(.message("\(hostLabel): No tmux panes found.", isError: false))
         } else {
-          nextSections.append(
-            TmuxPaneInboxSection(
-              hostAlias: descriptor.alias,
-              hostName: descriptor.hostName,
-              rows: panes.map { .pane($0) }
-            )
-          )
+          allPanes.append(contentsOf: panes)
         }
       } catch {
-        nextSections.append(
-          TmuxPaneInboxSection(
-            hostAlias: descriptor.alias,
-            hostName: descriptor.hostName,
-            rows: [.message(error.localizedDescription, isError: true)]
-          )
-        )
+        statusRows.append(.message("\(hostLabel): \(error.localizedDescription)", isError: true))
       }
+    }
+
+    let sortedPanes = tmuxPaneInboxSortPanesByRecentActivity(allPanes)
+    var nextSections: [TmuxPaneInboxSection] = []
+    if !sortedPanes.isEmpty {
+      nextSections.append(
+        TmuxPaneInboxSection(
+          title: "Chats • \(sortedPanes.count)",
+          rows: sortedPanes.map { .pane($0) }
+        )
+      )
+    }
+    if !statusRows.isEmpty {
+      nextSections.append(
+        TmuxPaneInboxSection(
+          title: "Host Status",
+          rows: statusRows
+        )
+      )
     }
 
     sections = nextSections
@@ -1923,22 +1945,7 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-    let item = sections[section]
-    let hostLabel: String
-    if item.hostName.isEmpty || item.hostName == item.hostAlias {
-      hostLabel = item.hostAlias
-    } else {
-      hostLabel = "\(item.hostAlias) (\(item.hostName))"
-    }
-    let paneCount = item.rows.reduce(0) { partialResult, row in
-      switch row {
-      case .pane:
-        return partialResult + 1
-      case .message:
-        return partialResult
-      }
-    }
-    return paneCount > 0 ? "\(hostLabel) • \(paneCount)" : hostLabel
+    sections[section].title
   }
 
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -1949,8 +1956,9 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       let showPaneStar = BLKDefaults.isTmuxPaneStarVisible()
       let star = (showPaneStar && pane.active) ? "★ " : ""
       let attached = (BLKDefaults.isTmuxSessionAttachedVisible() && pane.sessionAttached) ? " • attached" : ""
+      let hostLabel = tmuxPaneInboxHostLabel(alias: pane.hostAlias, hostName: pane.hostName)
       content.text = "\(star)\(pane.sessionName)\(attached)"
-      content.secondaryText = "\(pane.windowName) • pane \(pane.paneIndex) • \(pane.currentPath.blink_lastPathComponent)"
+      content.secondaryText = "\(hostLabel) • \(pane.windowName) • pane \(pane.paneIndex) • \(pane.currentPath.blink_lastPathComponent)"
       content.textProperties.color = .label
       content.secondaryTextProperties.color = .secondaryLabel
       cell.accessoryType = .disclosureIndicator
@@ -2002,12 +2010,14 @@ fileprivate struct TmuxControlPane: Decodable {
   let active: Bool
   let target: String
   let currentPath: String
+  let paneActivity: Int64
 
   enum CodingKeys: String, CodingKey {
     case index
     case active
     case target
     case currentPath = "current_path"
+    case paneActivity = "pane_activity"
   }
 }
 
@@ -2094,6 +2104,7 @@ fileprivate enum TmuxControlError: LocalizedError {
   case unauthorized(Int)
   case badStatusCode(Int, String)
   case endpointUnsupported(String)
+  case incompatibleSessionsSchema(String)
   case missingData(String)
   case decoding(String, Error)
   case transport(Error)
@@ -2115,6 +2126,8 @@ fileprivate enum TmuxControlError: LocalizedError {
       return "Tmux control plane returned HTTP \(code) at \(path)."
     case .endpointUnsupported(let hostAlias):
       return "Host '\(hostAlias)' does not expose compatible pane control routes. Upgrade tmuxd/reverse-proxy to support /panes/{target}/{output,input,escape}."
+    case .incompatibleSessionsSchema(let hostAlias):
+      return "Host '\(hostAlias)' exposes an outdated tmux sessions payload (missing pane_activity). Upgrade tmuxd/tmux."
     case .missingData(let path):
       return "Tmux control plane returned no data at \(path)."
     case .decoding(_, let error):
@@ -2133,11 +2146,21 @@ fileprivate enum TmuxControlPlaneClient {
     return try await _withProfile(for: context) { profile, context in
       let path = profile.sessionsPath
       let result = try await _request(context: context, path: path, method: "GET")
+      if !(200...299).contains(result.statusCode),
+         let detail = _extractErrorMessage(data: result.data),
+         detail.localizedCaseInsensitiveContains("pane_activity")
+      {
+        throw TmuxControlError.incompatibleSessionsSchema(context.hostAlias)
+      }
       try _throwIfNonSuccess(result: result, path: path)
       guard !result.data.isEmpty else {
         throw TmuxControlError.missingData(path)
       }
-      return try _decode([TmuxControlSession].self, data: result.data, path: path)
+      return try _decodeSessions(
+        data: result.data,
+        path: path,
+        hostAlias: context.hostAlias
+      )
     }
   }
 
@@ -2284,6 +2307,37 @@ fileprivate enum TmuxControlPlaneClient {
   private static func _decode<T: Decodable>(_ type: T.Type, data: Data, path: String) throws -> T {
     do {
       return try JSONDecoder().decode(type, from: data)
+    } catch {
+      throw TmuxControlError.decoding(path, error)
+    }
+  }
+
+  private static func _extractErrorMessage(data: Data) -> String? {
+    guard !data.isEmpty else {
+      return nil
+    }
+
+    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let value = json["error"] as? String
+    {
+      return value
+    }
+
+    if let raw = String(data: data, encoding: .utf8) {
+      return raw
+    }
+    return nil
+  }
+
+  private static func _decodeSessions(
+    data: Data,
+    path: String,
+    hostAlias: String
+  ) throws -> [TmuxControlSession] {
+    do {
+      return try JSONDecoder().decode([TmuxControlSession].self, from: data)
+    } catch DecodingError.keyNotFound(let key, _) where key.stringValue == "pane_activity" {
+      throw TmuxControlError.incompatibleSessionsSchema(hostAlias)
     } catch {
       throw TmuxControlError.decoding(path, error)
     }

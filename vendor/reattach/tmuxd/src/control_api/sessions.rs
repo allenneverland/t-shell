@@ -9,6 +9,7 @@ pub struct PaneResponse {
     pub active: bool,
     pub target: String,
     pub current_path: String,
+    pub pane_activity: i64,
 }
 
 #[derive(Serialize)]
@@ -61,6 +62,7 @@ pub async fn list_sessions() -> Result<Json<Vec<SessionResponse>>, (StatusCode, 
                                     active: p.active,
                                     target: p.target,
                                     current_path: p.current_path,
+                                    pane_activity: p.pane_activity,
                                 })
                                 .collect(),
                         })
