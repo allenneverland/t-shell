@@ -554,6 +554,10 @@ async fn run_daemon(args: Option<ServeArgs>) -> AppResult<()> {
             get(push_api::list_mutes).post(push_api::create_mute),
         )
         .route("/v1/push/mutes/{id}", delete(push_api::delete_mute))
+        .route(
+            "/v1/push/panes/{target}/read",
+            post(push_api::mark_pane_read),
+        )
         .route("/v1/push/metrics/ios", post(push_api::ingest_ios_metrics));
 
     let public_routes = Router::new()
@@ -742,10 +746,7 @@ fn run_hooks_command(action: Option<HookAction>) -> Result<(), String> {
                 } else {
                     "unknown verification failure".to_string()
                 };
-                return Err(format!(
-                    "tmux bell hook verification failed: {}",
-                    detail
-                ));
+                return Err(format!("tmux bell hook verification failed: {}", detail));
             }
             Ok(())
         }
@@ -795,7 +796,8 @@ const REASON_RUNTIME_BELL_ACTION_NONE: &str = "runtime_bell_action_none";
 const REASON_RUNTIME_OPTIONS_QUERY_FAILED: &str = "runtime_options_query_failed";
 const REASON_RUNTIME_PROBE_SET_HOOK_FAILED: &str = "runtime_probe_set_hook_failed";
 const REASON_RUNTIME_PROBE_TRIGGER_HOOK_FAILED: &str = "runtime_probe_trigger_hook_failed";
-const REASON_RUNTIME_PROBE_TRIGGER_HOOK_NOT_OBSERVED: &str = "runtime_probe_trigger_hook_not_observed";
+const REASON_RUNTIME_PROBE_TRIGGER_HOOK_NOT_OBSERVED: &str =
+    "runtime_probe_trigger_hook_not_observed";
 const REASON_RUNTIME_PROBE_NEW_WINDOW_FAILED: &str = "runtime_probe_new_window_failed";
 const REASON_RUNTIME_PROBE_RAW_BEL_NOT_OBSERVED: &str = "runtime_probe_raw_bel_not_observed";
 const REASON_RUNTIME_PROBE_RESTORE_HOOK_FAILED: &str = "runtime_probe_restore_hook_failed";
@@ -1582,9 +1584,9 @@ fn execute_runtime_tmux_bell_probe(expected_hook_command: &str) -> RuntimeBellPr
             ],
             "configure runtime raw BEL probe hook",
         ) {
-            report
-                .reasons
-                .push(format!("failed to configure runtime raw BEL probe hook: {detail}"));
+            report.reasons.push(format!(
+                "failed to configure runtime raw BEL probe hook: {detail}"
+            ));
             push_unique(
                 &mut report.reason_codes,
                 REASON_RUNTIME_PROBE_SET_HOOK_FAILED.to_string(),

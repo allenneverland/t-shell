@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -116,6 +117,12 @@ impl Database {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mutes_device_id ON mutes(device_id);
+
+            CREATE TABLE IF NOT EXISTS pane_notification_state (
+                pane_target TEXT PRIMARY KEY,
+                last_notified_ts INTEGER NOT NULL,
+                last_read_ts INTEGER
+            );
 
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -873,6 +880,65 @@ impl Database {
         SCOPE_DEVICE_API
     }
 
+    pub fn record_pane_notification(
+        &self,
+        pane_target: &str,
+        event_ts: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let clean_target = pane_target.trim();
+        if clean_target.is_empty() {
+            return Ok(());
+        }
+
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "INSERT INTO pane_notification_state (pane_target, last_notified_ts, last_read_ts)
+             VALUES (?1, ?2, NULL)
+             ON CONFLICT(pane_target) DO UPDATE SET
+               last_notified_ts = MAX(pane_notification_state.last_notified_ts, excluded.last_notified_ts)",
+            params![clean_target, event_ts.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_pane_read(&self, pane_target: &str, read_at: DateTime<Utc>) -> AppResult<()> {
+        let clean_target = pane_target.trim();
+        if clean_target.is_empty() {
+            return Ok(());
+        }
+
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "INSERT INTO pane_notification_state (pane_target, last_notified_ts, last_read_ts)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(pane_target) DO UPDATE SET
+               last_read_ts = CASE
+                 WHEN pane_notification_state.last_read_ts IS NULL
+                      OR pane_notification_state.last_read_ts < excluded.last_read_ts
+                 THEN excluded.last_read_ts
+                 ELSE pane_notification_state.last_read_ts
+               END",
+            params![clean_target, read_at.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_unread_pane_targets(&self) -> AppResult<HashSet<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT pane_target
+             FROM pane_notification_state
+             WHERE last_notified_ts > COALESCE(last_read_ts, -9223372036854775808)",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = HashSet::new();
+        while let Some(row) = rows.next()? {
+            let target: String = row.get(0)?;
+            out.insert(target);
+        }
+        Ok(out)
+    }
+
     pub fn list_devices_for_host(&self, host_id: &str) -> AppResult<Vec<DeviceRecord>> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
@@ -1345,6 +1411,7 @@ fn lock_conn(conn: &Mutex<Connection>) -> AppResult<std::sync::MutexGuard<'_, Co
 mod tests {
     use super::*;
     use crate::models::{CompletePairingRequest, RegisterDeviceRequest, StartPairingRequest};
+    use chrono::TimeZone;
 
     fn setup_database() -> Database {
         let path =
@@ -1646,5 +1713,50 @@ mod tests {
             ],
         )
         .expect("same apns token should be reusable once old row is revoked");
+    }
+
+    #[test]
+    fn pane_notification_state_tracks_unread_and_read_transitions() {
+        let db = setup_database();
+        let base = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+
+        db.record_pane_notification("work:1.0", base)
+            .expect("first notification should be recorded");
+        let unread_after_notify = db
+            .list_unread_pane_targets()
+            .expect("unread list should be readable");
+        assert!(unread_after_notify.contains("work:1.0"));
+
+        db.mark_pane_read("work:1.0", base + Duration::seconds(10))
+            .expect("read marker should be stored");
+        let unread_after_read = db
+            .list_unread_pane_targets()
+            .expect("unread list should be readable");
+        assert!(!unread_after_read.contains("work:1.0"));
+    }
+
+    #[test]
+    fn pane_notification_state_uses_monotonic_timestamps() {
+        let db = setup_database();
+        let base = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        db.record_pane_notification("ops:2.1", base)
+            .expect("notification should be recorded");
+        db.mark_pane_read("ops:2.1", base + Duration::seconds(30))
+            .expect("read marker should be recorded");
+        db.record_pane_notification("ops:2.1", base - Duration::seconds(5))
+            .expect("older notification should not regress unread state");
+
+        let unread_after_old_event = db
+            .list_unread_pane_targets()
+            .expect("unread list should be readable");
+        assert!(!unread_after_old_event.contains("ops:2.1"));
+
+        db.record_pane_notification("ops:2.1", base + Duration::seconds(60))
+            .expect("newer notification should mark pane unread");
+        let unread_after_new_event = db
+            .list_unread_pane_targets()
+            .expect("unread list should be readable");
+        assert!(unread_after_new_event.contains("ops:2.1"));
     }
 }

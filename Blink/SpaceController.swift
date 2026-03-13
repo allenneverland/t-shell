@@ -1300,9 +1300,33 @@ extension SpaceController {
       return
     }
 
+    _markTmuxPaneReadIfPossible(hostAlias: cleanHost, paneTarget: cleanPane)
+
     let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
     let requestID = TmuxPaneLaunchRequestStore.shared.register(request: request)
     _openShellAndRunCommand("tmux-pane-bridge --request-id \(requestID)", skipHistoryRecord: true)
+  }
+
+  private func _markTmuxPaneReadIfPossible(hostAlias: String, paneTarget: String) {
+    let cleanHostAlias = hostAlias.blink_trimmed
+    let cleanPaneTarget = paneTarget.blink_trimmed
+    guard !cleanHostAlias.isEmpty, !cleanPaneTarget.isEmpty else {
+      return
+    }
+
+    guard let host = (BKHosts.allHosts() ?? []).first(where: {
+      (($0.host ?? "").blink_trimmed).caseInsensitiveCompare(cleanHostAlias) == .orderedSame
+    }) else {
+      return
+    }
+
+    Task {
+      do {
+        try await TmuxControlPlaneClient.markPaneRead(for: host, target: cleanPaneTarget)
+      } catch {
+        debugPrint("Failed to mark tmux pane as read:", error.localizedDescription)
+      }
+    }
   }
 
   private func _presentTmuxPaneDetail(host: BKHosts, request: TmuxNotificationRequest) {
@@ -1634,6 +1658,9 @@ struct TmuxPaneInboxItem: Equatable {
   let currentPath: String
   let active: Bool
   let paneActivity: Int64
+  let currentCommand: String
+  let previewText: String
+  let hasUnreadNotification: Bool
 }
 
 fileprivate enum TmuxPaneInboxRow: Equatable {
@@ -1657,6 +1684,24 @@ func tmuxPaneInboxHostLabel(alias: String, hostName: String) -> String {
     return alias
   }
   return "\(alias) (\(hostName))"
+}
+
+func tmuxPaneInboxPreviewText(previewText: String, currentCommand: String, fallbackPath: String) -> String {
+  let preview = previewText.blink_trimmed
+  if !preview.isEmpty {
+    return preview
+  }
+
+  let command = currentCommand.blink_trimmed
+  if !command.isEmpty {
+    return command
+  }
+
+  let path = fallbackPath.blink_lastPathComponent
+  if !path.isEmpty {
+    return path
+  }
+  return "(no recent output)"
 }
 
 fileprivate func tmuxPaneInboxFlattenPanes(
@@ -1686,7 +1731,10 @@ fileprivate func tmuxPaneInboxFlattenPanes(
             paneTarget: pane.target,
             currentPath: pane.currentPath,
             active: pane.active,
-            paneActivity: pane.paneActivity
+            paneActivity: pane.paneActivity,
+            currentCommand: pane.currentCommand,
+            previewText: pane.previewText,
+            hasUnreadNotification: pane.hasUnreadNotification
           )
         )
       }
@@ -1957,8 +2005,14 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       let star = (showPaneStar && pane.active) ? "★ " : ""
       let attached = (BLKDefaults.isTmuxSessionAttachedVisible() && pane.sessionAttached) ? " • attached" : ""
       let hostLabel = tmuxPaneInboxHostLabel(alias: pane.hostAlias, hostName: pane.hostName)
-      content.text = "\(star)\(pane.sessionName)\(attached)"
-      content.secondaryText = "\(hostLabel) • \(pane.windowName) • pane \(pane.paneIndex) • \(pane.currentPath.blink_lastPathComponent)"
+      let unreadMarker = pane.hasUnreadNotification ? "● " : ""
+      let preview = tmuxPaneInboxPreviewText(
+        previewText: pane.previewText,
+        currentCommand: pane.currentCommand,
+        fallbackPath: pane.currentPath
+      )
+      content.text = "\(unreadMarker)\(star)\(pane.sessionName)\(attached)"
+      content.secondaryText = "\(preview) • \(hostLabel) • \(pane.windowName) • pane \(pane.paneIndex)"
       content.textProperties.color = .label
       content.secondaryTextProperties.color = .secondaryLabel
       cell.accessoryType = .disclosureIndicator
@@ -2011,6 +2065,9 @@ fileprivate struct TmuxControlPane: Decodable {
   let target: String
   let currentPath: String
   let paneActivity: Int64
+  let currentCommand: String
+  let previewText: String
+  let hasUnreadNotification: Bool
 
   enum CodingKeys: String, CodingKey {
     case index
@@ -2018,6 +2075,9 @@ fileprivate struct TmuxControlPane: Decodable {
     case target
     case currentPath = "current_path"
     case paneActivity = "pane_activity"
+    case currentCommand = "current_command"
+    case previewText = "preview_text"
+    case hasUnreadNotification = "has_unread_notification"
   }
 }
 
@@ -2105,6 +2165,7 @@ fileprivate enum TmuxControlError: LocalizedError {
   case badStatusCode(Int, String)
   case endpointUnsupported(String)
   case incompatibleSessionsSchema(String)
+  case missingDeviceAPIToken(String)
   case missingData(String)
   case decoding(String, Error)
   case transport(Error)
@@ -2127,7 +2188,9 @@ fileprivate enum TmuxControlError: LocalizedError {
     case .endpointUnsupported(let hostAlias):
       return "Host '\(hostAlias)' does not expose compatible pane control routes. Upgrade tmuxd/reverse-proxy to support /panes/{target}/{output,input,escape}."
     case .incompatibleSessionsSchema(let hostAlias):
-      return "Host '\(hostAlias)' exposes an outdated tmux sessions payload (missing pane_activity). Upgrade tmuxd/tmux."
+      return "Host '\(hostAlias)' exposes an outdated tmux sessions payload (missing pane_activity/current_command/preview_text/has_unread_notification). Upgrade tmuxd/tmux."
+    case .missingDeviceAPIToken(let hostAlias):
+      return "Host '\(hostAlias)' is missing Device API token. Re-register tmux push in Settings > Hosts > SSH."
     case .missingData(let path):
       return "Tmux control plane returned no data at \(path)."
     case .decoding(_, let error):
@@ -2148,7 +2211,7 @@ fileprivate enum TmuxControlPlaneClient {
       let result = try await _request(context: context, path: path, method: "GET")
       if !(200...299).contains(result.statusCode),
          let detail = _extractErrorMessage(data: result.data),
-         detail.localizedCaseInsensitiveContains("pane_activity")
+         _isSessionsSchemaMismatchMessage(detail)
       {
         throw TmuxControlError.incompatibleSessionsSchema(context.hostAlias)
       }
@@ -2162,6 +2225,25 @@ fileprivate enum TmuxControlPlaneClient {
         hostAlias: context.hostAlias
       )
     }
+  }
+
+  static func markPaneRead(for host: BKHosts, target: String) async throws {
+    let context = try _context(for: host)
+    let cleanToken = host.tmuxPushDeviceApiToken?.blink_trimmed ?? ""
+    guard !cleanToken.isEmpty else {
+      throw TmuxControlError.missingDeviceAPIToken(context.hostAlias)
+    }
+
+    let encodedTarget = _encodePathComponent(target)
+    let path = "/v1/push/panes/\(encodedTarget)/read"
+    let deviceContext = TmuxControlRequestContext(
+      hostAlias: context.hostAlias,
+      baseURL: context.baseURL,
+      bearerToken: cleanToken,
+      cacheKey: context.cacheKey
+    )
+    let result = try await _request(context: deviceContext, path: path, method: "POST")
+    try _throwIfNonSuccess(result: result, path: path)
   }
 
   static func getPaneOutput(for host: BKHosts, target: String, lines: Int = outputLines) async throws -> String {
@@ -2336,11 +2418,28 @@ fileprivate enum TmuxControlPlaneClient {
   ) throws -> [TmuxControlSession] {
     do {
       return try JSONDecoder().decode([TmuxControlSession].self, from: data)
-    } catch DecodingError.keyNotFound(let key, _) where key.stringValue == "pane_activity" {
+    } catch DecodingError.keyNotFound(let key, _) where _isRequiredSessionsField(key.stringValue) {
       throw TmuxControlError.incompatibleSessionsSchema(hostAlias)
     } catch {
       throw TmuxControlError.decoding(path, error)
     }
+  }
+
+  private static func _isRequiredSessionsField(_ key: String) -> Bool {
+    switch key {
+    case "pane_activity", "current_command", "preview_text", "has_unread_notification":
+      return true
+    default:
+      return false
+    }
+  }
+
+  private static func _isSessionsSchemaMismatchMessage(_ message: String) -> Bool {
+    let normalized = message.lowercased()
+    return normalized.contains("pane_activity")
+      || normalized.contains("current_command")
+      || normalized.contains("preview_text")
+      || normalized.contains("has_unread_notification")
   }
 
   static func _encodePathComponent(_ value: String) -> String {

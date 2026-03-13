@@ -197,6 +197,20 @@ pub async fn ingest_ios_metrics(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn mark_pane_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(target): Path<String>,
+) -> AppResult<StatusCode> {
+    let _token = authorize_device_api(&state.db, &headers)?;
+    if target.trim().is_empty() {
+        return Err(AppError::bad_request("pane target is empty"));
+    }
+
+    state.db.mark_pane_read(&target, Utc::now())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn ingest_event(
     state: &AppState,
     req: IngestEventRequest,
@@ -230,6 +244,9 @@ async fn ingest_event(
         pane_target,
         event_ts,
     };
+    if let Some(target) = event.pane_target.as_deref() {
+        state.db.record_pane_notification(target, event.event_ts)?;
+    }
 
     let candidates = state.db.list_all_devices()?;
 

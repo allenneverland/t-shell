@@ -149,6 +149,24 @@ final class TmuxPickerDisplayTests: XCTestCase {
     )
     XCTAssertEqual(title, "editor • pane 2 • project")
   }
+
+  func testInboxPreviewPrefersPreviewText() {
+    let preview = tmuxPaneInboxPreviewText(
+      previewText: "build succeeded",
+      currentCommand: "make test",
+      fallbackPath: "/tmp/project"
+    )
+    XCTAssertEqual(preview, "build succeeded")
+  }
+
+  func testInboxPreviewFallsBackToCurrentCommand() {
+    let preview = tmuxPaneInboxPreviewText(
+      previewText: "   ",
+      currentCommand: "python server.py",
+      fallbackPath: "/tmp/project"
+    )
+    XCTAssertEqual(preview, "python server.py")
+  }
 }
 
 final class TmuxPaneInboxSortingTests: XCTestCase {
@@ -171,7 +189,10 @@ final class TmuxPaneInboxSortingTests: XCTestCase {
       paneTarget: paneTarget,
       currentPath: "/tmp",
       active: false,
-      paneActivity: paneActivity
+      paneActivity: paneActivity,
+      currentCommand: "bash",
+      previewText: "preview",
+      hasUnreadNotification: false
     )
   }
 

@@ -10,6 +10,8 @@ pub struct Pane {
     pub target: String,
     pub current_path: String,
     pub pane_activity: i64,
+    pub current_command: String,
+    pub preview_text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,6 +40,7 @@ struct ParsedPaneRow {
     pane_active: bool,
     current_path: String,
     pane_activity: i64,
+    current_command: String,
 }
 
 fn parse_session_attached(value: &str) -> bool {
@@ -58,7 +61,7 @@ fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
     }
 
     let parts: Vec<&str> = line.split('|').collect();
-    if parts.len() != 9 {
+    if parts.len() != 10 {
         return Ok(None);
     }
 
@@ -72,7 +75,64 @@ fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
         pane_active: parts[6] == "1",
         current_path: parts[7].to_string(),
         pane_activity: parse_pane_activity(parts[8])?,
+        current_command: parts[9].trim().to_string(),
     }))
+}
+
+fn capture_pane_preview_text(target: &str) -> String {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", target, "-S", "-40"])
+        .output();
+    let Ok(output) = output else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for line in raw.lines().rev() {
+        let clean = sanitize_preview_line(line);
+        if !clean.is_empty() {
+            return truncate_preview_text(&clean, 140);
+        }
+    }
+    String::new()
+}
+
+fn sanitize_preview_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek().copied() == Some('[') {
+                let _ = chars.next();
+                for esc_ch in chars.by_ref() {
+                    if ('@'..='~').contains(&esc_ch) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_control() && ch != '\t' {
+            continue;
+        }
+        out.push(if ch == '\t' { ' ' } else { ch });
+    }
+    out.trim().to_string()
+}
+
+fn truncate_preview_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut result = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    result.push('…');
+    result
 }
 
 pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
@@ -81,7 +141,7 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{session_attached}|#{window_index}|#{window_name}|#{window_active}|#{pane_index}|#{pane_active}|#{pane_current_path}|#{pane_activity}",
+            "#{session_name}|#{session_attached}|#{window_index}|#{window_name}|#{window_active}|#{pane_index}|#{pane_active}|#{pane_current_path}|#{pane_activity}|#{pane_current_command}",
         ])
         .output()
         .map_err(TmuxError::Io)?;
@@ -109,6 +169,14 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
             "{}:{}.{}",
             parsed.session_name, parsed.window_index, parsed.pane_index
         );
+        let preview_text = {
+            let preview = capture_pane_preview_text(&target);
+            if !preview.is_empty() {
+                preview
+            } else {
+                truncate_preview_text(&sanitize_preview_line(&parsed.current_command), 140)
+            }
+        };
 
         let pane = Pane {
             index: parsed.pane_index,
@@ -116,11 +184,11 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
             target,
             current_path: parsed.current_path,
             pane_activity: parsed.pane_activity,
+            current_command: parsed.current_command,
+            preview_text,
         };
 
-        let session = sessions
-            .iter_mut()
-            .find(|s| s.name == parsed.session_name);
+        let session = sessions.iter_mut().find(|s| s.name == parsed.session_name);
         match session {
             Some(session) => {
                 let window = session
@@ -161,7 +229,9 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pane_activity, parse_session_attached};
+    use super::{
+        parse_pane_activity, parse_session_attached, sanitize_preview_line, truncate_preview_text,
+    };
     use crate::tmux::TmuxError;
 
     #[test]
@@ -192,5 +262,17 @@ mod tests {
             }
             _ => panic!("expected command error"),
         }
+    }
+
+    #[test]
+    fn sanitize_preview_line_removes_ansi_and_control_bytes() {
+        let line = "\u{1b}[31mhello\u{1b}[0m\tworld\u{7}";
+        assert_eq!(sanitize_preview_line(line), "hello world");
+    }
+
+    #[test]
+    fn truncate_preview_text_adds_ellipsis_when_needed() {
+        assert_eq!(truncate_preview_text("abcdef", 4), "abc…");
+        assert_eq!(truncate_preview_text("abc", 4), "abc");
     }
 }

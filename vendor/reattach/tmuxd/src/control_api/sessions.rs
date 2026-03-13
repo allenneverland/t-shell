@@ -1,7 +1,7 @@
-use axum::{http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::tmux;
+use crate::{state::AppState, tmux};
 
 #[derive(Serialize)]
 pub struct PaneResponse {
@@ -10,6 +10,9 @@ pub struct PaneResponse {
     pub target: String,
     pub current_path: String,
     pub pane_activity: i64,
+    pub current_command: String,
+    pub preview_text: String,
+    pub has_unread_notification: bool,
 }
 
 #[derive(Serialize)]
@@ -38,10 +41,22 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
-pub async fn list_sessions() -> Result<Json<Vec<SessionResponse>>, (StatusCode, Json<ErrorResponse>)>
-{
+pub async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SessionResponse>>, (StatusCode, Json<ErrorResponse>)> {
     match tmux::list_sessions() {
         Ok(sessions) => {
+            let unread_targets = match state.db.list_unread_pane_targets() {
+                Ok(values) => values,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: e.to_string(),
+                        }),
+                    ))
+                }
+            };
             let response: Vec<SessionResponse> = sessions
                 .into_iter()
                 .map(|s| SessionResponse {
@@ -57,12 +72,19 @@ pub async fn list_sessions() -> Result<Json<Vec<SessionResponse>>, (StatusCode, 
                             panes: w
                                 .panes
                                 .into_iter()
-                                .map(|p| PaneResponse {
-                                    index: p.index,
-                                    active: p.active,
-                                    target: p.target,
-                                    current_path: p.current_path,
-                                    pane_activity: p.pane_activity,
+                                .map(|p| {
+                                    let target = p.target;
+                                    let has_unread_notification = unread_targets.contains(&target);
+                                    PaneResponse {
+                                        index: p.index,
+                                        active: p.active,
+                                        target,
+                                        current_path: p.current_path,
+                                        pane_activity: p.pane_activity,
+                                        current_command: p.current_command,
+                                        preview_text: p.preview_text,
+                                        has_unread_notification,
+                                    }
                                 })
                                 .collect(),
                         })
