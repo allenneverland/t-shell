@@ -95,20 +95,11 @@ final class TmuxAttachCommandTests: XCTestCase {
 }
 
 final class TmuxControlPlaneRouteTests: XCTestCase {
-  func testNamespacedProfilePaths() {
-    let profile = TmuxControlPlaneProfile.namespacedV1
-    XCTAssertEqual(profile.sessionsPath, "/v1/tmux/sessions")
-    XCTAssertEqual(profile.paneOutputPath(target: "work:1.2", lines: 500), "/v1/tmux/panes/work:1.2/output?lines=500")
-    XCTAssertEqual(profile.paneInputPath(target: "work:1.2"), "/v1/tmux/panes/work:1.2/input")
-    XCTAssertEqual(profile.paneEscapePath(target: "work:1.2"), "/v1/tmux/panes/work:1.2/escape")
-  }
-
-  func testFlatProfilePaths() {
-    let profile = TmuxControlPlaneProfile.flat
-    XCTAssertEqual(profile.sessionsPath, "/sessions")
-    XCTAssertEqual(profile.paneOutputPath(target: "work:1.2", lines: 500), "/panes/work:1.2/output?lines=500")
-    XCTAssertEqual(profile.paneInputPath(target: "work:1.2"), "/panes/work:1.2/input")
-    XCTAssertEqual(profile.paneEscapePath(target: "work:1.2"), "/panes/work:1.2/escape")
+  func testNamespacedPathsOnly() {
+    XCTAssertEqual(tmuxControlSessionsPathForTesting(), "/v1/tmux/sessions")
+    XCTAssertEqual(tmuxControlPaneOutputPathForTesting(target: "work:1.2", lines: 500), "/v1/tmux/panes/work:1.2/output?lines=500")
+    XCTAssertEqual(tmuxControlPaneInputPathForTesting(target: "work:1.2"), "/v1/tmux/panes/work:1.2/input")
+    XCTAssertEqual(tmuxControlPaneEscapePathForTesting(target: "work:1.2"), "/v1/tmux/panes/work:1.2/escape")
   }
 
   func testPaneTargetPathEncodingEscapesSlashAndSpace() {

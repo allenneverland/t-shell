@@ -1813,6 +1813,30 @@ enum TmuxSSHOnboardingService {
     return RemoteOnboardingResult(discoveredServiceBaseURL: discoveredServiceBaseURL)
   }
 
+  static func upgradeTmuxdOnly(
+    hostAlias: String,
+    termDevice: TermDevice,
+    onProgress: @escaping (String) -> Void
+  ) async throws {
+    await MainActor.run { onProgress("Connecting to remote host…") }
+    let client = try await connect(hostAlias: hostAlias, termDevice: termDevice)
+    defer {
+      SSHPool.deregister(allTunnelsForConnection: client)
+    }
+
+    await MainActor.run { onProgress("Detecting remote platform…") }
+    let platform = try await resolveRemotePlatform(on: client)
+
+    await MainActor.run { onProgress("Resolving tmuxd release tag…") }
+    let releaseTag = try await resolveTmuxdReleaseTag(on: client)
+
+    await MainActor.run { onProgress("Installing tmuxd…") }
+    try await installTmuxd(on: client, releaseTag: releaseTag, platform: platform)
+
+    await MainActor.run { onProgress("Restarting tmuxd service…") }
+    _ = try await restartTmuxdServiceUsingExistingConfig(on: client)
+  }
+
   static func resolveReachableServiceBaseURL(
     endpointOverride: String,
     fallbackServiceBaseURL: String,
@@ -2399,6 +2423,45 @@ enum TmuxSSHOnboardingService {
     throw ValidationError.general(
       message: "Unable to install tmuxd for \(platform.os)-\(platform.arch):\n\(failureMessage)"
     )
+  }
+
+  private static func restartTmuxdServiceUsingExistingConfig(
+    on client: SSH.SSHClient
+  ) async throws -> Int {
+    var conflictFailures: [String] = []
+    for localPort in tmuxdLocalPortCandidates {
+      do {
+        try await runChecked(script: startTmuxdScript(localPort: localPort), on: client)
+        try await runChecked(script: waitForLocalHealthzScript(localPort: localPort), on: client)
+        return localPort
+      } catch {
+        let diagnostics = (try? await runChecked(script: tmuxdDiagnosticsScript(localPort: localPort), on: client).stdout) ?? ""
+        let combined = [error.localizedDescription, diagnostics]
+          .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+          .joined(separator: "\n")
+        if isTmuxdPortConflictOutput(combined) {
+          let detail = firstNonEmptyLine(in: [combined]) ?? "listener conflict"
+          conflictFailures.append("port \(localPort): listener conflict (\(detail))")
+          continue
+        }
+
+        var message = "Failed to restart tmuxd service after upgrade on local port \(localPort)."
+        if let guidance = classifyTmuxdStartupFailureMessage(combined) {
+          message += "\n\(guidance)"
+        }
+        if !combined.isEmpty {
+          message += "\n\(combined)"
+        }
+        throw ValidationError.general(message: message)
+      }
+    }
+
+    var lines = conflictFailures
+    if lines.isEmpty {
+      lines.append("All tmuxd restart attempts failed before binding a local port.")
+    }
+    lines.append("Failed to restart tmuxd after upgrade on all managed local ports (8787/8790/8791).")
+    throw ValidationError.general(message: lines.joined(separator: "\n"))
   }
 
   private static func installTmuxBellHook(on client: SSH.SSHClient) async throws {

@@ -485,6 +485,14 @@ Please go to your subscriptions and cancel one of them!
           self._createShell(userActivity: nil, animated: true)
           self._focusOnShell()
         }
+      },
+      onUpgradeHost: { [weak self] hostAlias in
+        guard let self else {
+          return
+        }
+        self._dismissTmuxPaneInboxIfNeeded {
+          self._upgradeTmuxHost(hostAlias: hostAlias)
+        }
       }
     )
     let nav = UINavigationController(rootViewController: inbox)
@@ -1329,6 +1337,91 @@ extension SpaceController {
     }
   }
 
+  private func _tmuxHost(for alias: String) -> BKHosts? {
+    let cleanAlias = alias.blink_trimmed
+    guard !cleanAlias.isEmpty else {
+      return nil
+    }
+
+    return (BKHosts.allHosts() ?? []).first(where: {
+      (($0.host ?? "").blink_trimmed).caseInsensitiveCompare(cleanAlias) == .orderedSame
+        || (($0.hostName ?? "").blink_trimmed).caseInsensitiveCompare(cleanAlias) == .orderedSame
+    })
+  }
+
+  private func _presentUpgradeFailureAlert(_ message: String) {
+    let alert = UIAlertController(title: "Upgrade Failed", message: message, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "OK", style: .default, handler: { [weak self] _ in
+      self?._presentTmuxPaneInbox(animated: true)
+    }))
+    present(alert, animated: true)
+  }
+
+  private func _upgradeTmuxHost(hostAlias: String) {
+    let cleanAlias = hostAlias.blink_trimmed
+    guard !cleanAlias.isEmpty else {
+      showAlert(msg: "Missing host alias for upgrade.")
+      _presentTmuxPaneInbox(animated: true)
+      return
+    }
+    guard let host = _tmuxHost(for: cleanAlias) else {
+      showAlert(msg: "Host '\(cleanAlias)' was not found. Check Settings > Hosts > SSH.")
+      _presentTmuxPaneInbox(animated: true)
+      return
+    }
+
+    func runUpgrade(using termDevice: TermDevice) {
+      let hud = MBProgressHUD.showAdded(to: view, animated: true)
+      hud.mode = .indeterminate
+      hud.label.text = "Upgrading tmuxd…"
+      hud.detailsLabel.text = "Preparing remote upgrade for \(cleanAlias)"
+      hud.detailsLabel.numberOfLines = 0
+
+      Task { @MainActor [weak self] in
+        guard let self else {
+          return
+        }
+
+        defer {
+          hud.hide(animated: true)
+        }
+
+        do {
+          try await TmuxSSHOnboardingService.upgradeTmuxdOnly(
+            hostAlias: cleanAlias,
+            termDevice: termDevice,
+            onProgress: { status in
+              Task { @MainActor in
+                hud.detailsLabel.text = status
+              }
+            }
+          )
+          _ = try await TmuxControlPlaneClient.listSessions(for: host)
+          self._presentTmuxPaneInbox(animated: true)
+        } catch {
+          self._presentUpgradeFailureAlert(error.localizedDescription)
+        }
+      }
+    }
+
+    if let termDevice = currentTerm()?.termDevice {
+      runUpgrade(using: termDevice)
+      return
+    }
+
+    _createShell(userActivity: nil, animated: true) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      self._focusOnShell()
+      guard let termDevice = self.currentTerm()?.termDevice else {
+        self._presentUpgradeFailureAlert("Cannot create terminal context required for SSH upgrade. Open a terminal and retry.")
+        return
+      }
+      runUpgrade(using: termDevice)
+    }
+  }
+
   private func _presentTmuxPaneDetail(host: BKHosts, request: TmuxNotificationRequest) {
     let paneController = TmuxPaneDetailViewController(host: host, request: request)
     let nav = UINavigationController(rootViewController: paneController)
@@ -1665,7 +1758,18 @@ struct TmuxPaneInboxItem: Equatable {
 
 fileprivate enum TmuxPaneInboxRow: Equatable {
   case pane(TmuxPaneInboxItem)
-  case message(String, isError: Bool)
+  case message(String, isError: Bool, action: TmuxPaneInboxRowAction?)
+}
+
+fileprivate enum TmuxPaneInboxRowAction: Equatable {
+  case upgradeHost(String)
+
+  var subtitle: String {
+    switch self {
+    case .upgradeHost:
+      return "Tap to upgrade this host's tmuxd."
+    }
+  }
 }
 
 fileprivate struct TmuxPaneInboxSection: Equatable {
@@ -1774,6 +1878,7 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
 
   private let onPaneSelected: (TmuxNotificationRequest) -> Void
   private let onCreateTerminal: () -> Void
+  private let onUpgradeHost: (String) -> Void
 
   private var sections: [TmuxPaneInboxSection] = []
   private var autoRefreshTask: Task<Void, Never>?
@@ -1782,10 +1887,12 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
 
   init(
     onPaneSelected: @escaping (TmuxNotificationRequest) -> Void,
-    onCreateTerminal: @escaping () -> Void
+    onCreateTerminal: @escaping () -> Void,
+    onUpgradeHost: @escaping (String) -> Void
   ) {
     self.onPaneSelected = onPaneSelected
     self.onCreateTerminal = onCreateTerminal
+    self.onUpgradeHost = onUpgradeHost
     super.init(style: .insetGrouped)
   }
 
@@ -1914,12 +2021,18 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
           sessions: sessions
         )
         if panes.isEmpty {
-          statusRows.append(.message("\(hostLabel): No tmux panes found.", isError: false))
+          statusRows.append(.message("\(hostLabel): No tmux panes found.", isError: false, action: nil))
         } else {
           allPanes.append(contentsOf: panes)
         }
       } catch {
-        statusRows.append(.message("\(hostLabel): \(error.localizedDescription)", isError: true))
+        let action: TmuxPaneInboxRowAction?
+        if let controlError = error as? TmuxControlError, controlError.requiresHostUpgrade {
+          action = .upgradeHost(descriptor.alias)
+        } else {
+          action = nil
+        }
+        statusRows.append(.message("\(hostLabel): \(error.localizedDescription)", isError: true, action: action))
       }
     }
 
@@ -2017,12 +2130,13 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       content.secondaryTextProperties.color = .secondaryLabel
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
-    case .message(let message, let isError):
+    case .message(let message, let isError, let action):
       content.text = message
       content.textProperties.color = isError ? .systemRed : .secondaryLabel
-      content.secondaryText = nil
-      cell.accessoryType = .none
-      cell.selectionStyle = .none
+      content.secondaryText = action?.subtitle
+      content.secondaryTextProperties.color = .secondaryLabel
+      cell.accessoryType = action == nil ? .none : .disclosureIndicator
+      cell.selectionStyle = action == nil ? .none : .default
     }
     cell.contentConfiguration = content
     return cell
@@ -2033,17 +2147,24 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       tableView.deselectRow(at: indexPath, animated: true)
     }
 
-    guard case .pane(let pane) = sections[indexPath.section].rows[indexPath.row] else {
-      return
-    }
-
-    onPaneSelected(
-      TmuxNotificationRequest(
-        hostAlias: pane.hostAlias,
-        sessionName: pane.sessionName,
-        paneTarget: pane.paneTarget
+    switch sections[indexPath.section].rows[indexPath.row] {
+    case .pane(let pane):
+      onPaneSelected(
+        TmuxNotificationRequest(
+          hostAlias: pane.hostAlias,
+          sessionName: pane.sessionName,
+          paneTarget: pane.paneTarget
+        )
       )
-    )
+    case .message(_, _, let action):
+      guard let action else {
+        return
+      }
+      switch action {
+      case .upgradeHost(let hostAlias):
+        onUpgradeHost(hostAlias)
+      }
+    }
   }
 }
 
@@ -2081,61 +2202,31 @@ fileprivate struct TmuxControlPane: Decodable {
   }
 }
 
-enum TmuxControlPlaneProfile: CaseIterable, Equatable {
-  case namespacedV1
-  case flat
+fileprivate struct TmuxControlCapabilitiesResponse: Decodable {
+  let capabilitiesSchemaVersion: Int
+  let features: TmuxControlCapabilitiesFeatures
 
-  var sessionsPath: String {
-    switch self {
-    case .namespacedV1:
-      return "/v1/tmux/sessions"
-    case .flat:
-      return "/sessions"
-    }
-  }
-
-  func paneOutputPath(target: String, lines: Int) -> String {
-    switch self {
-    case .namespacedV1:
-      return "/v1/tmux/panes/\(target)/output?lines=\(lines)"
-    case .flat:
-      return "/panes/\(target)/output?lines=\(lines)"
-    }
-  }
-
-  func paneInputPath(target: String) -> String {
-    switch self {
-    case .namespacedV1:
-      return "/v1/tmux/panes/\(target)/input"
-    case .flat:
-      return "/panes/\(target)/input"
-    }
-  }
-
-  func paneEscapePath(target: String) -> String {
-    switch self {
-    case .namespacedV1:
-      return "/v1/tmux/panes/\(target)/escape"
-    case .flat:
-      return "/panes/\(target)/escape"
-    }
+  enum CodingKeys: String, CodingKey {
+    case capabilitiesSchemaVersion = "capabilities_schema_version"
+    case features
   }
 }
 
-fileprivate actor TmuxControlPlaneProfileCache {
-  static let shared = TmuxControlPlaneProfileCache()
-  private var values: [String: TmuxControlPlaneProfile] = [:]
+fileprivate struct TmuxControlCapabilitiesFeatures: Decodable {
+  let paneInboxV1: TmuxControlPaneInboxCapability?
 
-  func profile(for key: String) -> TmuxControlPlaneProfile? {
-    values[key]
+  enum CodingKeys: String, CodingKey {
+    case paneInboxV1 = "pane_inbox_v1"
   }
+}
 
-  func set(_ profile: TmuxControlPlaneProfile, for key: String) {
-    values[key] = profile
-  }
+fileprivate struct TmuxControlPaneInboxCapability: Decodable {
+  let enabled: Bool
+  let requiredPaneFields: [String]
 
-  func removeProfile(for key: String) {
-    values.removeValue(forKey: key)
+  enum CodingKeys: String, CodingKey {
+    case enabled
+    case requiredPaneFields = "required_pane_fields"
   }
 }
 
@@ -2143,7 +2234,6 @@ fileprivate struct TmuxControlRequestContext {
   let hostAlias: String
   let baseURL: String
   let bearerToken: String?
-  let cacheKey: String
 }
 
 fileprivate struct TmuxControlHTTPResult {
@@ -2163,18 +2253,20 @@ fileprivate enum TmuxControlError: LocalizedError {
   case invalidURL(String)
   case unauthorized(Int)
   case badStatusCode(Int, String)
-  case endpointUnsupported(String)
+  case incompatibleCapabilitiesSchema(String)
   case incompatibleSessionsSchema(String)
   case missingDeviceAPIToken(String)
   case missingData(String)
   case decoding(String, Error)
   case transport(Error)
 
-  var isRouteNotFound: Bool {
-    if case .badStatusCode(let code, _) = self {
-      return code == 404
+  var requiresHostUpgrade: Bool {
+    switch self {
+    case .incompatibleCapabilitiesSchema, .incompatibleSessionsSchema:
+      return true
+    default:
+      return false
     }
-    return false
   }
 
   var errorDescription: String? {
@@ -2185,8 +2277,8 @@ fileprivate enum TmuxControlError: LocalizedError {
       return "Tmux endpoint rejected credentials (HTTP 401/403). Verify Service Token in Settings > Hosts > SSH."
     case .badStatusCode(let code, let path):
       return "Tmux control plane returned HTTP \(code) at \(path)."
-    case .endpointUnsupported(let hostAlias):
-      return "Host '\(hostAlias)' does not expose compatible pane control routes. Upgrade tmuxd/reverse-proxy to support /panes/{target}/{output,input,escape}."
+    case .incompatibleCapabilitiesSchema(let hostAlias):
+      return "Host '\(hostAlias)' exposes an outdated tmux capabilities payload (requires capabilities_schema_version >= 7 with pane_inbox_v1). Upgrade tmuxd on this host."
     case .incompatibleSessionsSchema(let hostAlias):
       return "Host '\(hostAlias)' exposes an outdated tmux sessions payload (missing pane_activity/current_command/preview_text/has_unread_notification). Upgrade tmuxd/tmux."
     case .missingDeviceAPIToken(let hostAlias):
@@ -2203,28 +2295,34 @@ fileprivate enum TmuxControlError: LocalizedError {
 
 fileprivate enum TmuxControlPlaneClient {
   private static let outputLines = 500
+  private static let minimumCapabilitiesSchemaVersion = 7
+  private static let capabilitiesPath = "/v1/capabilities"
+  private static let sessionsPath = "/v1/tmux/sessions"
+  private static let requiredPaneInboxFields: Set<String> = [
+    "pane_activity",
+    "current_command",
+    "preview_text",
+    "has_unread_notification"
+  ]
 
   static func listSessions(for host: BKHosts) async throws -> [TmuxControlSession] {
     let context = try _context(for: host)
-    return try await _withProfile(for: context) { profile, context in
-      let path = profile.sessionsPath
-      let result = try await _request(context: context, path: path, method: "GET")
-      if !(200...299).contains(result.statusCode),
-         let detail = _extractErrorMessage(data: result.data),
-         _isSessionsSchemaMismatchMessage(detail)
-      {
-        throw TmuxControlError.incompatibleSessionsSchema(context.hostAlias)
-      }
-      try _throwIfNonSuccess(result: result, path: path)
-      guard !result.data.isEmpty else {
-        throw TmuxControlError.missingData(path)
-      }
-      return try _decodeSessions(
-        data: result.data,
-        path: path,
-        hostAlias: context.hostAlias
-      )
+    try await _validatePaneInboxCapabilities(context: context)
+
+    let path = sessionsPath
+    let result = try await _request(context: context, path: path, method: "GET")
+    if result.statusCode == 404 {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
+    try _throwIfNonSuccess(result: result, path: path)
+    guard !result.data.isEmpty else {
+      throw TmuxControlError.missingData(path)
+    }
+    return try _decodeSessions(
+      data: result.data,
+      path: path,
+      hostAlias: context.hostAlias
+    )
   }
 
   static func markPaneRead(for host: BKHosts, target: String) async throws {
@@ -2239,8 +2337,7 @@ fileprivate enum TmuxControlPlaneClient {
     let deviceContext = TmuxControlRequestContext(
       hostAlias: context.hostAlias,
       baseURL: context.baseURL,
-      bearerToken: cleanToken,
-      cacheKey: context.cacheKey
+      bearerToken: cleanToken
     )
     let result = try await _request(context: deviceContext, path: path, method: "POST")
     try _throwIfNonSuccess(result: result, path: path)
@@ -2249,76 +2346,36 @@ fileprivate enum TmuxControlPlaneClient {
   static func getPaneOutput(for host: BKHosts, target: String, lines: Int = outputLines) async throws -> String {
     let context = try _context(for: host)
     let encodedTarget = _encodePathComponent(target)
-    return try await _withProfile(for: context) { profile, context in
-      let path = profile.paneOutputPath(target: encodedTarget, lines: max(1, lines))
-      let result = try await _request(context: context, path: path, method: "GET")
-      try _throwIfNonSuccess(result: result, path: path)
-      guard !result.data.isEmpty else {
-        throw TmuxControlError.missingData(path)
-      }
-      if let response = try? _decode(TmuxControlPaneOutputResponse.self, data: result.data, path: path) {
-        return response.output
-      }
-      if let raw = String(data: result.data, encoding: .utf8) {
-        return raw
-      }
-      throw TmuxControlError.decoding(path, DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported output payload.")))
+    let path = "/v1/tmux/panes/\(encodedTarget)/output?lines=\(max(1, lines))"
+    let result = try await _request(context: context, path: path, method: "GET")
+    try _throwIfNonSuccess(result: result, path: path)
+    guard !result.data.isEmpty else {
+      throw TmuxControlError.missingData(path)
     }
+    if let response = try? _decode(TmuxControlPaneOutputResponse.self, data: result.data, path: path) {
+      return response.output
+    }
+    if let raw = String(data: result.data, encoding: .utf8) {
+      return raw
+    }
+    throw TmuxControlError.decoding(path, DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported output payload.")))
   }
 
   static func sendInput(for host: BKHosts, target: String, text: String) async throws {
     let context = try _context(for: host)
     let encodedTarget = _encodePathComponent(target)
     let body = try JSONEncoder().encode(TmuxControlPaneInputRequest(text: text))
-    _ = try await _withProfile(for: context) { profile, context in
-      let path = profile.paneInputPath(target: encodedTarget)
-      let result = try await _request(context: context, path: path, method: "POST", body: body)
-      try _throwIfNonSuccess(result: result, path: path)
-      return ()
-    }
+    let path = "/v1/tmux/panes/\(encodedTarget)/input"
+    let result = try await _request(context: context, path: path, method: "POST", body: body)
+    try _throwIfNonSuccess(result: result, path: path)
   }
 
   static func sendEscape(for host: BKHosts, target: String) async throws {
     let context = try _context(for: host)
     let encodedTarget = _encodePathComponent(target)
-    _ = try await _withProfile(for: context) { profile, context in
-      let path = profile.paneEscapePath(target: encodedTarget)
-      let result = try await _request(context: context, path: path, method: "POST")
-      try _throwIfNonSuccess(result: result, path: path)
-      return ()
-    }
-  }
-
-  private static func _withProfile<T>(
-    for context: TmuxControlRequestContext,
-    operation: @escaping (TmuxControlPlaneProfile, TmuxControlRequestContext) async throws -> T
-  ) async throws -> T {
-    let cache = TmuxControlPlaneProfileCache.shared
-    if let cached = await cache.profile(for: context.cacheKey) {
-      do {
-        let result = try await operation(cached, context)
-        await cache.set(cached, for: context.cacheKey)
-        return result
-      } catch let error as TmuxControlError where error.isRouteNotFound {
-        await cache.removeProfile(for: context.cacheKey)
-      } catch {
-        throw error
-      }
-    }
-
-    for profile in TmuxControlPlaneProfile.allCases {
-      do {
-        let result = try await operation(profile, context)
-        await cache.set(profile, for: context.cacheKey)
-        return result
-      } catch let error as TmuxControlError where error.isRouteNotFound {
-        continue
-      } catch {
-        throw error
-      }
-    }
-
-    throw TmuxControlError.endpointUnsupported(context.hostAlias)
+    let path = "/v1/tmux/panes/\(encodedTarget)/escape"
+    let result = try await _request(context: context, path: path, method: "POST")
+    try _throwIfNonSuccess(result: result, path: path)
   }
 
   private static func _context(for host: BKHosts) throws -> TmuxControlRequestContext {
@@ -2333,12 +2390,10 @@ fileprivate enum TmuxControlPlaneClient {
     }
 
     let token = host.tmuxServiceToken?.blink_trimmed
-    let cacheKey = "\(hostAlias.lowercased())|\(base)"
     return TmuxControlRequestContext(
       hostAlias: hostAlias.isEmpty ? (host.hostName ?? "(unknown)") : hostAlias,
       baseURL: base,
-      bearerToken: token?.isEmpty == true ? nil : token,
-      cacheKey: cacheKey
+      bearerToken: token?.isEmpty == true ? nil : token
     )
   }
 
@@ -2394,23 +2449,6 @@ fileprivate enum TmuxControlPlaneClient {
     }
   }
 
-  private static func _extractErrorMessage(data: Data) -> String? {
-    guard !data.isEmpty else {
-      return nil
-    }
-
-    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let value = json["error"] as? String
-    {
-      return value
-    }
-
-    if let raw = String(data: data, encoding: .utf8) {
-      return raw
-    }
-    return nil
-  }
-
   private static func _decodeSessions(
     data: Data,
     path: String,
@@ -2425,6 +2463,46 @@ fileprivate enum TmuxControlPlaneClient {
     }
   }
 
+  private static func _decodeCapabilities(
+    data: Data,
+    hostAlias: String
+  ) throws -> TmuxControlCapabilitiesResponse {
+    do {
+      return try JSONDecoder().decode(TmuxControlCapabilitiesResponse.self, from: data)
+    } catch {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(hostAlias)
+    }
+  }
+
+  private static func _validatePaneInboxCapabilities(
+    context: TmuxControlRequestContext
+  ) async throws {
+    let result = try await _request(context: context, path: capabilitiesPath, method: "GET")
+    if result.statusCode == 404 {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
+    }
+    try _throwIfNonSuccess(result: result, path: capabilitiesPath)
+    guard !result.data.isEmpty else {
+      throw TmuxControlError.missingData(capabilitiesPath)
+    }
+
+    let capabilities = try _decodeCapabilities(
+      data: result.data,
+      hostAlias: context.hostAlias
+    )
+    guard capabilities.capabilitiesSchemaVersion >= minimumCapabilitiesSchemaVersion else {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
+    }
+    guard let paneInboxV1 = capabilities.features.paneInboxV1, paneInboxV1.enabled else {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
+    }
+
+    let normalized = Set(paneInboxV1.requiredPaneFields.map { $0.lowercased() })
+    guard requiredPaneInboxFields.isSubset(of: normalized) else {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
+    }
+  }
+
   private static func _isRequiredSessionsField(_ key: String) -> Bool {
     switch key {
     case "pane_activity", "current_command", "preview_text", "has_unread_notification":
@@ -2432,14 +2510,6 @@ fileprivate enum TmuxControlPlaneClient {
     default:
       return false
     }
-  }
-
-  private static func _isSessionsSchemaMismatchMessage(_ message: String) -> Bool {
-    let normalized = message.lowercased()
-    return normalized.contains("pane_activity")
-      || normalized.contains("current_command")
-      || normalized.contains("preview_text")
-      || normalized.contains("has_unread_notification")
   }
 
   static func _encodePathComponent(_ value: String) -> String {
@@ -2451,6 +2521,22 @@ fileprivate enum TmuxControlPlaneClient {
 
 func tmuxControlEncodePathComponent(_ value: String) -> String {
   TmuxControlPlaneClient._encodePathComponent(value)
+}
+
+func tmuxControlSessionsPathForTesting() -> String {
+  "/v1/tmux/sessions"
+}
+
+func tmuxControlPaneOutputPathForTesting(target: String, lines: Int) -> String {
+  "/v1/tmux/panes/\(target)/output?lines=\(max(1, lines))"
+}
+
+func tmuxControlPaneInputPathForTesting(target: String) -> String {
+  "/v1/tmux/panes/\(target)/input"
+}
+
+func tmuxControlPaneEscapePathForTesting(target: String) -> String {
+  "/v1/tmux/panes/\(target)/escape"
 }
 
 @MainActor
