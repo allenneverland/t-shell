@@ -1378,6 +1378,12 @@ enum TmuxSSHOnboardingService {
     let logPath: String
   }
 
+  private struct ResolvedTmuxdRuntime {
+    let bindAddr: String
+    let localPort: Int
+    let healthHost: String
+  }
+
   fileprivate struct RemoteOnboardingResult {
     let discoveredServiceBaseURL: String?
   }
@@ -1666,8 +1672,27 @@ enum TmuxSSHOnboardingService {
     tmuxdLocalPortCandidates
   }
 
-  static func localHealthzScriptForTesting(port: Int) -> String {
-    waitForLocalHealthzScript(localPort: port)
+  static func resolveExistingTmuxdRuntimeScriptForTesting() -> String {
+    resolveExistingTmuxdRuntimeScript()
+  }
+
+  static func parseResolvedTmuxdRuntimeForTesting(_ raw: String) -> (bindAddr: String, port: Int)? {
+    guard let resolved = parseResolvedTmuxdRuntime(raw) else {
+      return nil
+    }
+    return (resolved.bindAddr, resolved.localPort)
+  }
+
+  static func localHealthzScriptForTesting(port: Int, host: String = "127.0.0.1") -> String {
+    waitForLocalHealthzScript(localHost: host, localPort: port)
+  }
+
+  static func localHealthHostForBindAddressForTesting(_ bindAddr: String) -> String {
+    localHealthProbeHost(forBindAddress: bindAddr)
+  }
+
+  static func startTmuxdScriptForTesting(port: Int, bindAddr: String = "127.0.0.1") -> String {
+    startTmuxdScript(localPort: port, bindAddr: bindAddr)
   }
 
   static func preferredTailscaleHTTPSRouteForTesting(
@@ -2428,40 +2453,54 @@ enum TmuxSSHOnboardingService {
   private static func restartTmuxdServiceUsingExistingConfig(
     on client: SSH.SSHClient
   ) async throws -> Int {
-    var conflictFailures: [String] = []
-    for localPort in tmuxdLocalPortCandidates {
-      do {
-        try await runChecked(script: startTmuxdScript(localPort: localPort), on: client)
-        try await runChecked(script: waitForLocalHealthzScript(localPort: localPort), on: client)
-        return localPort
-      } catch {
-        let diagnostics = (try? await runChecked(script: tmuxdDiagnosticsScript(localPort: localPort), on: client).stdout) ?? ""
-        let combined = [error.localizedDescription, diagnostics]
+    let runtime = try await resolveExistingTmuxdRuntime(on: client)
+    do {
+      try await runChecked(
+        script: startTmuxdScript(localPort: runtime.localPort, bindAddr: runtime.bindAddr),
+        on: client
+      )
+      try await runChecked(
+        script: waitForLocalHealthzScript(localHost: runtime.healthHost, localPort: runtime.localPort),
+        on: client
+      )
+      return runtime.localPort
+    } catch {
+      let diagnostics = (try? await runChecked(
+        script: tmuxdDiagnosticsScript(
+          bindAddr: runtime.bindAddr,
+          localHost: runtime.healthHost,
+          localPort: runtime.localPort
+        ),
+        on: client
+      ).stdout) ?? ""
+      let combined = compactDiagnosticOutput(
+        [error.localizedDescription, diagnostics]
           .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
           .joined(separator: "\n")
-        if isTmuxdPortConflictOutput(combined) {
-          let detail = firstNonEmptyLine(in: [combined]) ?? "listener conflict"
-          conflictFailures.append("port \(localPort): listener conflict (\(detail))")
-          continue
-        }
+      )
 
-        var message = "Failed to restart tmuxd service after upgrade on local port \(localPort)."
-        if let guidance = classifyTmuxdStartupFailureMessage(combined) {
-          message += "\n\(guidance)"
-        }
+      if isTmuxdPortConflictOutput(combined) {
+        var message = "Configured tmuxd port \(runtime.bindAddr):\(runtime.localPort) is already occupied on the host."
+        message += "\nUpgrade-only keeps the existing endpoint stable and will not auto-switch ports."
+        message += "\nRun full SSH onboarding if you need automatic managed fallback ports (8787/8790/8791)."
         if !combined.isEmpty {
           message += "\n\(combined)"
         }
         throw ValidationError.general(message: message)
       }
-    }
 
-    var lines = conflictFailures
-    if lines.isEmpty {
-      lines.append("All tmuxd restart attempts failed before binding a local port.")
+      var message = "Failed to restart tmuxd service after upgrade with existing config (\(runtime.bindAddr):\(runtime.localPort))."
+      if runtime.healthHost.caseInsensitiveCompare(runtime.bindAddr) != .orderedSame {
+        message += "\nHealth check target: \(runtime.healthHost):\(runtime.localPort)"
+      }
+      if let guidance = classifyTmuxdStartupFailureMessage(combined) {
+        message += "\n\(guidance)"
+      }
+      if !combined.isEmpty {
+        message += "\n\(combined)"
+      }
+      throw ValidationError.general(message: message)
     }
-    lines.append("Failed to restart tmuxd after upgrade on all managed local ports (8787/8790/8791).")
-    throw ValidationError.general(message: lines.joined(separator: "\n"))
   }
 
   private static func installTmuxBellHook(on client: SSH.SSHClient) async throws {
@@ -2795,6 +2834,8 @@ enum TmuxSSHOnboardingService {
   ) async throws -> ManagedTmuxdRuntime {
     var conflictFailures: [String] = []
     for localPort in tmuxdLocalPortCandidates {
+      let bindAddr = "127.0.0.1"
+      let healthHost = localHealthProbeHost(forBindAddress: bindAddr)
       do {
         try await runChecked(
           script: writeConfigScript(
@@ -2807,21 +2848,34 @@ enum TmuxSSHOnboardingService {
           ),
           on: client
         )
-        try await runChecked(script: startTmuxdScript(localPort: localPort), on: client)
-        try await runChecked(script: waitForLocalHealthzScript(localPort: localPort), on: client)
+        try await runChecked(
+          script: startTmuxdScript(localPort: localPort, bindAddr: bindAddr),
+          on: client
+        )
+        try await runChecked(
+          script: waitForLocalHealthzScript(localHost: healthHost, localPort: localPort),
+          on: client
+        )
         return ManagedTmuxdRuntime(
           localPort: localPort,
           proxyTarget: tmuxdProxyTarget(localPort: localPort),
           logPath: tmuxdStateLogPath
         )
       } catch {
-        let diagnostics = (try? await runChecked(script: tmuxdDiagnosticsScript(localPort: localPort), on: client).stdout) ?? ""
-        let combined = [error.localizedDescription, diagnostics]
+        let diagnostics = (try? await runChecked(
+          script: tmuxdDiagnosticsScript(
+            bindAddr: bindAddr,
+            localHost: healthHost,
+            localPort: localPort
+          ),
+          on: client
+        ).stdout) ?? ""
+        let combined = compactDiagnosticOutput([error.localizedDescription, diagnostics]
           .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-          .joined(separator: "\n")
+          .joined(separator: "\n"))
         if isTmuxdPortConflictOutput(combined) {
           let detail = firstNonEmptyLine(in: [combined]) ?? "listener conflict"
-          conflictFailures.append("port \(localPort): listener conflict (\(detail))")
+          conflictFailures.append("port \(bindAddr):\(localPort): listener conflict (\(detail))")
           continue
         }
 
@@ -2844,9 +2898,13 @@ enum TmuxSSHOnboardingService {
     throw ValidationError.general(message: lines.joined(separator: "\n"))
   }
 
-  private static func startTmuxdScript(localPort: Int) -> String {
-    """
+  private static func startTmuxdScript(localPort: Int, bindAddr: String = "127.0.0.1") -> String {
+    let bindAddrQuoted = shellQuote(bindAddr)
+    return """
     set -eu
+    port="\(localPort)"
+    bind_addr=\(bindAddrQuoted)
+    config_file="${TMUXD_CONFIG_FILE:-$HOME/.config/tmuxd/config.toml}"
     state_dir="$HOME/.local/state/tmuxd"
     log_file="$state_dir/tmuxd.log"
     pid_file="$state_dir/tmuxd.pid"
@@ -2856,22 +2914,31 @@ enum TmuxSSHOnboardingService {
       sleep 1
     fi
     : > "$log_file"
-    nohup "$HOME/.local/bin/tmuxd" serve --config "$HOME/.config/tmuxd/config.toml" > "$log_file" 2>&1 &
+    nohup "$HOME/.local/bin/tmuxd" serve --config "$config_file" --bind-addr "$bind_addr" --port "$port" > "$log_file" 2>&1 &
     pid="$!"
     printf '%s\\n' "$pid" > "$pid_file"
     sleep 1
     if ! kill -0 "$pid" >/dev/null 2>&1; then
       tail -n 80 "$log_file" >&2 || true
-      echo "tmuxd exited immediately after launch on 127.0.0.1:\(localPort)." >&2
+      echo "tmuxd exited immediately after launch on $bind_addr:$port." >&2
       exit 1
     fi
     printf '%s\\n' "$pid"
     """
   }
 
-  private static func tmuxdDiagnosticsScript(localPort: Int) -> String {
-    """
+  private static func tmuxdDiagnosticsScript(
+    bindAddr: String,
+    localHost: String,
+    localPort: Int
+  ) -> String {
+    let bindAddrQuoted = shellQuote(bindAddr)
+    let localHostQuoted = shellQuote(localHost)
+    return """
     set -eu
+    bind_addr=\(bindAddrQuoted)
+    health_host=\(localHostQuoted)
+    port="\(localPort)"
     log_file="$HOME/.local/state/tmuxd/tmuxd.log"
     pid_file="$HOME/.local/state/tmuxd/tmuxd.pid"
     pid=""
@@ -2885,7 +2952,8 @@ enum TmuxSSHOnboardingService {
     else
       echo "tmuxd pid: <missing>"
     fi
-    echo "expected local listen: 127.0.0.1:\(localPort)"
+    echo "configured listen: $bind_addr:$port"
+    echo "health probe target: $health_host:$port"
     echo "log path: $log_file"
     if [ -r "$log_file" ]; then
       echo "--- tmuxd.log (tail) ---"
@@ -3051,6 +3119,119 @@ enum TmuxSSHOnboardingService {
       lower.contains("listen tcp") && lower.contains("127.0.0.1")
   }
 
+  private static func localHealthProbeHost(forBindAddress bindAddr: String) -> String {
+    var normalized = bindAddr.trimmingCharacters(in: .whitespacesAndNewlines)
+    if normalized.hasPrefix("[") && normalized.hasSuffix("]") {
+      normalized.removeFirst()
+      normalized.removeLast()
+    }
+    let lower = normalized.lowercased()
+    if normalized.isEmpty || lower == "0.0.0.0" || lower == "::" || lower == "::0" || lower == "localhost" {
+      return "127.0.0.1"
+    }
+    return normalized
+  }
+
+  private static func parseResolvedTmuxdRuntime(_ raw: String) -> ResolvedTmuxdRuntime? {
+    let lines = trimmedNonEmptyLines(raw)
+    var bindAddr: String?
+    var localPort: Int?
+
+    for line in lines {
+      if line.hasPrefix("bind_addr=") {
+        let value = String(line.dropFirst("bind_addr=".count))
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty {
+          bindAddr = value
+        }
+      } else if line.hasPrefix("port=") {
+        let value = String(line.dropFirst("port=".count))
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parsed = Int(value), (1...65535).contains(parsed) {
+          localPort = parsed
+        }
+      }
+    }
+
+    guard let bindAddr, !bindAddr.isEmpty, let localPort else {
+      return nil
+    }
+    return ResolvedTmuxdRuntime(
+      bindAddr: bindAddr,
+      localPort: localPort,
+      healthHost: localHealthProbeHost(forBindAddress: bindAddr)
+    )
+  }
+
+  private static func resolveExistingTmuxdRuntime(on client: SSH.SSHClient) async throws -> ResolvedTmuxdRuntime {
+    let result = try await runChecked(script: resolveExistingTmuxdRuntimeScript(), on: client)
+    guard let runtime = parseResolvedTmuxdRuntime(result.stdout) else {
+      let compact = compactDiagnosticOutput(result.stdout)
+      var message = "Unable to resolve existing tmuxd bind/port from remote config."
+      message += "\nEnsure ~/.config/tmuxd/config.toml contains valid bind_addr and port values, or rerun full SSH onboarding."
+      if !compact.isEmpty {
+        message += "\n\(compact)"
+      }
+      throw ValidationError.general(message: message)
+    }
+    return runtime
+  }
+
+  private static func resolveExistingTmuxdRuntimeScript() -> String {
+    """
+    set -eu
+    config_file="${TMUXD_CONFIG_FILE:-$HOME/.config/tmuxd/config.toml}"
+    bind_addr="${TMUXD_BIND_ADDR:-}"
+    port="${TMUXD_PORT:-}"
+
+    strip_value() {
+      printf '%s' "$1" | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^\\\"//; s/\\\"$//; s/^'//; s/'$//"
+    }
+
+    if [ -z "$bind_addr" ] && [ -r "$config_file" ]; then
+      bind_line="$(grep -E '^[[:space:]]*bind_addr[[:space:]]*=' "$config_file" | head -n 1 || true)"
+      if [ -n "$bind_line" ]; then
+        bind_addr="$(strip_value "$bind_line")"
+      fi
+    fi
+
+    if [ -z "$port" ] && [ -r "$config_file" ]; then
+      port_line="$(grep -E '^[[:space:]]*port[[:space:]]*=' "$config_file" | head -n 1 || true)"
+      if [ -n "$port_line" ]; then
+        candidate="$(strip_value "$port_line")"
+        case "$candidate" in
+          ''|*[!0-9]*)
+            ;;
+          *)
+            port="$candidate"
+            ;;
+        esac
+      fi
+    fi
+
+    if [ -z "$bind_addr" ]; then
+      bind_addr="127.0.0.1"
+    fi
+    if [ -z "$port" ]; then
+      port="8787"
+    fi
+
+    case "$port" in
+      ''|*[!0-9]*)
+        echo "invalid tmuxd port: $port" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      echo "tmuxd port out of range: $port" >&2
+      exit 1
+    fi
+
+    printf 'bind_addr=%s\\n' "$bind_addr"
+    printf 'port=%s\\n' "$port"
+    """
+  }
+
   private static func firstNonEmptyLine(in outputs: [String]) -> String? {
     for output in outputs {
       if let line = trimmedNonEmptyLines(output).first {
@@ -3058,6 +3239,31 @@ enum TmuxSSHOnboardingService {
       }
     }
     return nil
+  }
+
+  private static func compactDiagnosticOutput(_ raw: String, maxLines: Int = 120) -> String {
+    let withoutEsc = raw.replacingOccurrences(of: "\u{001B}", with: "")
+    let strippedAnsi = withoutEsc.replacingOccurrences(
+      of: #"\[[0-9;]*[A-Za-z]"#,
+      with: "",
+      options: .regularExpression
+    )
+    let lines = strippedAnsi.components(separatedBy: .newlines)
+    var compact: [String] = []
+    for line in lines {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else {
+        continue
+      }
+      if compact.last == trimmed {
+        continue
+      }
+      compact.append(trimmed)
+      if compact.count >= maxLines {
+        break
+      }
+    }
+    return compact.joined(separator: "\n")
   }
 
   private static func resolveTailnetDNSName(on client: SSH.SSHClient) async throws -> String? {
@@ -3130,12 +3336,30 @@ enum TmuxSSHOnboardingService {
     return trimmed.hasSuffix(".") ? String(trimmed.dropLast()) : trimmed
   }
 
-  private static func waitForLocalHealthzScript(localPort: Int) -> String {
-    """
+  private static func waitForLocalHealthzScript(
+    localHost: String = "127.0.0.1",
+    localPort: Int
+  ) -> String {
+    let localHostQuoted = shellQuote(localHost)
+    return """
     set -eu
+    host=\(localHostQuoted)
     port="\(localPort)"
     pid_file="$HOME/.local/state/tmuxd/tmuxd.pid"
     log_file="$HOME/.local/state/tmuxd/tmuxd.log"
+    url_host="$host"
+    case "$url_host" in
+      *:*)
+        case "$url_host" in
+          \\[*\\])
+            ;;
+          *)
+            url_host="[$url_host]"
+            ;;
+        esac
+        ;;
+    esac
+    health_url="http://$url_host:$port/v1/healthz"
     i=0
     while [ "$i" -lt 30 ]; do
       pid=""
@@ -3144,25 +3368,25 @@ enum TmuxSSHOnboardingService {
       fi
       if [ -n "$pid" ] && ! kill -0 "$pid" >/dev/null 2>&1; then
         tail -n 80 "$log_file" >&2 || true
-        echo "tmuxd process exited before health check succeeded on 127.0.0.1:$port." >&2
+        echo "tmuxd process exited before health check succeeded on $host:$port." >&2
         exit 1
       fi
 
       if command -v curl >/dev/null 2>&1; then
-        if curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:$port/v1/healthz" >/dev/null 2>&1; then
+        if curl -fsS --connect-timeout 2 --max-time 3 "$health_url" >/dev/null 2>&1; then
           exit 0
         fi
       elif command -v wget >/dev/null 2>&1; then
-        if wget -qO- --timeout=3 "http://127.0.0.1:$port/v1/healthz" >/dev/null 2>&1; then
+        if wget -qO- --timeout=3 "$health_url" >/dev/null 2>&1; then
           exit 0
         fi
       elif command -v python3 >/dev/null 2>&1; then
-        if python3 -c "import sys,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/v1/healthz' % sys.argv[1], timeout=3).read()" "$port" >/dev/null 2>&1
+        if python3 -c "import sys,urllib.request; urllib.request.urlopen(sys.argv[1], timeout=3).read()" "$health_url" >/dev/null 2>&1
         then
           exit 0
         fi
       elif command -v python >/dev/null 2>&1; then
-        if python -c "import sys; req=__import__('urllib2' if sys.version_info[0] == 2 else 'urllib.request', fromlist=['urlopen']); req.urlopen('http://127.0.0.1:%s/v1/healthz' % sys.argv[1], timeout=3)" "$port" >/dev/null 2>&1
+        if python -c "import sys; req=__import__('urllib2' if sys.version_info[0] == 2 else 'urllib.request', fromlist=['urlopen']); req.urlopen(sys.argv[1], timeout=3)" "$health_url" >/dev/null 2>&1
         then
           exit 0
         fi
@@ -3177,7 +3401,7 @@ enum TmuxSSHOnboardingService {
     done
 
     tail -n 80 "$log_file" >&2 || true
-    echo "tmuxd local health check failed on 127.0.0.1:$port." >&2
+    echo "tmuxd local health check failed on $host:$port." >&2
     exit 1
     """
   }

@@ -690,12 +690,55 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertEqual(TmuxSSHOnboardingService.tmuxdLocalPortCandidatesForTesting(), [8787, 8790, 8791])
   }
 
-  func testLocalHealthScriptIncludesPythonFallbackAndDynamicPort() {
-    let script = TmuxSSHOnboardingService.localHealthzScriptForTesting(port: 8790)
-    XCTAssertTrue(script.contains("127.0.0.1:$port/v1/healthz"))
+  func testLocalHealthScriptIncludesPythonFallbackAndDynamicHost() {
+    let script = TmuxSSHOnboardingService.localHealthzScriptForTesting(port: 8790, host: "::1")
+    XCTAssertTrue(script.contains("host='::1'"))
+    XCTAssertTrue(script.contains("health_url=\"http://$url_host:$port/v1/healthz\""))
+    XCTAssertTrue(script.contains("url_host=\"[$url_host]\""))
     XCTAssertTrue(script.contains("command -v python3"))
     XCTAssertTrue(script.contains("command -v python"))
-    XCTAssertTrue(script.contains("tmuxd process exited before health check succeeded on 127.0.0.1:$port."))
+    XCTAssertTrue(script.contains("tmuxd process exited before health check succeeded on $host:$port."))
+  }
+
+  func testStartTmuxdScriptUsesExplicitBindAddrAndPortFlags() {
+    let script = TmuxSSHOnboardingService.startTmuxdScriptForTesting(port: 8791, bindAddr: "0.0.0.0")
+    XCTAssertTrue(script.contains("bind_addr='0.0.0.0'"))
+    XCTAssertTrue(script.contains("--bind-addr \"$bind_addr\" --port \"$port\""))
+    XCTAssertTrue(script.contains("config_file=\"${TMUXD_CONFIG_FILE:-$HOME/.config/tmuxd/config.toml}\""))
+  }
+
+  func testResolveExistingTmuxdRuntimeScriptUsesEnvAndConfigFallback() {
+    let script = TmuxSSHOnboardingService.resolveExistingTmuxdRuntimeScriptForTesting()
+    XCTAssertTrue(script.contains("bind_addr=\"${TMUXD_BIND_ADDR:-}\""))
+    XCTAssertTrue(script.contains("port=\"${TMUXD_PORT:-}\""))
+    XCTAssertTrue(script.contains("config_file=\"${TMUXD_CONFIG_FILE:-$HOME/.config/tmuxd/config.toml}\""))
+    XCTAssertTrue(script.contains("printf 'bind_addr=%s\\n' \"$bind_addr\""))
+    XCTAssertTrue(script.contains("printf 'port=%s\\n' \"$port\""))
+  }
+
+  func testParseResolvedTmuxdRuntimeParsesValidOutput() {
+    let raw = """
+    bind_addr=0.0.0.0
+    port=8791
+    """
+    let parsed = TmuxSSHOnboardingService.parseResolvedTmuxdRuntimeForTesting(raw)
+    XCTAssertEqual(parsed?.bindAddr, "0.0.0.0")
+    XCTAssertEqual(parsed?.port, 8791)
+  }
+
+  func testParseResolvedTmuxdRuntimeRejectsInvalidPort() {
+    let raw = """
+    bind_addr=127.0.0.1
+    port=abc
+    """
+    XCTAssertNil(TmuxSSHOnboardingService.parseResolvedTmuxdRuntimeForTesting(raw))
+  }
+
+  func testLocalHealthHostNormalizationForWildcardBindAddr() {
+    XCTAssertEqual(TmuxSSHOnboardingService.localHealthHostForBindAddressForTesting("0.0.0.0"), "127.0.0.1")
+    XCTAssertEqual(TmuxSSHOnboardingService.localHealthHostForBindAddressForTesting("::"), "127.0.0.1")
+    XCTAssertEqual(TmuxSSHOnboardingService.localHealthHostForBindAddressForTesting("[::1]"), "::1")
+    XCTAssertEqual(TmuxSSHOnboardingService.localHealthHostForBindAddressForTesting("10.0.0.15"), "10.0.0.15")
   }
 
   func testPreferredServeRoutePrefersManagedFallbackPorts() {
