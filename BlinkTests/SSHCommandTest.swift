@@ -106,6 +106,33 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
     XCTAssertEqual(tmuxControlEncodePathComponent("dev path/1.2"), "dev%20path%2F1.2")
     XCTAssertEqual(tmuxControlEncodePathComponent("session:1.2"), "session:1.2")
   }
+
+  func testSessionsErrorCodeMapsToRuntimeUpgradeGuidance() {
+    let payload = """
+    {"code":"incompatible_tmux_runtime","error":"tmux runtime missing required pane inbox capabilities","missing_capabilities":["pane_activity"]}
+    """
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 422,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("pane_activity") ?? false)
+  }
+
+  func testSessionsLegacy500ErrorStillMapsToRuntimeUpgradeGuidance() {
+    let payload = """
+    {"error":"tmux list-panes did not return a valid pane_activity value"}
+    """
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 500,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
+  }
 }
 
 final class TmuxPickerDisplayTests: XCTestCase {
@@ -624,8 +651,7 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     let output = "Remote command failed with exit status 1.\nstderr:\nunknown command: run-hook"
     let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
     XCTAssertNotNil(message)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("latest tmuxd release") ?? false)
-    XCTAssertFalse(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? true)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
   }
 
   func testClassifyTmuxBellHookFailureForRawBellProbeMessage() {
@@ -675,8 +701,8 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     """
     let message = TmuxSSHOnboardingService.tmuxBellHookVerificationFailureMessageForTesting(json)
     XCTAssertNotNil(message)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("deprecated runtime probe compatibility failure") ?? false)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("latest tmuxd release") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("incompatible") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
   }
 
   func testClassifyTmuxBellHookFailureForRuntimeServerNotRunning() {

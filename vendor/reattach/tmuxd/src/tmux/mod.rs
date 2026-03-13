@@ -1,3 +1,4 @@
+mod capabilities;
 mod capture;
 mod create;
 mod diagnostics;
@@ -5,6 +6,7 @@ mod kill;
 mod list;
 mod send;
 
+pub use capabilities::pane_inbox_runtime_capability;
 pub use capture::capture_pane;
 pub use create::create_session;
 pub use diagnostics::{collect_diagnostics, TmuxDiagnostics};
@@ -18,4 +20,9 @@ pub enum TmuxError {
     Io(#[from] std::io::Error),
     #[error("tmux command failed: {0}")]
     Command(String),
+    #[error("incompatible tmux runtime: {detail}")]
+    IncompatibleRuntime {
+        detail: String,
+        missing_capabilities: Vec<String>,
+    },
 }

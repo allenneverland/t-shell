@@ -49,9 +49,10 @@ fn parse_session_attached(value: &str) -> bool {
 
 fn parse_pane_activity(value: &str) -> Result<i64, TmuxError> {
     value.parse::<i64>().map_err(|_| {
-        TmuxError::Command(
-            "tmux list-panes did not return a valid pane_activity value. Upgrade tmux/tmuxd to a version that supports #{pane_activity}.".to_string(),
-        )
+        TmuxError::IncompatibleRuntime {
+            detail: "tmux list-panes did not return a valid pane_activity value. Upgrade tmux/tmuxd to a version that supports #{pane_activity}.".to_string(),
+            missing_capabilities: vec!["pane_activity".to_string()],
+        }
     })
 }
 
@@ -60,7 +61,7 @@ fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
         return Ok(None);
     }
 
-    let parts: Vec<&str> = line.split('|').collect();
+    let parts: Vec<&str> = line.splitn(10, '|').collect();
     if parts.len() != 10 {
         return Ok(None);
     }
@@ -135,6 +136,20 @@ fn truncate_preview_text(value: &str, max_chars: usize) -> String {
     result
 }
 
+fn infer_missing_capabilities_from_error(stderr: &str) -> Vec<String> {
+    let lower = stderr.to_lowercase();
+    let mut missing = Vec::new();
+    if lower.contains("pane_activity") {
+        missing.push("pane_activity".to_string());
+    }
+    if lower.contains("pane_current_command") || lower.contains("current_command") {
+        missing.push("pane_current_command".to_string());
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
 pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
     let output = Command::new("tmux")
         .args([
@@ -153,6 +168,16 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
             || stderr.contains("No such file or directory")
         {
             return Ok(vec![]);
+        }
+        let missing_capabilities = infer_missing_capabilities_from_error(&stderr);
+        if !missing_capabilities.is_empty() || stderr.to_lowercase().contains("unknown format") {
+            return Err(TmuxError::IncompatibleRuntime {
+                detail: format!(
+                    "tmux list-panes failed for pane inbox runtime capability requirements: {}",
+                    stderr.trim()
+                ),
+                missing_capabilities,
+            });
         }
         return Err(TmuxError::Command(stderr.to_string()));
     }
@@ -230,7 +255,8 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_pane_activity, parse_session_attached, sanitize_preview_line, truncate_preview_text,
+        infer_missing_capabilities_from_error, parse_pane_activity, parse_session_attached,
+        sanitize_preview_line, truncate_preview_text,
     };
     use crate::tmux::TmuxError;
 
@@ -257,11 +283,29 @@ mod tests {
     fn parse_pane_activity_rejects_invalid_values() {
         let error = parse_pane_activity("not-a-number").unwrap_err();
         match error {
-            TmuxError::Command(msg) => {
-                assert!(msg.contains("pane_activity"));
+            TmuxError::IncompatibleRuntime {
+                detail,
+                missing_capabilities,
+            } => {
+                assert!(detail.contains("pane_activity"));
+                assert_eq!(missing_capabilities, vec!["pane_activity".to_string()]);
             }
             _ => panic!("expected command error"),
         }
+    }
+
+    #[test]
+    fn infer_missing_capabilities_from_error_detects_known_fields() {
+        let inferred = infer_missing_capabilities_from_error(
+            "unknown format: pane_activity and pane_current_command",
+        );
+        assert_eq!(
+            inferred,
+            vec![
+                "pane_activity".to_string(),
+                "pane_current_command".to_string()
+            ]
+        );
     }
 
     #[test]

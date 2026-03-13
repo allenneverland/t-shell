@@ -1538,7 +1538,7 @@ enum TmuxSSHOnboardingService {
       lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnsupported) ||
       lower.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
       lower.contains(tmuxVerifyReasonRuntimeProbeCapabilityQueryFailed) {
-      return "Installed tmuxd is using a deprecated runtime bell probe path. Re-run onboarding to install the latest tmuxd release, then retry."
+      return "Host tmux runtime is too old or missing required capabilities for runtime probes. Upgrade tmux first, then rerun onboarding (which will refresh tmuxd hooks)."
     }
 
     if lower.contains("runtime tmux server is not running") ||
@@ -1614,7 +1614,23 @@ enum TmuxSSHOnboardingService {
       reasonCodes.contains(tmuxVerifyReasonRuntimeProbeTmuxVersionUnavailable) ||
       reasonCodes.contains(tmuxVerifyReasonRuntimeProbeMissingRunHook) ||
       missingCapabilities.contains("run-hook") {
-      return "Installed tmuxd reported a deprecated runtime probe compatibility failure. Re-run onboarding to install the latest tmuxd release, then retry."
+      let minimum = report.minimumTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let detected = report.detectedTmuxVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let missing = report.missingCapabilities
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+      var message = "Host tmux runtime is incompatible with required tmux capabilities."
+      if let detected, !detected.isEmpty {
+        message += " Detected: \(detected)."
+      }
+      if let minimum, !minimum.isEmpty {
+        message += " Minimum expected: \(minimum)."
+      }
+      if !missing.isEmpty {
+        message += " Missing capabilities: \(missing.joined(separator: ", "))."
+      }
+      message += " Upgrade tmux on host, then rerun onboarding (tmuxd hooks/config will be refreshed automatically)."
+      return message
     }
 
     if report.runtimeProbePerformed && !report.runtimeProbeHookOK {

@@ -38,7 +38,42 @@ pub struct CreateSessionRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    pub code: &'static str,
     pub error: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_capabilities: Vec<String>,
+}
+
+fn tmux_error_response(error: tmux::TmuxError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        tmux::TmuxError::IncompatibleRuntime {
+            detail,
+            missing_capabilities,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                code: "incompatible_tmux_runtime",
+                error: detail,
+                missing_capabilities,
+            }),
+        ),
+        tmux::TmuxError::Command(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "tmux_error",
+                error: detail,
+                missing_capabilities: Vec::new(),
+            }),
+        ),
+        tmux::TmuxError::Io(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "tmux_io_error",
+                error: detail.to_string(),
+                missing_capabilities: Vec::new(),
+            }),
+        ),
+    }
 }
 
 pub async fn list_sessions(
@@ -52,7 +87,9 @@ pub async fn list_sessions(
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
+                            code: "db_error",
                             error: e.to_string(),
+                            missing_capabilities: Vec::new(),
                         }),
                     ))
                 }
@@ -93,12 +130,7 @@ pub async fn list_sessions(
                 .collect();
             Ok(Json(response))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )),
+        Err(e) => Err(tmux_error_response(e)),
     }
 }
 
@@ -107,11 +139,34 @@ pub async fn create_session(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     match tmux::create_session(&payload.name, &payload.cwd) {
         Ok(()) => Ok(StatusCode::CREATED),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )),
+        Err(e) => Err(tmux_error_response(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tmux_error_response;
+    use crate::tmux::TmuxError;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn incompatible_runtime_maps_to_422_with_machine_readable_code() {
+        let (status, body) = tmux_error_response(TmuxError::IncompatibleRuntime {
+            detail: "missing pane_activity".to_string(),
+            missing_capabilities: vec!["pane_activity".to_string()],
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.0.code, "incompatible_tmux_runtime");
+        assert_eq!(
+            body.0.missing_capabilities,
+            vec!["pane_activity".to_string()]
+        );
+    }
+
+    #[test]
+    fn generic_tmux_error_maps_to_500_code() {
+        let (status, body) = tmux_error_response(TmuxError::Command("tmux failed".to_string()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.code, "tmux_error");
     }
 }

@@ -1130,7 +1130,21 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
     let mut runtime_probe_reason_codes = Vec::new();
-    let detected_tmux_version = detect_tmux_version_string();
+    let pane_inbox_runtime = tmux::pane_inbox_runtime_capability();
+    let runtime_probe_compatible = pane_inbox_runtime.compatible;
+    let minimum_tmux_version = pane_inbox_runtime.minimum_tmux_version.clone();
+    let detected_tmux_version = pane_inbox_runtime.detected_tmux_version.clone();
+    let required_capabilities = pane_inbox_runtime.required_capabilities.clone();
+    let missing_capabilities = pane_inbox_runtime.missing_capabilities.clone();
+    for code in &pane_inbox_runtime.reason_codes {
+        push_unique(&mut runtime_probe_reason_codes, code.clone());
+    }
+    if probe_runtime && !runtime_probe_compatible {
+        reasons.push(format!(
+            "tmux runtime is incompatible with pane inbox requirements: {}",
+            pane_inbox_runtime.detail
+        ));
+    }
 
     let persistent_config_ok = match home_file(".tmux.conf") {
         None => {
@@ -1254,6 +1268,7 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
             && runtime_options_ok
             && runtime_probe_hook_ok
             && runtime_probe_raw_bel_ok
+            && runtime_probe_compatible
     } else {
         persistent_config_ok && (!runtime_server_present || (runtime_hook_ok && runtime_options_ok))
     };
@@ -1266,11 +1281,11 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
         runtime_probe_performed,
         runtime_probe_hook_ok,
         runtime_probe_raw_bel_ok,
-        runtime_probe_compatible: true,
-        minimum_tmux_version: "n/a".to_string(),
+        runtime_probe_compatible,
+        minimum_tmux_version,
         detected_tmux_version,
-        required_capabilities: Vec::new(),
-        missing_capabilities: Vec::new(),
+        required_capabilities,
+        missing_capabilities,
         runtime_probe_reason_codes,
         overall_ok,
         reasons,
@@ -1346,19 +1361,6 @@ fn tmux_server_is_running() -> Result<bool, String> {
         Ok(false)
     } else {
         Err(format!("`tmux list-sessions` failed: {detail}"))
-    }
-}
-
-fn detect_tmux_version_string() -> Option<String> {
-    let output = std::process::Command::new("tmux").arg("-V").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
     }
 }
 

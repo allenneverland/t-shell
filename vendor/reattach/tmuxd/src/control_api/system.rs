@@ -1,9 +1,9 @@
-use axum::Json;
+use axum::{extract::State, Json};
 use serde::Serialize;
 
-use crate::tmux;
+use crate::{state::AppState, tmux};
 
-const CAPABILITIES_SCHEMA_VERSION: u32 = 7;
+const CAPABILITIES_SCHEMA_VERSION: u32 = 8;
 const INPUT_EVENTS_MAX_BATCH: u32 = 128;
 const PANE_INBOX_REQUIRED_FIELDS: [&str; 4] = [
     "pane_activity",
@@ -43,6 +43,10 @@ pub struct InputEventsCapability {
 pub struct PaneInboxCapability {
     pub enabled: bool,
     pub required_pane_fields: Vec<&'static str>,
+    pub runtime_compatible: bool,
+    pub minimum_tmux_version: String,
+    pub detected_tmux_version: Option<String>,
+    pub missing_capabilities: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -61,7 +65,8 @@ pub async fn healthz() -> Json<HealthzResponse> {
     Json(HealthzResponse { status: "ok" })
 }
 
-pub async fn capabilities() -> Json<CapabilitiesResponse> {
+pub async fn capabilities(State(_state): State<AppState>) -> Json<CapabilitiesResponse> {
+    let runtime = tmux::pane_inbox_runtime_capability();
     Json(CapabilitiesResponse {
         daemon: "tmuxd",
         version: env!("CARGO_PKG_VERSION"),
@@ -73,8 +78,12 @@ pub async fn capabilities() -> Json<CapabilitiesResponse> {
                 supports_repeat: true,
             },
             pane_inbox_v1: PaneInboxCapability {
-                enabled: true,
+                enabled: runtime.compatible,
                 required_pane_fields: PANE_INBOX_REQUIRED_FIELDS.to_vec(),
+                runtime_compatible: runtime.compatible,
+                minimum_tmux_version: runtime.minimum_tmux_version,
+                detected_tmux_version: runtime.detected_tmux_version,
+                missing_capabilities: runtime.missing_capabilities,
             },
         },
         endpoints: EndpointCapabilities {
@@ -106,7 +115,7 @@ mod tests {
         let payload = CapabilitiesResponse {
             daemon: "tmuxd",
             version: "1.0.22",
-            capabilities_schema_version: 7,
+            capabilities_schema_version: 8,
             features: FeatureCapabilities {
                 input_events_v1: InputEventsCapability {
                     enabled: true,
@@ -121,6 +130,10 @@ mod tests {
                         "preview_text",
                         "has_unread_notification",
                     ],
+                    runtime_compatible: true,
+                    minimum_tmux_version: "3.1.0".to_string(),
+                    detected_tmux_version: Some("tmux 3.4".to_string()),
+                    missing_capabilities: vec![],
                 },
             },
             endpoints: EndpointCapabilities {
@@ -140,7 +153,7 @@ mod tests {
             value
                 .get("capabilities_schema_version")
                 .and_then(|v| v.as_u64()),
-            Some(7)
+            Some(8)
         );
         assert_eq!(
             value
@@ -163,6 +176,12 @@ mod tests {
         assert_eq!(
             value
                 .pointer("/features/pane_inbox_v1/enabled")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .pointer("/features/pane_inbox_v1/runtime_compatible")
                 .and_then(|v| v.as_bool()),
             Some(true)
         );

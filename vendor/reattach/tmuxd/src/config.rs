@@ -83,7 +83,10 @@ impl Config {
             .or(file_cfg.bind_addr)
             .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
 
-        let port = args.and_then(|a| a.port).or(file_cfg.port).unwrap_or(DEFAULT_PORT);
+        let port = args
+            .and_then(|a| a.port)
+            .or(file_cfg.port)
+            .unwrap_or(DEFAULT_PORT);
 
         let data_dir = args
             .and_then(|a| a.data_dir.clone())
@@ -180,8 +183,9 @@ fn load_file_config(path: &PathBuf) -> AppResult<FileConfig> {
     }
 
     let content = std::fs::read_to_string(path)?;
-    let cfg = toml::from_str::<FileConfig>(&content)
-        .map_err(|e| AppError::bad_request(format!("invalid config file {}: {}", path.display(), e)))?;
+    let cfg = toml::from_str::<FileConfig>(&content).map_err(|e| {
+        AppError::bad_request(format!("invalid config file {}: {}", path.display(), e))
+    })?;
     Ok(cfg)
 }
 

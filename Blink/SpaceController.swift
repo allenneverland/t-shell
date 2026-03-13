@@ -2223,10 +2223,28 @@ fileprivate struct TmuxControlCapabilitiesFeatures: Decodable {
 fileprivate struct TmuxControlPaneInboxCapability: Decodable {
   let enabled: Bool
   let requiredPaneFields: [String]
+  let runtimeCompatible: Bool?
+  let minimumTmuxVersion: String?
+  let detectedTmuxVersion: String?
+  let missingCapabilities: [String]
 
   enum CodingKeys: String, CodingKey {
     case enabled
     case requiredPaneFields = "required_pane_fields"
+    case runtimeCompatible = "runtime_compatible"
+    case minimumTmuxVersion = "minimum_tmux_version"
+    case detectedTmuxVersion = "detected_tmux_version"
+    case missingCapabilities = "missing_capabilities"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    enabled = try container.decode(Bool.self, forKey: .enabled)
+    requiredPaneFields = try container.decodeIfPresent([String].self, forKey: .requiredPaneFields) ?? []
+    runtimeCompatible = try container.decodeIfPresent(Bool.self, forKey: .runtimeCompatible)
+    minimumTmuxVersion = try container.decodeIfPresent(String.self, forKey: .minimumTmuxVersion)
+    detectedTmuxVersion = try container.decodeIfPresent(String.self, forKey: .detectedTmuxVersion)
+    missingCapabilities = try container.decodeIfPresent([String].self, forKey: .missingCapabilities) ?? []
   }
 }
 
@@ -2239,6 +2257,25 @@ fileprivate struct TmuxControlRequestContext {
 fileprivate struct TmuxControlHTTPResult {
   let statusCode: Int
   let data: Data
+}
+
+fileprivate struct TmuxControlAPIErrorResponse: Decodable {
+  let code: String?
+  let error: String?
+  let missingCapabilities: [String]
+
+  enum CodingKeys: String, CodingKey {
+    case code
+    case error
+    case missingCapabilities = "missing_capabilities"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    code = try container.decodeIfPresent(String.self, forKey: .code)
+    error = try container.decodeIfPresent(String.self, forKey: .error)
+    missingCapabilities = try container.decodeIfPresent([String].self, forKey: .missingCapabilities) ?? []
+  }
 }
 
 fileprivate struct TmuxControlPaneOutputResponse: Decodable {
@@ -2255,6 +2292,7 @@ fileprivate enum TmuxControlError: LocalizedError {
   case badStatusCode(Int, String)
   case incompatibleCapabilitiesSchema(String)
   case incompatibleSessionsSchema(String)
+  case incompatibleRuntime(String, [String], String?)
   case missingDeviceAPIToken(String)
   case missingData(String)
   case decoding(String, Error)
@@ -2262,7 +2300,7 @@ fileprivate enum TmuxControlError: LocalizedError {
 
   var requiresHostUpgrade: Bool {
     switch self {
-    case .incompatibleCapabilitiesSchema, .incompatibleSessionsSchema:
+    case .incompatibleCapabilitiesSchema, .incompatibleSessionsSchema, .incompatibleRuntime:
       return true
     default:
       return false
@@ -2281,6 +2319,21 @@ fileprivate enum TmuxControlError: LocalizedError {
       return "Host '\(hostAlias)' exposes an outdated tmux capabilities payload (requires capabilities_schema_version >= 7 with pane_inbox_v1). Upgrade tmuxd on this host."
     case .incompatibleSessionsSchema(let hostAlias):
       return "Host '\(hostAlias)' exposes an outdated tmux sessions payload (missing pane_activity/current_command/preview_text/has_unread_notification). Upgrade tmuxd/tmux."
+    case .incompatibleRuntime(let hostAlias, let missingCapabilities, let detail):
+      let missing = missingCapabilities
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+      let capabilitiesPart: String
+      if missing.isEmpty {
+        capabilitiesPart = "pane inbox runtime capabilities"
+      } else {
+        capabilitiesPart = missing.joined(separator: "/")
+      }
+      var message = "Host '\(hostAlias)' tmux runtime is incompatible with pane inbox requirements (\(capabilitiesPart)). Upgrade tmux/tmuxd on this host."
+      if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        message += "\n\(detail)"
+      }
+      return message
     case .missingDeviceAPIToken(let hostAlias):
       return "Host '\(hostAlias)' is missing Device API token. Re-register tmux push in Settings > Hosts > SSH."
     case .missingData(let path):
@@ -2314,7 +2367,7 @@ fileprivate enum TmuxControlPlaneClient {
     if result.statusCode == 404 {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
-    try _throwIfNonSuccess(result: result, path: path)
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(path)
     }
@@ -2340,7 +2393,7 @@ fileprivate enum TmuxControlPlaneClient {
       bearerToken: cleanToken
     )
     let result = try await _request(context: deviceContext, path: path, method: "POST")
-    try _throwIfNonSuccess(result: result, path: path)
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
   }
 
   static func getPaneOutput(for host: BKHosts, target: String, lines: Int = outputLines) async throws -> String {
@@ -2348,7 +2401,7 @@ fileprivate enum TmuxControlPlaneClient {
     let encodedTarget = _encodePathComponent(target)
     let path = "/v1/tmux/panes/\(encodedTarget)/output?lines=\(max(1, lines))"
     let result = try await _request(context: context, path: path, method: "GET")
-    try _throwIfNonSuccess(result: result, path: path)
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(path)
     }
@@ -2367,7 +2420,7 @@ fileprivate enum TmuxControlPlaneClient {
     let body = try JSONEncoder().encode(TmuxControlPaneInputRequest(text: text))
     let path = "/v1/tmux/panes/\(encodedTarget)/input"
     let result = try await _request(context: context, path: path, method: "POST", body: body)
-    try _throwIfNonSuccess(result: result, path: path)
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
   }
 
   static func sendEscape(for host: BKHosts, target: String) async throws {
@@ -2375,7 +2428,7 @@ fileprivate enum TmuxControlPlaneClient {
     let encodedTarget = _encodePathComponent(target)
     let path = "/v1/tmux/panes/\(encodedTarget)/escape"
     let result = try await _request(context: context, path: path, method: "POST")
-    try _throwIfNonSuccess(result: result, path: path)
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
   }
 
   private static func _context(for host: BKHosts) throws -> TmuxControlRequestContext {
@@ -2432,13 +2485,28 @@ fileprivate enum TmuxControlPlaneClient {
     }
   }
 
-  private static func _throwIfNonSuccess(result: TmuxControlHTTPResult, path: String) throws {
+  private static func _throwIfNonSuccess(
+    result: TmuxControlHTTPResult,
+    path: String,
+    hostAlias: String
+  ) throws {
     guard !(result.statusCode == 401 || result.statusCode == 403) else {
       throw TmuxControlError.unauthorized(result.statusCode)
     }
-    guard (200...299).contains(result.statusCode) else {
-      throw TmuxControlError.badStatusCode(result.statusCode, path)
+    guard !(200...299).contains(result.statusCode) else {
+      return
     }
+
+    if path == sessionsPath,
+       let classified = _classifySessionsRuntimeIncompatibility(
+        statusCode: result.statusCode,
+        hostAlias: hostAlias,
+        data: result.data
+       ) {
+      throw classified
+    }
+
+    throw TmuxControlError.badStatusCode(result.statusCode, path)
   }
 
   private static func _decode<T: Decodable>(_ type: T.Type, data: Data, path: String) throws -> T {
@@ -2481,7 +2549,7 @@ fileprivate enum TmuxControlPlaneClient {
     if result.statusCode == 404 {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
-    try _throwIfNonSuccess(result: result, path: capabilitiesPath)
+    try _throwIfNonSuccess(result: result, path: capabilitiesPath, hostAlias: context.hostAlias)
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(capabilitiesPath)
     }
@@ -2493,7 +2561,19 @@ fileprivate enum TmuxControlPlaneClient {
     guard capabilities.capabilitiesSchemaVersion >= minimumCapabilitiesSchemaVersion else {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
-    guard let paneInboxV1 = capabilities.features.paneInboxV1, paneInboxV1.enabled else {
+    guard let paneInboxV1 = capabilities.features.paneInboxV1 else {
+      throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
+    }
+
+    if paneInboxV1.runtimeCompatible == false || !paneInboxV1.missingCapabilities.isEmpty {
+      throw TmuxControlError.incompatibleRuntime(
+        context.hostAlias,
+        paneInboxV1.missingCapabilities,
+        nil
+      )
+    }
+
+    guard paneInboxV1.enabled else {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
 
@@ -2501,6 +2581,54 @@ fileprivate enum TmuxControlPlaneClient {
     guard requiredPaneInboxFields.isSubset(of: normalized) else {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
+  }
+
+  private static func _decodeAPIErrorResponse(from data: Data) -> TmuxControlAPIErrorResponse? {
+    guard !data.isEmpty else {
+      return nil
+    }
+    return try? JSONDecoder().decode(TmuxControlAPIErrorResponse.self, from: data)
+  }
+
+  private static func _classifySessionsRuntimeIncompatibility(
+    statusCode: Int,
+    hostAlias: String,
+    data: Data
+  ) -> TmuxControlError? {
+    let payload = _decodeAPIErrorResponse(from: data)
+    let code = payload?.code?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    let detail = payload?.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let missing = payload?.missingCapabilities ?? []
+    let detailLower = detail?.lowercased() ?? ""
+
+    let knownCodes: Set<String> = [
+      "incompatible_tmux_runtime",
+      "incompatible_pane_inbox_runtime",
+      "pane_inbox_runtime_incompatible"
+    ]
+    if knownCodes.contains(code) {
+      return .incompatibleRuntime(hostAlias, missing, detail)
+    }
+
+    if statusCode == 422,
+       !detailLower.isEmpty,
+       (detailLower.contains("pane_activity") ||
+        detailLower.contains("pane_current_command") ||
+        detailLower.contains("incompatible tmux runtime"))
+    {
+      return .incompatibleRuntime(hostAlias, missing, detail)
+    }
+
+    if statusCode >= 500,
+       !detailLower.isEmpty,
+       (detailLower.contains("pane_activity") ||
+        detailLower.contains("pane_current_command") ||
+        detailLower.contains("incompatible tmux runtime"))
+    {
+      return .incompatibleRuntime(hostAlias, missing, detail)
+    }
+
+    return nil
   }
 
   private static func _isRequiredSessionsField(_ key: String) -> Bool {
@@ -2516,6 +2644,21 @@ fileprivate enum TmuxControlPlaneClient {
     var allowed = CharacterSet.urlPathAllowed
     allowed.remove(charactersIn: "/")
     return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+  }
+
+  static func _sessionsErrorMessageForTesting(
+    statusCode: Int,
+    hostAlias: String,
+    payload: String
+  ) -> String? {
+    let data = payload.data(using: .utf8) ?? Data()
+    let result = TmuxControlHTTPResult(statusCode: statusCode, data: data)
+    do {
+      try _throwIfNonSuccess(result: result, path: sessionsPath, hostAlias: hostAlias)
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
   }
 }
 
@@ -2537,6 +2680,18 @@ func tmuxControlPaneInputPathForTesting(target: String) -> String {
 
 func tmuxControlPaneEscapePathForTesting(target: String) -> String {
   "/v1/tmux/panes/\(target)/escape"
+}
+
+func tmuxControlSessionsErrorMessageForTesting(
+  statusCode: Int,
+  hostAlias: String,
+  payload: String
+) -> String? {
+  TmuxControlPlaneClient._sessionsErrorMessageForTesting(
+    statusCode: statusCode,
+    hostAlias: hostAlias,
+    payload: payload
+  )
 }
 
 @MainActor
