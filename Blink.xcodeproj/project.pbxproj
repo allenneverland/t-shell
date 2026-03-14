@@ -5302,7 +5302,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 1008;
+					CURRENT_PROJECT_VERSION = 1009;
 				DEAD_CODE_STRIPPING = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEFINES_MODULE = YES;
@@ -5325,7 +5325,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/Frameworks",
 				);
-					MARKETING_VERSION = 18.3.5;
+					MARKETING_VERSION = 18.3.6;
 				NEW_SETTING = "";
 				OTHER_CFLAGS = "$(BLINK_OTHER_CFLAGS)";
 				OTHER_LDFLAGS = (
@@ -5355,7 +5355,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-					CURRENT_PROJECT_VERSION = 1008;
+					CURRENT_PROJECT_VERSION = 1009;
 				DEAD_CODE_STRIPPING = NO;
 				DEFINES_MODULE = YES;
 				DEVELOPMENT_TEAM = FR4WTM284K;
@@ -5373,7 +5373,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/Frameworks",
 				);
-					MARKETING_VERSION = 18.3.5;
+					MARKETING_VERSION = 18.3.6;
 				NEW_SETTING = "";
 				OTHER_CFLAGS = "$(BLINK_OTHER_CFLAGS)";
 				OTHER_LDFLAGS = (
