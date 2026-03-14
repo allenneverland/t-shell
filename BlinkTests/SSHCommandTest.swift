@@ -133,6 +133,20 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
     XCTAssertNotNil(message)
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("upgrade tmux") ?? false)
   }
+
+  func testSessionsPayloadParseCodeDoesNotMapToRuntimeUpgradeGuidance() {
+    let payload = """
+    {"code":"sessions_payload_parse_error","error":"pane_activity is not numeric in tmux sessions payload"}
+    """
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 500,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("HTTP 500") ?? false)
+    XCTAssertFalse(message?.localizedCaseInsensitiveContains("runtime is incompatible") ?? true)
+  }
 }
 
 final class TmuxPickerDisplayTests: XCTestCase {
@@ -184,6 +198,16 @@ final class TmuxPickerDisplayTests: XCTestCase {
       fallbackPath: "/tmp/project"
     )
     XCTAssertEqual(preview, "python server.py")
+  }
+
+  func testUpgradeCompletedButInboxNotReadyMessageShowsPartialSuccessGuidance() {
+    let message = tmuxUpgradeCompletedButPaneInboxNotReadyMessage(
+      hostAlias: "allen",
+      issue: "tmux runtime requires upgrade"
+    )
+    XCTAssertTrue(message.localizedCaseInsensitiveContains("upgrade completed successfully"))
+    XCTAssertTrue(message.localizedCaseInsensitiveContains("pane inbox is not ready"))
+    XCTAssertTrue(message.localizedCaseInsensitiveContains("upgrade tmux"))
   }
 }
 

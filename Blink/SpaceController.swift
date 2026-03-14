@@ -493,6 +493,14 @@ Please go to your subscriptions and cancel one of them!
         self._dismissTmuxPaneInboxIfNeeded {
           self._upgradeTmuxHost(hostAlias: hostAlias)
         }
+      },
+      onFixRuntimeHost: { [weak self] hostAlias in
+        guard let self else {
+          return
+        }
+        self._dismissTmuxPaneInboxIfNeeded {
+          self._presentTmuxRuntimeFixGuide(hostAlias: hostAlias, issue: nil)
+        }
       }
     )
     let nav = UINavigationController(rootViewController: inbox)
@@ -1357,6 +1365,45 @@ extension SpaceController {
     present(alert, animated: true)
   }
 
+  private func _presentUpgradeCompletedButPaneInboxNotReadyAlert(hostAlias: String, issue: String) {
+    let cleanAlias = hostAlias.blink_trimmed
+    let issueText = issue.blink_trimmed
+    let message = tmuxUpgradeCompletedButPaneInboxNotReadyMessage(
+      hostAlias: cleanAlias,
+      issue: issueText
+    )
+
+    let alert = UIAlertController(
+      title: "Upgrade Completed",
+      message: message,
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "Fix Runtime", style: .default, handler: { [weak self] _ in
+      self?._presentTmuxRuntimeFixGuide(hostAlias: cleanAlias, issue: issueText)
+    }))
+    alert.addAction(UIAlertAction(title: "Back to Chats", style: .cancel, handler: { [weak self] _ in
+      self?._presentTmuxPaneInbox(animated: true)
+    }))
+    present(alert, animated: true)
+  }
+
+  private func _presentTmuxRuntimeFixGuide(hostAlias: String, issue: String?) {
+    let cleanAlias = hostAlias.blink_trimmed
+    var message = "Host '\(cleanAlias)' requires tmux runtime upgrade for pane inbox.\n\nSuggested checks:\n- tmux -V\n- tmux list-panes -a -F '#{pane_activity}|#{pane_current_command}'\n\nAfter upgrading tmux:\n1. Restart tmux server.\n2. Retry from Chats."
+    if let issue, !issue.blink_trimmed.isEmpty {
+      message += "\n\nCurrent issue:\n\(issue.blink_trimmed)"
+    }
+
+    let alert = UIAlertController(title: "Fix tmux Runtime", message: message, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "Open Terminal", style: .default, handler: { [weak self] _ in
+      self?._openShellAndRunCommand("ssh \(cleanAlias)", skipHistoryRecord: true)
+    }))
+    alert.addAction(UIAlertAction(title: "Back to Chats", style: .cancel, handler: { [weak self] _ in
+      self?._presentTmuxPaneInbox(animated: true)
+    }))
+    present(alert, animated: true)
+  }
+
   private func _upgradeTmuxHost(hostAlias: String) {
     let cleanAlias = hostAlias.blink_trimmed
     guard !cleanAlias.isEmpty else {
@@ -1396,10 +1443,19 @@ extension SpaceController {
               }
             }
           )
+        } catch {
+          self._presentUpgradeFailureAlert(error.localizedDescription)
+          return
+        }
+
+        do {
           _ = try await TmuxControlPlaneClient.listSessions(for: host)
           self._presentTmuxPaneInbox(animated: true)
         } catch {
-          self._presentUpgradeFailureAlert(error.localizedDescription)
+          self._presentUpgradeCompletedButPaneInboxNotReadyAlert(
+            hostAlias: cleanAlias,
+            issue: error.localizedDescription
+          )
         }
       }
     }
@@ -1763,11 +1819,14 @@ fileprivate enum TmuxPaneInboxRow: Equatable {
 
 fileprivate enum TmuxPaneInboxRowAction: Equatable {
   case upgradeHost(String)
+  case fixRuntime(String)
 
   var subtitle: String {
     switch self {
     case .upgradeHost:
-      return "Tap to upgrade this host's tmuxd."
+      return "Tap to upgrade this host's tmuxd service."
+    case .fixRuntime:
+      return "Tap to view tmux runtime upgrade guidance."
     }
   }
 }
@@ -1806,6 +1865,17 @@ func tmuxPaneInboxPreviewText(previewText: String, currentCommand: String, fallb
     return path
   }
   return "(no recent output)"
+}
+
+func tmuxUpgradeCompletedButPaneInboxNotReadyMessage(hostAlias: String, issue: String) -> String {
+  let cleanAlias = hostAlias.blink_trimmed
+  let issueText = issue.blink_trimmed
+  var message = "tmuxd upgrade completed successfully for host '\(cleanAlias)'.\n\nPane inbox is not ready yet."
+  if !issueText.isEmpty {
+    message += "\n\(issueText)"
+  }
+  message += "\n\nNext steps:\n1. Upgrade tmux on the host (minimum 3.1+).\n2. Restart tmux server.\n3. Re-open Chats and retry."
+  return message
 }
 
 fileprivate func tmuxPaneInboxFlattenPanes(
@@ -1879,6 +1949,7 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
   private let onPaneSelected: (TmuxNotificationRequest) -> Void
   private let onCreateTerminal: () -> Void
   private let onUpgradeHost: (String) -> Void
+  private let onFixRuntimeHost: (String) -> Void
 
   private var sections: [TmuxPaneInboxSection] = []
   private var autoRefreshTask: Task<Void, Never>?
@@ -1888,11 +1959,13 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
   init(
     onPaneSelected: @escaping (TmuxNotificationRequest) -> Void,
     onCreateTerminal: @escaping () -> Void,
-    onUpgradeHost: @escaping (String) -> Void
+    onUpgradeHost: @escaping (String) -> Void,
+    onFixRuntimeHost: @escaping (String) -> Void
   ) {
     self.onPaneSelected = onPaneSelected
     self.onCreateTerminal = onCreateTerminal
     self.onUpgradeHost = onUpgradeHost
+    self.onFixRuntimeHost = onFixRuntimeHost
     super.init(style: .insetGrouped)
   }
 
@@ -2027,8 +2100,15 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
         }
       } catch {
         let action: TmuxPaneInboxRowAction?
-        if let controlError = error as? TmuxControlError, controlError.requiresHostUpgrade {
-          action = .upgradeHost(descriptor.alias)
+        if let controlError = error as? TmuxControlError {
+          switch controlError {
+          case .incompatibleRuntime:
+            action = .fixRuntime(descriptor.alias)
+          case .incompatibleCapabilitiesSchema, .incompatibleSessionsSchema:
+            action = .upgradeHost(descriptor.alias)
+          default:
+            action = nil
+          }
         } else {
           action = nil
         }
@@ -2163,6 +2243,8 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
       switch action {
       case .upgradeHost(let hostAlias):
         onUpgradeHost(hostAlias)
+      case .fixRuntime(let hostAlias):
+        onFixRuntimeHost(hostAlias)
       }
     }
   }
@@ -2329,9 +2411,12 @@ fileprivate enum TmuxControlError: LocalizedError {
       } else {
         capabilitiesPart = missing.joined(separator: "/")
       }
-      var message = "Host '\(hostAlias)' tmux runtime is incompatible with pane inbox requirements (\(capabilitiesPart)). Upgrade tmux/tmuxd on this host."
+      var message = "Host '\(hostAlias)' tmux runtime is incompatible with pane inbox requirements (\(capabilitiesPart)). Upgrade tmux on this host and retry."
       if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        message += "\n\(detail)"
+        let normalizedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedDetail.lowercased().contains("pane inbox requirements") {
+          message += "\nDetails: \(normalizedDetail)"
+        }
       }
       return message
     case .missingDeviceAPIToken(let hostAlias):
@@ -2608,6 +2693,16 @@ fileprivate enum TmuxControlPlaneClient {
     ]
     if knownCodes.contains(code) {
       return .incompatibleRuntime(hostAlias, missing, detail)
+    }
+
+    let nonRuntimeCodes: Set<String> = [
+      "sessions_payload_parse_error",
+      "tmux_error",
+      "tmux_io_error",
+      "db_error"
+    ]
+    if nonRuntimeCodes.contains(code) {
+      return nil
     }
 
     if statusCode == 422,

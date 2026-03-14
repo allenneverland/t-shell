@@ -20,6 +20,8 @@ pub enum TmuxError {
     Io(#[from] std::io::Error),
     #[error("tmux command failed: {0}")]
     Command(String),
+    #[error("tmux sessions payload parse failed: {detail}")]
+    PayloadParse { detail: String },
     #[error("incompatible tmux runtime: {detail}")]
     IncompatibleRuntime {
         detail: String,

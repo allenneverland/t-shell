@@ -65,6 +65,14 @@ fn tmux_error_response(error: tmux::TmuxError) -> (StatusCode, Json<ErrorRespons
                 missing_capabilities: Vec::new(),
             }),
         ),
+        tmux::TmuxError::PayloadParse { detail } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "sessions_payload_parse_error",
+                error: detail,
+                missing_capabilities: Vec::new(),
+            }),
+        ),
         tmux::TmuxError::Io(detail) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -168,5 +176,14 @@ mod tests {
         let (status, body) = tmux_error_response(TmuxError::Command("tmux failed".to_string()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.code, "tmux_error");
+    }
+
+    #[test]
+    fn payload_parse_error_maps_to_dedicated_500_code() {
+        let (status, body) = tmux_error_response(TmuxError::PayloadParse {
+            detail: "field count mismatch".to_string(),
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.code, "sessions_payload_parse_error");
     }
 }

@@ -3,6 +3,9 @@ use std::process::Command;
 
 use crate::tmux::TmuxError;
 
+const PANE_ROW_SEPARATOR: char = '\u{1f}';
+const LIST_PANES_FORMAT: &str = "#{session_name}\u{1f}#{session_attached}\u{1f}#{window_index}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_activity}\u{1f}#{pane_current_command}";
+
 #[derive(Debug, Serialize)]
 pub struct Pane {
     pub index: u32,
@@ -48,12 +51,44 @@ fn parse_session_attached(value: &str) -> bool {
 }
 
 fn parse_pane_activity(value: &str) -> Result<i64, TmuxError> {
-    value.parse::<i64>().map_err(|_| {
-        TmuxError::IncompatibleRuntime {
-            detail: "tmux list-panes did not return a valid pane_activity value. Upgrade tmux/tmuxd to a version that supports #{pane_activity}.".to_string(),
-            missing_capabilities: vec!["pane_activity".to_string()],
+    let trimmed = value.trim();
+    trimmed.parse::<i64>().map_err(|_| {
+        if trimmed.contains("#{pane_activity}") {
+            return TmuxError::IncompatibleRuntime {
+                detail: "tmux list-panes did not return a valid pane_activity value. Upgrade tmux/tmuxd to a version that supports #{pane_activity}.".to_string(),
+                missing_capabilities: vec!["pane_activity".to_string()],
+            };
+        }
+
+        TmuxError::PayloadParse {
+            detail: format!("pane_activity is not numeric in tmux sessions payload: `{trimmed}`"),
         }
     })
+}
+
+fn payload_parse_error(line: &str, message: &str) -> TmuxError {
+    let normalized = line.replace(PANE_ROW_SEPARATOR, "|");
+    let excerpt = normalized.chars().take(180).collect::<String>();
+    TmuxError::PayloadParse {
+        detail: format!("{message}. line=`{excerpt}`"),
+    }
+}
+
+fn parse_u32_field(raw: &str, field: &str, line: &str) -> Result<u32, TmuxError> {
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|_| payload_parse_error(line, format!("invalid `{field}` value").as_str()))
+}
+
+fn parse_bool_flag_field(raw: &str, field: &str, line: &str) -> Result<bool, TmuxError> {
+    match raw.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(payload_parse_error(
+            line,
+            format!("invalid `{field}` flag value").as_str(),
+        )),
+    }
 }
 
 fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
@@ -61,19 +96,22 @@ fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
         return Ok(None);
     }
 
-    let parts: Vec<&str> = line.splitn(10, '|').collect();
+    let parts: Vec<&str> = line.splitn(10, PANE_ROW_SEPARATOR).collect();
     if parts.len() != 10 {
-        return Ok(None);
+        return Err(payload_parse_error(
+            line,
+            "unexpected tmux sessions payload field count",
+        ));
     }
 
     Ok(Some(ParsedPaneRow {
         session_name: parts[0].to_string(),
         session_attached: parse_session_attached(parts[1]),
-        window_index: parts[2].parse().unwrap_or(0),
+        window_index: parse_u32_field(parts[2], "window_index", line)?,
         window_name: parts[3].to_string(),
-        window_active: parts[4] == "1",
-        pane_index: parts[5].parse().unwrap_or(0),
-        pane_active: parts[6] == "1",
+        window_active: parse_bool_flag_field(parts[4], "window_active", line)?,
+        pane_index: parse_u32_field(parts[5], "pane_index", line)?,
+        pane_active: parse_bool_flag_field(parts[6], "pane_active", line)?,
         current_path: parts[7].to_string(),
         pane_activity: parse_pane_activity(parts[8])?,
         current_command: parts[9].trim().to_string(),
@@ -152,12 +190,7 @@ fn infer_missing_capabilities_from_error(stderr: &str) -> Vec<String> {
 
 pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
     let output = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}|#{session_attached}|#{window_index}|#{window_name}|#{window_active}|#{pane_index}|#{pane_active}|#{pane_current_path}|#{pane_activity}|#{pane_current_command}",
-        ])
+        .args(["list-panes", "-a", "-F", LIST_PANES_FORMAT])
         .output()
         .map_err(TmuxError::Io)?;
 
@@ -255,8 +288,8 @@ pub fn list_sessions() -> Result<Vec<Session>, TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_missing_capabilities_from_error, parse_pane_activity, parse_session_attached,
-        sanitize_preview_line, truncate_preview_text,
+        infer_missing_capabilities_from_error, parse_pane_activity, parse_pane_row,
+        parse_session_attached, sanitize_preview_line, truncate_preview_text, PANE_ROW_SEPARATOR,
     };
     use crate::tmux::TmuxError;
 
@@ -280,8 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_activity_rejects_invalid_values() {
-        let error = parse_pane_activity("not-a-number").unwrap_err();
+    fn parse_pane_activity_reports_incompatible_runtime_for_placeholder() {
+        let error = parse_pane_activity("#{pane_activity}").unwrap_err();
         match error {
             TmuxError::IncompatibleRuntime {
                 detail,
@@ -290,7 +323,46 @@ mod tests {
                 assert!(detail.contains("pane_activity"));
                 assert_eq!(missing_capabilities, vec!["pane_activity".to_string()]);
             }
-            _ => panic!("expected command error"),
+            _ => panic!("expected incompatible runtime error"),
+        }
+    }
+
+    #[test]
+    fn parse_pane_activity_reports_payload_parse_for_non_numeric_values() {
+        let error = parse_pane_activity("not-a-number").unwrap_err();
+        match error {
+            TmuxError::PayloadParse { detail } => {
+                assert!(detail.contains("pane_activity"));
+            }
+            _ => panic!("expected payload parse error"),
+        }
+    }
+
+    #[test]
+    fn parse_pane_row_supports_pipe_characters_in_free_text_fields() {
+        let line = format!(
+            "work{sep}1{sep}2{sep}dev|ops{sep}1{sep}3{sep}0{sep}/tmp/a|b{sep}1719000000{sep}bash -lc 'echo a|b'",
+            sep = PANE_ROW_SEPARATOR
+        );
+        let parsed = parse_pane_row(&line)
+            .expect("parse should succeed")
+            .expect("parsed row should exist");
+
+        assert_eq!(parsed.session_name, "work");
+        assert_eq!(parsed.window_name, "dev|ops");
+        assert_eq!(parsed.current_path, "/tmp/a|b");
+        assert_eq!(parsed.current_command, "bash -lc 'echo a|b'");
+    }
+
+    #[test]
+    fn parse_pane_row_rejects_incomplete_payload() {
+        let line = format!("work{sep}1{sep}2", sep = PANE_ROW_SEPARATOR);
+        let error = parse_pane_row(&line).unwrap_err();
+        match error {
+            TmuxError::PayloadParse { detail } => {
+                assert!(detail.contains("field count"));
+            }
+            _ => panic!("expected payload parse error"),
         }
     }
 
