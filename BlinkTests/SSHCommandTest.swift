@@ -736,6 +736,20 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("active tmux server") ?? false)
   }
 
+  func testTmuxBellHookVerifyExecutionFailurePassesThroughRuntimeIncompatibilityMessage() {
+    let raw = "Host tmux runtime is incompatible with required tmux capabilities. Detected: tmux 3.4. Minimum expected: 3.1.0. Missing capabilities: pane_activity. Upgrade tmux on host, then rerun onboarding (tmuxd hooks/config will be refreshed automatically)."
+    let message = TmuxSSHOnboardingService.tmuxBellHookVerifyExecutionFailureMessageForTesting(raw)
+    XCTAssertEqual(message, raw)
+    XCTAssertFalse(message.localizedCaseInsensitiveContains("~/.tmux.conf is writable"))
+  }
+
+  func testTmuxBellHookInstallFailureUnknownErrorKeepsPermissionGuidance() {
+    let raw = "Remote command failed with exit status 1."
+    let message = TmuxSSHOnboardingService.tmuxBellHookInstallFailureMessageForTesting(raw)
+    XCTAssertTrue(message.localizedCaseInsensitiveContains("Failed to install tmux bell hook"))
+    XCTAssertTrue(message.localizedCaseInsensitiveContains("~/.tmux.conf is writable"))
+  }
+
   func testManagedTmuxdLocalPortCandidates() {
     XCTAssertEqual(TmuxSSHOnboardingService.tmuxdLocalPortCandidatesForTesting(), [8787, 8790, 8791])
   }

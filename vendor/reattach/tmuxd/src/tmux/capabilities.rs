@@ -228,14 +228,17 @@ fn probe_pane_field_capabilities() -> Result<PaneFieldProbeResult, String> {
 }
 
 fn parse_probe_line(line: &str) -> PaneFieldProbeResult {
-    let mut parts = line.splitn(2, '|');
-    let pane_activity = parts.next().unwrap_or_default().trim();
-    let pane_current_command = parts.next().unwrap_or_default().trim();
+    let Some((pane_activity_raw, pane_current_command_raw)) = line.split_once('|') else {
+        return PaneFieldProbeResult::default();
+    };
+    let pane_activity = pane_activity_raw.trim();
+    let pane_current_command = pane_current_command_raw.trim();
 
     PaneFieldProbeResult {
-        pane_activity_supported: pane_activity.parse::<i64>().is_ok(),
-        pane_current_command_supported: !pane_current_command.is_empty()
-            && !pane_current_command.contains("#{pane_current_command}"),
+        // `pane_activity` can be empty on some runtimes/panes even when the format exists.
+        pane_activity_supported: !pane_activity.contains("#{pane_activity}"),
+        // `pane_current_command` can transiently be empty; placeholder echo indicates true incompatibility.
+        pane_current_command_supported: !pane_current_command.contains("#{pane_current_command}"),
     }
 }
 
@@ -324,6 +327,10 @@ mod tests {
         assert!(supported.pane_activity_supported);
         assert!(supported.pane_current_command_supported);
 
+        let empty_activity = parse_probe_line("|zsh");
+        assert!(empty_activity.pane_activity_supported);
+        assert!(empty_activity.pane_current_command_supported);
+
         let missing_activity = parse_probe_line("#{pane_activity}|zsh");
         assert!(!missing_activity.pane_activity_supported);
         assert!(missing_activity.pane_current_command_supported);
@@ -331,5 +338,9 @@ mod tests {
         let missing_command = parse_probe_line("1719000000|#{pane_current_command}");
         assert!(missing_command.pane_activity_supported);
         assert!(!missing_command.pane_current_command_supported);
+
+        let malformed = parse_probe_line("1719000000");
+        assert!(!malformed.pane_activity_supported);
+        assert!(!malformed.pane_current_command_supported);
     }
 }

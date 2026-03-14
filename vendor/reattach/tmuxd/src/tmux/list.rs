@@ -52,6 +52,10 @@ fn parse_session_attached(value: &str) -> bool {
 
 fn parse_pane_activity(value: &str) -> Result<i64, TmuxError> {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        // Some tmux runtimes can emit empty activity timestamps for newly created/idle panes.
+        return Ok(0);
+    }
     trimmed.parse::<i64>().map_err(|_| {
         if trimmed.contains("#{pane_activity}") {
             return TmuxError::IncompatibleRuntime {
@@ -310,6 +314,12 @@ mod tests {
     fn parse_pane_activity_accepts_valid_unix_timestamps() {
         assert_eq!(parse_pane_activity("0").unwrap(), 0);
         assert_eq!(parse_pane_activity("1719000000").unwrap(), 1719000000);
+    }
+
+    #[test]
+    fn parse_pane_activity_treats_empty_value_as_zero() {
+        assert_eq!(parse_pane_activity("").unwrap(), 0);
+        assert_eq!(parse_pane_activity("   ").unwrap(), 0);
     }
 
     #[test]

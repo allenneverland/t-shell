@@ -1584,6 +1584,42 @@ enum TmuxSSHOnboardingService {
     return nil
   }
 
+  private static func tmuxBellHookInstallFailureMessage(raw: String) -> String {
+    let cleanRaw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    var message = "Failed to install tmux bell hook."
+    if let guidance = classifyTmuxBellHookFailureMessage(cleanRaw) {
+      message += "\n\(guidance)"
+    } else {
+      message += "\nEnsure ~/.local/bin/tmuxd is executable and ~/.tmux.conf is writable, then retry onboarding."
+    }
+    if !cleanRaw.isEmpty {
+      message += "\n\(cleanRaw)"
+    }
+    return message
+  }
+
+  private static func tmuxBellHookVerifyExecutionFailureMessage(raw: String) -> String {
+    let cleanRaw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanRaw.isEmpty else {
+      return "tmux bell hook verification failed with empty output."
+    }
+    let lower = cleanRaw.lowercased()
+
+    if lower.contains("host tmux runtime is incompatible with required tmux capabilities") {
+      return cleanRaw
+    }
+    if let guidance = classifyTmuxBellHookFailureMessage(cleanRaw) {
+      return "\(guidance)\n\(cleanRaw)"
+    }
+    if lower.contains("tmux bell hook verification failed") ||
+      lower.contains("tmux runtime hook probe failed") ||
+      lower.contains("tmux pane raw bel probe failed") {
+      return "Bell hook verification failed during runtime probing. Start tmux on host, rerun onboarding once, then retry.\n\(cleanRaw)"
+    }
+
+    return "tmux bell hook verification failed.\n\(cleanRaw)"
+  }
+
   private static func tmuxBellHookVerificationFailureMessage(report: TmuxBellHookVerifyResponse) -> String {
     let reasonCodes = Set(report.runtimeProbeReasonCodes.map { $0.lowercased() })
     let missingCapabilities = Set(report.missingCapabilities.map { $0.lowercased() })
@@ -1675,6 +1711,14 @@ enum TmuxSSHOnboardingService {
 
   static func parseTmuxBellHookVerifyJSONForTesting(_ raw: String) -> Bool {
     decodeTmuxBellHookVerifyResponse(raw) != nil
+  }
+
+  static func tmuxBellHookInstallFailureMessageForTesting(_ raw: String) -> String {
+    tmuxBellHookInstallFailureMessage(raw: raw)
+  }
+
+  static func tmuxBellHookVerifyExecutionFailureMessageForTesting(_ raw: String) -> String {
+    tmuxBellHookVerifyExecutionFailureMessage(raw: raw)
   }
 
   static func tmuxBellHookVerificationFailureMessageForTesting(_ raw: String) -> String? {
@@ -2522,41 +2566,37 @@ enum TmuxSSHOnboardingService {
   private static func installTmuxBellHook(on client: SSH.SSHClient) async throws {
     do {
       try await runChecked(script: installTmuxBellHookScript(), on: client)
-      let validation = try await runExec(
+    } catch {
+      throw ValidationError.general(
+        message: tmuxBellHookInstallFailureMessage(raw: error.localizedDescription)
+      )
+    }
+
+    let validation: RemoteExecResult
+    do {
+      validation = try await runExec(
         command: "sh -lc \(shellQuote(verifyTmuxBellHookScript()))",
         on: client
       )
-      guard let report = decodeTmuxBellHookVerifyResponse(validation.stdout) else {
-        if validation.exitStatus == 0 {
-          throw ValidationError.general(
-            message: "tmuxd hooks verify returned invalid JSON output."
-          )
-        }
-        throw ValidationError.general(message: formatExecFailure(validation))
-      }
-
-      if !report.overallOK || validation.exitStatus != 0 {
-        throw ValidationError.general(
-          message: tmuxBellHookVerificationFailureMessage(report: report)
-        )
-      }
     } catch {
-      let raw = error.localizedDescription
-      let lowerRaw = raw.lowercased()
-      var message = "Failed to install tmux bell hook."
-      if let guidance = classifyTmuxBellHookFailureMessage(raw) {
-        message += "\n\(guidance)"
-      } else if lowerRaw.contains("tmux bell hook verification failed") ||
-        lowerRaw.contains("tmux runtime hook probe failed") ||
-        lowerRaw.contains("tmux pane raw bel probe failed") {
-        message += "\nBell hook verification failed during runtime probing. Start tmux on host, rerun onboarding once, then retry."
-      } else {
-        message += "\nEnsure ~/.local/bin/tmuxd is executable and ~/.tmux.conf is writable, then retry onboarding."
-      }
-      if !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        message += "\n\(raw)"
-      }
-      throw ValidationError.general(message: message)
+      throw ValidationError.general(
+        message: tmuxBellHookVerifyExecutionFailureMessage(raw: error.localizedDescription)
+      )
+    }
+
+    guard let report = decodeTmuxBellHookVerifyResponse(validation.stdout) else {
+      let raw = validation.exitStatus == 0
+        ? "tmuxd hooks verify returned invalid JSON output."
+        : formatExecFailure(validation)
+      throw ValidationError.general(
+        message: tmuxBellHookVerifyExecutionFailureMessage(raw: raw)
+      )
+    }
+
+    if !report.overallOK || validation.exitStatus != 0 {
+      throw ValidationError.general(
+        message: tmuxBellHookVerificationFailureMessage(report: report)
+      )
     }
   }
 
