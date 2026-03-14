@@ -144,8 +144,35 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
       payload: payload
     )
     XCTAssertNotNil(message)
-    XCTAssertTrue(message?.localizedCaseInsensitiveContains("HTTP 500") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("sessions_payload_parse_error") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("pane_activity is not numeric") ?? false)
     XCTAssertFalse(message?.localizedCaseInsensitiveContains("runtime is incompatible") ?? true)
+  }
+
+  func testSessionsUnknown500ErrorShowsStructuredCodeAndDetail() {
+    let payload = """
+    {"code":"tmux_error","error":"tmux command failed: failed to read socket"}
+    """
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 500,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("tmux_error") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("failed to read socket") ?? false)
+  }
+
+  func testSessionsNonJSON500ErrorShowsBodySnippetFallback() {
+    let payload = "<html><body>internal server error from upstream</body></html>"
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 500,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("HTTP 500") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("internal server error from upstream") ?? false)
   }
 }
 

@@ -2371,7 +2371,7 @@ fileprivate struct TmuxControlPaneInputRequest: Encodable {
 fileprivate enum TmuxControlError: LocalizedError {
   case invalidURL(String)
   case unauthorized(Int)
-  case badStatusCode(Int, String)
+  case apiFailure(Int, String, String?, String?, [String], String?)
   case incompatibleCapabilitiesSchema(String)
   case incompatibleSessionsSchema(String)
   case incompatibleRuntime(String, [String], String?)
@@ -2395,8 +2395,27 @@ fileprivate enum TmuxControlError: LocalizedError {
       return "Tmux endpoint is invalid or insecure: \(value). Use a valid https:// endpoint in Settings > Hosts > SSH."
     case .unauthorized:
       return "Tmux endpoint rejected credentials (HTTP 401/403). Verify Service Token in Settings > Hosts > SSH."
-    case .badStatusCode(let code, let path):
-      return "Tmux control plane returned HTTP \(code) at \(path)."
+    case .apiFailure(let statusCode, let path, let code, let detail, let missingCapabilities, let bodySnippet):
+      var message = "Tmux control plane returned HTTP \(statusCode) at \(path)."
+      let normalizedCode = code?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !normalizedCode.isEmpty {
+        message += "\nCode: \(normalizedCode)"
+      }
+      let normalizedDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !normalizedDetail.isEmpty {
+        message += "\n\(normalizedDetail)"
+      }
+      let cleanedMissing = missingCapabilities
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+      if !cleanedMissing.isEmpty {
+        message += "\nMissing capabilities: \(cleanedMissing.joined(separator: ", "))"
+      }
+      let normalizedBodySnippet = bodySnippet?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if normalizedDetail.isEmpty && !normalizedBodySnippet.isEmpty {
+        message += "\nDetails: \(normalizedBodySnippet)"
+      }
+      return message
     case .incompatibleCapabilitiesSchema(let hostAlias):
       return "Host '\(hostAlias)' exposes an outdated tmux capabilities payload (requires capabilities_schema_version >= 7 with pane_inbox_v1). Upgrade tmuxd on this host."
     case .incompatibleSessionsSchema(let hostAlias):
@@ -2591,7 +2610,20 @@ fileprivate enum TmuxControlPlaneClient {
       throw classified
     }
 
-    throw TmuxControlError.badStatusCode(result.statusCode, path)
+    let payload = _decodeAPIErrorResponse(from: result.data)
+    let code = payload?.code?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let detail = payload?.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let missingCapabilities = payload?.missingCapabilities ?? []
+    let fallbackBodySnippet = _sanitizedBodySnippet(from: result.data)
+
+    throw TmuxControlError.apiFailure(
+      result.statusCode,
+      path,
+      (code?.isEmpty ?? true) ? nil : code,
+      (detail?.isEmpty ?? true) ? nil : detail,
+      missingCapabilities,
+      fallbackBodySnippet
+    )
   }
 
   private static func _decode<T: Decodable>(_ type: T.Type, data: Data, path: String) throws -> T {
@@ -2673,6 +2705,31 @@ fileprivate enum TmuxControlPlaneClient {
       return nil
     }
     return try? JSONDecoder().decode(TmuxControlAPIErrorResponse.self, from: data)
+  }
+
+  private static func _sanitizedBodySnippet(from data: Data, maxLength: Int = 280) -> String? {
+    guard !data.isEmpty else {
+      return nil
+    }
+    guard let raw = String(data: data, encoding: .utf8) else {
+      return nil
+    }
+    let collapsed = raw
+      .components(separatedBy: .newlines)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+
+    guard !collapsed.isEmpty else {
+      return nil
+    }
+
+    let cleaned = collapsed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    if cleaned.count <= maxLength {
+      return cleaned
+    }
+    let end = cleaned.index(cleaned.startIndex, offsetBy: maxLength)
+    return String(cleaned[..<end]) + "…"
   }
 
   private static func _classifySessionsRuntimeIncompatibility(
