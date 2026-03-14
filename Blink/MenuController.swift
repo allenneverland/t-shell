@@ -66,9 +66,6 @@ fileprivate var attachedShortcuts: [UIKeyCommand] = []
   enum WindowMenu: String, CaseIterable {
     case windowFocusOther
     case tabMoveToOtherWindow
-    case tabNext
-    case tabPrev
-    case tabLast
   }
 
   override private init() {}

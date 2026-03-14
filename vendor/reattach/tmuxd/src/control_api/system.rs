@@ -3,13 +3,14 @@ use serde::Serialize;
 
 use crate::{state::AppState, tmux};
 
-const CAPABILITIES_SCHEMA_VERSION: u32 = 8;
+const CAPABILITIES_SCHEMA_VERSION: u32 = 9;
 const INPUT_EVENTS_MAX_BATCH: u32 = 128;
-const PANE_INBOX_REQUIRED_FIELDS: [&str; 4] = [
+const PANE_INBOX_REQUIRED_FIELDS: [&str; 5] = [
     "pane_activity",
     "current_command",
     "preview_text",
     "has_unread_notification",
+    "last_message_ts",
 ];
 
 #[derive(Serialize)]
@@ -115,7 +116,7 @@ mod tests {
         let payload = CapabilitiesResponse {
             daemon: "tmuxd",
             version: "1.0.22",
-            capabilities_schema_version: 8,
+            capabilities_schema_version: 9,
             features: FeatureCapabilities {
                 input_events_v1: InputEventsCapability {
                     enabled: true,
@@ -129,6 +130,7 @@ mod tests {
                         "current_command",
                         "preview_text",
                         "has_unread_notification",
+                        "last_message_ts",
                     ],
                     runtime_compatible: true,
                     minimum_tmux_version: "3.1.0".to_string(),
@@ -153,7 +155,7 @@ mod tests {
             value
                 .get("capabilities_schema_version")
                 .and_then(|v| v.as_u64()),
-            Some(8)
+            Some(9)
         );
         assert_eq!(
             value
@@ -190,6 +192,12 @@ mod tests {
                 .pointer("/features/pane_inbox_v1/required_pane_fields/0")
                 .and_then(|v| v.as_str()),
             Some("pane_activity")
+        );
+        assert_eq!(
+            value
+                .pointer("/features/pane_inbox_v1/required_pane_fields/4")
+                .and_then(|v| v.as_str()),
+            Some("last_message_ts")
         );
         assert_eq!(
             value

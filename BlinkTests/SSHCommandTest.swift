@@ -254,6 +254,109 @@ final class TmuxPickerDisplayTests: XCTestCase {
   }
 }
 
+final class TmuxChatsEdgeSwipeTests: XCTestCase {
+  func testEdgeSwipeCanPresentRequiresWindowApplicationAndNoBlockingState() {
+    XCTAssertTrue(
+      tmuxChatsEdgeSwipeCanPresentChats(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxChatsPresented: false
+      )
+    )
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeCanPresentChats(
+        isWindowApplicationScene: false,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxChatsPresented: false
+      )
+    )
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeCanPresentChats(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: true,
+        hasPresentedViewController: false,
+        isTmuxChatsPresented: false
+      )
+    )
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeCanPresentChats(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: true,
+        isTmuxChatsPresented: false
+      )
+    )
+  }
+
+  func testEdgeSwipeRequiresPositiveHorizontalMovement() {
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: 0,
+        translationY: 0,
+        velocityX: 1000
+      )
+    )
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: -24,
+        translationY: 0,
+        velocityX: 1500
+      )
+    )
+  }
+
+  func testEdgeSwipeTriggersByDistanceThreshold() {
+    XCTAssertTrue(
+      tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: 56,
+        translationY: 30,
+        velocityX: 100
+      )
+    )
+  }
+
+  func testEdgeSwipeTriggersByVelocityWithShortDistance() {
+    XCTAssertTrue(
+      tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: 24,
+        translationY: 10,
+        velocityX: 700
+      )
+    )
+  }
+
+  func testEdgeSwipeRejectsLargeVerticalDrift() {
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: 90,
+        translationY: 81,
+        velocityX: 1200
+      )
+    )
+  }
+}
+
+final class TmuxTerminalPagingDisableTests: XCTestCase {
+  func testPagingCommandsAreDisabled() {
+    let disabled: [Command] = [
+      .tab1, .tab2, .tab3, .tab4, .tab5, .tab6, .tab7, .tab8, .tab9, .tab10, .tab11, .tab12,
+      .tabNext, .tabPrev, .tabNextCycling, .tabPrevCycling, .tabLast
+    ]
+    for cmd in disabled {
+      XCTAssertTrue(tmuxTerminalPagingCommandDisabled(cmd), "\(cmd.rawValue) should be disabled")
+    }
+  }
+
+  func testNonPagingCommandsRemainEnabled() {
+    let enabled: [Command] = [.tabNew, .tabClose, .windowClose, .windowFocusOther, .clipboardCopy]
+    for cmd in enabled {
+      XCTAssertFalse(tmuxTerminalPagingCommandDisabled(cmd), "\(cmd.rawValue) should remain enabled")
+    }
+  }
+}
+
 final class TmuxPaneInboxSortingTests: XCTestCase {
   private func _item(
     hostAlias: String,
@@ -261,7 +364,8 @@ final class TmuxPaneInboxSortingTests: XCTestCase {
     windowIndex: Int,
     paneIndex: Int,
     paneTarget: String,
-    paneActivity: Int64
+    paneActivity: Int64,
+    lastMessageTs: Int64? = nil
   ) -> TmuxPaneInboxItem {
     TmuxPaneInboxItem(
       hostAlias: hostAlias,
@@ -275,6 +379,7 @@ final class TmuxPaneInboxSortingTests: XCTestCase {
       currentPath: "/tmp",
       active: false,
       paneActivity: paneActivity,
+      lastMessageTs: lastMessageTs ?? paneActivity,
       currentCommand: "bash",
       previewText: "preview",
       hasUnreadNotification: false
@@ -320,6 +425,30 @@ final class TmuxPaneInboxSortingTests: XCTestCase {
       "zeta:1.0",
       "work:2.0"
     ])
+  }
+
+  func testSortPanesPrefersLastMessageTimestampOverPaneActivity() {
+    let newerMessage = _item(
+      hostAlias: "alpha",
+      sessionName: "ops",
+      windowIndex: 1,
+      paneIndex: 0,
+      paneTarget: "ops:1.0",
+      paneActivity: 1_000,
+      lastMessageTs: 4_000
+    )
+    let olderMessage = _item(
+      hostAlias: "beta",
+      sessionName: "build",
+      windowIndex: 1,
+      paneIndex: 0,
+      paneTarget: "build:1.0",
+      paneActivity: 9_000,
+      lastMessageTs: 2_000
+    )
+
+    let sorted = tmuxPaneInboxSortPanesByRecentActivity([olderMessage, newerMessage])
+    XCTAssertEqual(sorted.map(\.paneTarget), ["ops:1.0", "build:1.0"])
   }
 }
 

@@ -1,7 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::{state::AppState, tmux};
+use crate::{db::PaneInboxSnapshot, state::AppState, tmux};
 
 #[derive(Serialize)]
 pub struct PaneResponse {
@@ -13,6 +14,7 @@ pub struct PaneResponse {
     pub current_command: String,
     pub preview_text: String,
     pub has_unread_notification: bool,
+    pub last_message_ts: i64,
 }
 
 #[derive(Serialize)]
@@ -89,6 +91,32 @@ pub async fn list_sessions(
 ) -> Result<Json<Vec<SessionResponse>>, (StatusCode, Json<ErrorResponse>)> {
     match tmux::list_sessions() {
         Ok(sessions) => {
+            let pane_snapshots: Vec<PaneInboxSnapshot> = sessions
+                .iter()
+                .flat_map(|session| session.windows.iter())
+                .flat_map(|window| window.panes.iter())
+                .map(|pane| PaneInboxSnapshot {
+                    pane_target: pane.target.clone(),
+                    pane_activity: pane.pane_activity,
+                    preview_text: pane.preview_text.clone(),
+                })
+                .collect();
+            let last_message_ts_by_target = match state
+                .db
+                .resolve_pane_inbox_last_message_ts(&pane_snapshots, Utc::now())
+            {
+                Ok(values) => values,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            code: "db_error",
+                            error: e.to_string(),
+                            missing_capabilities: Vec::new(),
+                        }),
+                    ))
+                }
+            };
             let unread_targets = match state.db.list_unread_pane_targets() {
                 Ok(values) => values,
                 Err(e) => {
@@ -120,15 +148,21 @@ pub async fn list_sessions(
                                 .map(|p| {
                                     let target = p.target;
                                     let has_unread_notification = unread_targets.contains(&target);
+                                    let pane_activity = p.pane_activity.max(0);
+                                    let last_message_ts = last_message_ts_by_target
+                                        .get(&target)
+                                        .copied()
+                                        .unwrap_or(pane_activity);
                                     PaneResponse {
                                         index: p.index,
                                         active: p.active,
                                         target,
                                         current_path: p.current_path,
-                                        pane_activity: p.pane_activity,
+                                        pane_activity,
                                         current_command: p.current_command,
                                         preview_text: p.preview_text,
                                         has_unread_notification,
+                                        last_message_ts,
                                     }
                                 })
                                 .collect(),
@@ -153,7 +187,7 @@ pub async fn create_session(
 
 #[cfg(test)]
 mod tests {
-    use super::tmux_error_response;
+    use super::{tmux_error_response, PaneResponse};
     use crate::tmux::TmuxError;
     use axum::http::StatusCode;
 
@@ -185,5 +219,26 @@ mod tests {
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.code, "sessions_payload_parse_error");
+    }
+
+    #[test]
+    fn pane_response_serializes_last_message_timestamp() {
+        let payload = PaneResponse {
+            index: 1,
+            active: true,
+            target: "ops:1.1".to_string(),
+            current_path: "/tmp".to_string(),
+            pane_activity: 123,
+            current_command: "bash".to_string(),
+            preview_text: "hello".to_string(),
+            has_unread_notification: false,
+            last_message_ts: 456,
+        };
+
+        let value = serde_json::to_value(payload).expect("serialize pane response");
+        assert_eq!(
+            value.get("last_message_ts").and_then(|v| v.as_i64()),
+            Some(456)
+        );
     }
 }

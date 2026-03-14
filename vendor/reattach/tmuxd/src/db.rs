@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -30,6 +30,20 @@ struct LegacyDeviceToken {
     device_id: String,
     #[serde(default)]
     server_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaneInboxSnapshot {
+    pub pane_target: String,
+    pub pane_activity: i64,
+    pub preview_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct PaneInboxStateRow {
+    last_preview_text: String,
+    last_content_change_ts: i64,
+    last_message_ts: i64,
 }
 
 pub struct Database {
@@ -123,6 +137,16 @@ impl Database {
                 last_notified_ts INTEGER NOT NULL,
                 last_read_ts INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS pane_inbox_state (
+                pane_target TEXT PRIMARY KEY,
+                last_preview_text TEXT NOT NULL,
+                last_content_change_ts INTEGER NOT NULL,
+                last_message_ts INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pane_inbox_state_last_message_ts
+                ON pane_inbox_state(last_message_ts DESC);
 
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -939,6 +963,96 @@ impl Database {
         Ok(out)
     }
 
+    pub fn resolve_pane_inbox_last_message_ts(
+        &self,
+        panes: &[PaneInboxSnapshot],
+        observed_at: DateTime<Utc>,
+    ) -> AppResult<HashMap<String, i64>> {
+        if panes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction()?;
+        let notification_ts_by_target = load_notification_timestamps(&tx)?;
+        let existing_state_by_target = load_pane_inbox_state_rows(&tx)?;
+        let mut upsert_stmt = tx.prepare(
+            "INSERT INTO pane_inbox_state (
+                pane_target, last_preview_text, last_content_change_ts, last_message_ts, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(pane_target) DO UPDATE SET
+               last_preview_text = excluded.last_preview_text,
+               last_content_change_ts = MAX(
+                 pane_inbox_state.last_content_change_ts,
+                 excluded.last_content_change_ts
+               ),
+               last_message_ts = MAX(
+                 pane_inbox_state.last_message_ts,
+                 excluded.last_message_ts
+               ),
+               updated_at = excluded.updated_at",
+        )?;
+
+        let observed_ts = observed_at.timestamp();
+        let observed_at_rfc3339 = observed_at.to_rfc3339();
+        let mut last_message_ts_by_target = HashMap::new();
+
+        for pane in panes {
+            let target = pane.pane_target.trim();
+            if target.is_empty() {
+                continue;
+            }
+
+            let normalized_preview = pane.preview_text.trim();
+            let existing = existing_state_by_target.get(target);
+            let notification_ts = notification_ts_by_target.get(target).copied().unwrap_or(0);
+            let pane_activity_ts = pane.pane_activity.max(0);
+
+            let (stored_preview_text, last_content_change_ts) = match existing {
+                Some(existing_row) => {
+                    if normalized_preview.is_empty()
+                        || normalized_preview == existing_row.last_preview_text
+                    {
+                        (
+                            existing_row.last_preview_text.clone(),
+                            existing_row.last_content_change_ts,
+                        )
+                    } else {
+                        (
+                            normalized_preview.to_string(),
+                            observed_ts.max(existing_row.last_content_change_ts),
+                        )
+                    }
+                }
+                None => {
+                    if normalized_preview.is_empty() {
+                        ("".to_string(), 0)
+                    } else {
+                        (normalized_preview.to_string(), observed_ts)
+                    }
+                }
+            };
+
+            let existing_last_message_ts = existing.map(|row| row.last_message_ts).unwrap_or(0);
+            let last_message_ts = pane_activity_ts
+                .max(notification_ts.max(last_content_change_ts))
+                .max(existing_last_message_ts);
+
+            upsert_stmt.execute(params![
+                target,
+                stored_preview_text,
+                last_content_change_ts,
+                last_message_ts,
+                observed_at_rfc3339,
+            ])?;
+            last_message_ts_by_target.insert(target.to_string(), last_message_ts);
+        }
+
+        drop(upsert_stmt);
+        tx.commit()?;
+        Ok(last_message_ts_by_target)
+    }
+
     pub fn list_devices_for_host(&self, host_id: &str) -> AppResult<Vec<DeviceRecord>> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
@@ -1362,6 +1476,42 @@ fn migrate_devices_apns_uniqueness(conn: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn load_notification_timestamps(tx: &Transaction<'_>) -> AppResult<HashMap<String, i64>> {
+    let mut stmt =
+        tx.prepare("SELECT pane_target, last_notified_ts FROM pane_notification_state")?;
+    let mut rows = stmt.query([])?;
+    let mut out = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let pane_target: String = row.get(0)?;
+        let last_notified_ts: i64 = row.get(1)?;
+        out.insert(pane_target, last_notified_ts.max(0));
+    }
+    Ok(out)
+}
+
+fn load_pane_inbox_state_rows(
+    tx: &Transaction<'_>,
+) -> AppResult<HashMap<String, PaneInboxStateRow>> {
+    let mut stmt = tx.prepare(
+        "SELECT pane_target, last_preview_text, last_content_change_ts, last_message_ts
+         FROM pane_inbox_state",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let pane_target: String = row.get(0)?;
+        out.insert(
+            pane_target,
+            PaneInboxStateRow {
+                last_preview_text: row.get(1)?,
+                last_content_change_ts: row.get::<_, i64>(2)?.max(0),
+                last_message_ts: row.get::<_, i64>(3)?.max(0),
+            },
+        );
+    }
+    Ok(out)
+}
+
 fn parse_ts(raw: &str) -> AppResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
@@ -1758,5 +1908,96 @@ mod tests {
             .list_unread_pane_targets()
             .expect("unread list should be readable");
         assert!(unread_after_new_event.contains("ops:2.1"));
+    }
+
+    #[test]
+    fn resolve_pane_inbox_last_message_ts_combines_activity_notification_and_content_change() {
+        let db = setup_database();
+        let base = Utc.with_ymd_and_hms(2026, 1, 4, 12, 0, 0).unwrap();
+
+        let pane = PaneInboxSnapshot {
+            pane_target: "work:1.0".to_string(),
+            pane_activity: 0,
+            preview_text: "make build".to_string(),
+        };
+
+        let first = db
+            .resolve_pane_inbox_last_message_ts(std::slice::from_ref(&pane), base)
+            .expect("initial resolve should succeed");
+        assert_eq!(first.get("work:1.0").copied(), Some(base.timestamp()));
+
+        let second = db
+            .resolve_pane_inbox_last_message_ts(
+                std::slice::from_ref(&pane),
+                base + Duration::seconds(20),
+            )
+            .expect("second resolve should succeed");
+        assert_eq!(second.get("work:1.0").copied(), Some(base.timestamp()));
+
+        db.record_pane_notification("work:1.0", base + Duration::seconds(45))
+            .expect("notification should update unread timestamp");
+        let third = db
+            .resolve_pane_inbox_last_message_ts(
+                std::slice::from_ref(&pane),
+                base + Duration::seconds(50),
+            )
+            .expect("third resolve should succeed");
+        assert_eq!(
+            third.get("work:1.0").copied(),
+            Some((base + Duration::seconds(45)).timestamp())
+        );
+
+        let activity_pane = PaneInboxSnapshot {
+            pane_target: "work:1.0".to_string(),
+            pane_activity: (base + Duration::seconds(80)).timestamp(),
+            preview_text: "make build".to_string(),
+        };
+        let fourth = db
+            .resolve_pane_inbox_last_message_ts(
+                std::slice::from_ref(&activity_pane),
+                base + Duration::seconds(81),
+            )
+            .expect("fourth resolve should succeed");
+        assert_eq!(
+            fourth.get("work:1.0").copied(),
+            Some((base + Duration::seconds(80)).timestamp())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_inbox_last_message_ts_does_not_treat_empty_preview_as_new_message() {
+        let db = setup_database();
+        let base = Utc.with_ymd_and_hms(2026, 1, 5, 8, 0, 0).unwrap();
+
+        let initial = PaneInboxSnapshot {
+            pane_target: "ops:2.1".to_string(),
+            pane_activity: 0,
+            preview_text: "python run.py".to_string(),
+        };
+        db.resolve_pane_inbox_last_message_ts(std::slice::from_ref(&initial), base)
+            .expect("initial resolve should succeed");
+
+        let empty_preview = PaneInboxSnapshot {
+            pane_target: "ops:2.1".to_string(),
+            pane_activity: 0,
+            preview_text: "".to_string(),
+        };
+        let result = db
+            .resolve_pane_inbox_last_message_ts(
+                std::slice::from_ref(&empty_preview),
+                base + Duration::seconds(120),
+            )
+            .expect("empty preview resolve should succeed");
+        assert_eq!(result.get("ops:2.1").copied(), Some(base.timestamp()));
+
+        let conn = lock_conn(&db.conn).expect("connection lock");
+        let persisted_preview: String = conn
+            .query_row(
+                "SELECT last_preview_text FROM pane_inbox_state WHERE pane_target = ?1",
+                params!["ops:2.1"],
+                |row| row.get(0),
+            )
+            .expect("pane inbox row should exist");
+        assert_eq!(persisted_preview, "python run.py");
     }
 }

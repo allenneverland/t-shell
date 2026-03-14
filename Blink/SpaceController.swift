@@ -70,6 +70,7 @@ class SpaceController: UIViewController {
   private var _snippetsVC: SnippetsViewController? = nil
   private var _blinkMenu: BlinkMenu? = nil
   private var _bottomTapAreaView = UIView()
+  private var _tmuxChatsEdgePanRecognizer: UIScreenEdgePanGestureRecognizer? = nil
   private var _didPresentInitialTmuxPaneInbox: Bool = false
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   
@@ -206,6 +207,7 @@ class SpaceController: UIViewController {
     }
     
     _viewportsController.didMove(toParent: self)
+    _disableTerminalPagingGesture()
     
     _overlay.isUserInteractionEnabled = false
     view.addSubview(_overlay)
@@ -228,6 +230,8 @@ class SpaceController: UIViewController {
     doubleTap.numberOfTapsRequired = 2
     doubleTap.numberOfTouchesRequired = 1
     _bottomTapAreaView.addGestureRecognizer(doubleTap)
+
+    _setupTmuxChatsEdgeSwipeGesture()
     
     NotificationCenter.default.addObserver(self, selector: #selector(_geoTrackStateChanged), name: NSNotification.Name.BLGeoTrackStateChange, object: nil)
     
@@ -447,6 +451,58 @@ Please go to your subscriptions and cancel one of them!
     _attachInputToCurrentTerm()
   }
 
+  private func _disableTerminalPagingGesture() {
+    let scrollViews = _viewportsController.view.subviews.compactMap { $0 as? UIScrollView }
+    for scrollView in scrollViews {
+      scrollView.isScrollEnabled = false
+      scrollView.panGestureRecognizer.isEnabled = false
+    }
+  }
+
+  private func _setupTmuxChatsEdgeSwipeGesture() {
+    let gesture = UIScreenEdgePanGestureRecognizer(
+      target: self,
+      action: #selector(_handleTmuxChatsEdgePanGesture(_:))
+    )
+    gesture.edges = .left
+    gesture.maximumNumberOfTouches = 1
+    gesture.delegate = self
+    view.addGestureRecognizer(gesture)
+    _tmuxChatsEdgePanRecognizer = gesture
+  }
+
+  private var _canPresentTmuxChatsFromEdgeSwipe: Bool {
+    tmuxChatsEdgeSwipeCanPresentChats(
+      isWindowApplicationScene: sceneRole == .windowApplication,
+      isSpaceControllerAnimating: _spaceControllerAnimating,
+      hasPresentedViewController: presentedViewController != nil,
+      isTmuxChatsPresented: _isPresentingTmuxPaneInbox
+    )
+  }
+
+  @objc private func _handleTmuxChatsEdgePanGesture(_ gesture: UIScreenEdgePanGestureRecognizer) {
+    guard gesture === _tmuxChatsEdgePanRecognizer else {
+      return
+    }
+    guard _canPresentTmuxChatsFromEdgeSwipe else {
+      return
+    }
+    guard gesture.state == .ended else {
+      return
+    }
+
+    let translation = gesture.translation(in: view)
+    let velocity = gesture.velocity(in: view)
+    guard tmuxChatsEdgeSwipeShouldPresentChats(
+      translationX: Double(translation.x),
+      translationY: Double(translation.y),
+      velocityX: Double(velocity.x)
+    ) else {
+      return
+    }
+    _presentTmuxPaneInbox(animated: true)
+  }
+
   private func _presentInitialTmuxPaneInboxIfNeeded() {
     guard
       sceneRole == .windowApplication,
@@ -634,6 +690,28 @@ Please go to your subscriptions and cancel one of them!
     self.view.setNeedsLayout()
   }
   
+}
+
+extension SpaceController: UIGestureRecognizerDelegate {
+  func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    guard gestureRecognizer === _tmuxChatsEdgePanRecognizer else {
+      return true
+    }
+    guard _canPresentTmuxChatsFromEdgeSwipe else {
+      return false
+    }
+    guard let edgePan = gestureRecognizer as? UIScreenEdgePanGestureRecognizer else {
+      return false
+    }
+    let velocity = edgePan.velocity(in: view)
+    if velocity.x == 0 && velocity.y == 0 {
+      return true
+    }
+    if abs(velocity.x) <= abs(velocity.y) {
+      return false
+    }
+    return velocity.x >= 0
+  }
 }
 
 // MARK: UIStateRestorable
@@ -842,6 +920,9 @@ extension SpaceController {
   
   func _onCommand(_ cmd: Command) {
     guard foregroundActive else {
+      return
+    }
+    if tmuxTerminalPagingCommandDisabled(cmd) {
       return
     }
 
@@ -1795,6 +1876,58 @@ func tmuxPanePickerTitle(
   return "\(marker)\(windowName) • pane \(paneIndex) • \(path)"
 }
 
+func tmuxTerminalPagingCommandDisabled(_ cmd: Command) -> Bool {
+  switch cmd {
+  case .tab1, .tab2, .tab3, .tab4, .tab5, .tab6, .tab7, .tab8, .tab9, .tab10, .tab11, .tab12,
+       .tabNext, .tabPrev, .tabNextCycling, .tabPrevCycling, .tabLast:
+    return true
+  default:
+    return false
+  }
+}
+
+func tmuxChatsEdgeSwipeCanPresentChats(
+  isWindowApplicationScene: Bool,
+  isSpaceControllerAnimating: Bool,
+  hasPresentedViewController: Bool,
+  isTmuxChatsPresented: Bool
+) -> Bool {
+  guard isWindowApplicationScene else {
+    return false
+  }
+  guard !isSpaceControllerAnimating else {
+    return false
+  }
+  guard !isTmuxChatsPresented else {
+    return false
+  }
+  guard !hasPresentedViewController else {
+    return false
+  }
+  return true
+}
+
+func tmuxChatsEdgeSwipeShouldPresentChats(
+  translationX: Double,
+  translationY: Double,
+  velocityX: Double
+) -> Bool {
+  let minDistance = 56.0
+  let maxVerticalDrift = 80.0
+  let minVelocity = 700.0
+
+  guard translationX > 0 else {
+    return false
+  }
+  guard abs(translationY) <= maxVerticalDrift else {
+    return false
+  }
+  if translationX >= minDistance {
+    return true
+  }
+  return velocityX >= minVelocity
+}
+
 struct TmuxPaneInboxItem: Equatable {
   let hostAlias: String
   let hostName: String
@@ -1807,6 +1940,7 @@ struct TmuxPaneInboxItem: Equatable {
   let currentPath: String
   let active: Bool
   let paneActivity: Int64
+  let lastMessageTs: Int64
   let currentCommand: String
   let previewText: String
   let hasUnreadNotification: Bool
@@ -1906,6 +2040,7 @@ fileprivate func tmuxPaneInboxFlattenPanes(
             currentPath: pane.currentPath,
             active: pane.active,
             paneActivity: pane.paneActivity,
+            lastMessageTs: max(pane.lastMessageTs ?? pane.paneActivity, 0),
             currentCommand: pane.currentCommand,
             previewText: pane.previewText,
             hasUnreadNotification: pane.hasUnreadNotification
@@ -1920,6 +2055,9 @@ fileprivate func tmuxPaneInboxFlattenPanes(
 
 func tmuxPaneInboxSortPanesByRecentActivity(_ panes: [TmuxPaneInboxItem]) -> [TmuxPaneInboxItem] {
   panes.sorted { lhs, rhs in
+    if lhs.lastMessageTs != rhs.lastMessageTs {
+      return lhs.lastMessageTs > rhs.lastMessageTs
+    }
     if lhs.paneActivity != rhs.paneActivity {
       return lhs.paneActivity > rhs.paneActivity
     }
@@ -2268,6 +2406,7 @@ fileprivate struct TmuxControlPane: Decodable {
   let target: String
   let currentPath: String
   let paneActivity: Int64
+  let lastMessageTs: Int64?
   let currentCommand: String
   let previewText: String
   let hasUnreadNotification: Bool
@@ -2278,6 +2417,7 @@ fileprivate struct TmuxControlPane: Decodable {
     case target
     case currentPath = "current_path"
     case paneActivity = "pane_activity"
+    case lastMessageTs = "last_message_ts"
     case currentCommand = "current_command"
     case previewText = "preview_text"
     case hasUnreadNotification = "has_unread_notification"
