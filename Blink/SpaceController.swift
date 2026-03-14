@@ -2612,7 +2612,9 @@ fileprivate enum TmuxControlPlaneClient {
 
     let payload = _decodeAPIErrorResponse(from: result.data)
     let code = payload?.code?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let detail = payload?.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let detail = payload?.error
+      .map { _sanitizeAPIErrorDetail($0) }
+      .flatMap { $0.isEmpty ? nil : $0 }
     let missingCapabilities = payload?.missingCapabilities ?? []
     let fallbackBodySnippet = _sanitizedBodySnippet(from: result.data)
 
@@ -2732,6 +2734,34 @@ fileprivate enum TmuxControlPlaneClient {
     return String(cleaned[..<end]) + "…"
   }
 
+  private static func _sanitizeAPIErrorDetail(_ raw: String, maxLength: Int = 320) -> String {
+    let collapsed = raw
+      .components(separatedBy: .newlines)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
+
+    guard !collapsed.isEmpty else {
+      return ""
+    }
+
+    let withoutLineDump = collapsed.replacingOccurrences(
+      of: #"(?i)\s+line=`[^`]*`"#,
+      with: "",
+      options: .regularExpression
+    )
+    let normalizedSeparators = withoutLineDump.replacingOccurrences(of: "\\037", with: "|")
+    let cleaned = normalizedSeparators
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if cleaned.count <= maxLength {
+      return cleaned
+    }
+    let end = cleaned.index(cleaned.startIndex, offsetBy: maxLength)
+    return String(cleaned[..<end]) + "…"
+  }
+
   private static func _classifySessionsRuntimeIncompatibility(
     statusCode: Int,
     hostAlias: String,
@@ -2739,7 +2769,9 @@ fileprivate enum TmuxControlPlaneClient {
   ) -> TmuxControlError? {
     let payload = _decodeAPIErrorResponse(from: data)
     let code = payload?.code?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-    let detail = payload?.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let detail = payload?.error
+      .map { _sanitizeAPIErrorDetail($0) }
+      .flatMap { $0.isEmpty ? nil : $0 }
     let missing = payload?.missingCapabilities ?? []
     let detailLower = detail?.lowercased() ?? ""
 

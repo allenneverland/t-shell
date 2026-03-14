@@ -4,6 +4,8 @@ use std::process::Command;
 use crate::tmux::TmuxError;
 
 const PANE_ROW_SEPARATOR: char = '\u{1f}';
+const PANE_ROW_SEPARATOR_ESCAPED: &str = r"\037";
+const PANE_ROW_FIELD_COUNT: usize = 10;
 const LIST_PANES_FORMAT: &str = "#{session_name}\u{1f}#{session_attached}\u{1f}#{window_index}\u{1f}#{window_name}\u{1f}#{window_active}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_activity}\u{1f}#{pane_current_command}";
 
 #[derive(Debug, Serialize)]
@@ -46,6 +48,23 @@ struct ParsedPaneRow {
     current_command: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PaneRowSeparatorKind {
+    UnitSeparator,
+    EscapedOctal,
+    Unknown,
+}
+
+impl PaneRowSeparatorKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnitSeparator => "unit_separator_u001f",
+            Self::EscapedOctal => "escaped_octal_\\037",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 fn parse_session_attached(value: &str) -> bool {
     value.parse::<u32>().map(|count| count > 0).unwrap_or(false)
 }
@@ -64,34 +83,92 @@ fn parse_pane_activity(value: &str) -> Result<i64, TmuxError> {
             };
         }
 
-        TmuxError::PayloadParse {
-            detail: format!("pane_activity is not numeric in tmux sessions payload: `{trimmed}`"),
-        }
+        payload_parse_error(format!(
+            "pane_activity is not numeric in tmux sessions payload (value=`{}`)",
+            payload_value_excerpt(trimmed)
+        ))
     })
 }
 
-fn payload_parse_error(line: &str, message: &str) -> TmuxError {
-    let normalized = line.replace(PANE_ROW_SEPARATOR, "|");
-    let excerpt = normalized.chars().take(180).collect::<String>();
+fn payload_parse_error(detail: impl Into<String>) -> TmuxError {
     TmuxError::PayloadParse {
-        detail: format!("{message}. line=`{excerpt}`"),
+        detail: detail.into(),
     }
 }
 
-fn parse_u32_field(raw: &str, field: &str, line: &str) -> Result<u32, TmuxError> {
-    raw.trim()
-        .parse::<u32>()
-        .map_err(|_| payload_parse_error(line, format!("invalid `{field}` value").as_str()))
+fn payload_value_excerpt(value: &str) -> String {
+    let clean = sanitize_preview_line(value);
+    if clean.is_empty() {
+        return "(empty)".to_string();
+    }
+    truncate_preview_text(&clean, 64)
 }
 
-fn parse_bool_flag_field(raw: &str, field: &str, line: &str) -> Result<bool, TmuxError> {
+fn payload_row_log_excerpt(line: &str) -> String {
+    let normalized = line
+        .replace(PANE_ROW_SEPARATOR, "|")
+        .replace(PANE_ROW_SEPARATOR_ESCAPED, "|");
+    let clean = sanitize_preview_line(&normalized);
+    if clean.is_empty() {
+        return "(empty)".to_string();
+    }
+    truncate_preview_text(&clean, 220)
+}
+
+fn split_pane_row(line: &str) -> (PaneRowSeparatorKind, Vec<&str>) {
+    if line.contains(PANE_ROW_SEPARATOR) {
+        return (
+            PaneRowSeparatorKind::UnitSeparator,
+            line.splitn(PANE_ROW_FIELD_COUNT, PANE_ROW_SEPARATOR)
+                .collect(),
+        );
+    }
+    if line.contains(PANE_ROW_SEPARATOR_ESCAPED) {
+        return (
+            PaneRowSeparatorKind::EscapedOctal,
+            line.splitn(PANE_ROW_FIELD_COUNT, PANE_ROW_SEPARATOR_ESCAPED)
+                .collect(),
+        );
+    }
+    (PaneRowSeparatorKind::Unknown, vec![line])
+}
+
+fn payload_parse_field_count_error(
+    line: &str,
+    separator: PaneRowSeparatorKind,
+    got: usize,
+) -> TmuxError {
+    tracing::warn!(
+        separator = separator.label(),
+        expected_fields = PANE_ROW_FIELD_COUNT,
+        got_fields = got,
+        row_excerpt = %payload_row_log_excerpt(line),
+        "tmux sessions payload parse failed due to field count mismatch"
+    );
+    payload_parse_error(format!(
+        "unexpected tmux sessions payload field count (expected {expected}, got {got}; separator={separator})",
+        expected = PANE_ROW_FIELD_COUNT,
+        separator = separator.label(),
+    ))
+}
+
+fn parse_u32_field(raw: &str, field: &str) -> Result<u32, TmuxError> {
+    raw.trim().parse::<u32>().map_err(|_| {
+        payload_parse_error(format!(
+            "invalid `{field}` value in tmux sessions payload (value=`{}`)",
+            payload_value_excerpt(raw)
+        ))
+    })
+}
+
+fn parse_bool_flag_field(raw: &str, field: &str) -> Result<bool, TmuxError> {
     match raw.trim() {
         "0" => Ok(false),
         "1" => Ok(true),
-        _ => Err(payload_parse_error(
-            line,
-            format!("invalid `{field}` flag value").as_str(),
-        )),
+        _ => Err(payload_parse_error(format!(
+            "invalid `{field}` flag value in tmux sessions payload (value=`{}`)",
+            payload_value_excerpt(raw)
+        ))),
     }
 }
 
@@ -100,22 +177,23 @@ fn parse_pane_row(line: &str) -> Result<Option<ParsedPaneRow>, TmuxError> {
         return Ok(None);
     }
 
-    let parts: Vec<&str> = line.splitn(10, PANE_ROW_SEPARATOR).collect();
-    if parts.len() != 10 {
-        return Err(payload_parse_error(
+    let (separator, parts) = split_pane_row(line);
+    if parts.len() != PANE_ROW_FIELD_COUNT {
+        return Err(payload_parse_field_count_error(
             line,
-            "unexpected tmux sessions payload field count",
+            separator,
+            parts.len(),
         ));
     }
 
     Ok(Some(ParsedPaneRow {
         session_name: parts[0].to_string(),
         session_attached: parse_session_attached(parts[1]),
-        window_index: parse_u32_field(parts[2], "window_index", line)?,
+        window_index: parse_u32_field(parts[2], "window_index")?,
         window_name: parts[3].to_string(),
-        window_active: parse_bool_flag_field(parts[4], "window_active", line)?,
-        pane_index: parse_u32_field(parts[5], "pane_index", line)?,
-        pane_active: parse_bool_flag_field(parts[6], "pane_active", line)?,
+        window_active: parse_bool_flag_field(parts[4], "window_active")?,
+        pane_index: parse_u32_field(parts[5], "pane_index")?,
+        pane_active: parse_bool_flag_field(parts[6], "pane_active")?,
         current_path: parts[7].to_string(),
         pane_activity: parse_pane_activity(parts[8])?,
         current_command: parts[9].trim().to_string(),
@@ -294,6 +372,7 @@ mod tests {
     use super::{
         infer_missing_capabilities_from_error, parse_pane_activity, parse_pane_row,
         parse_session_attached, sanitize_preview_line, truncate_preview_text, PANE_ROW_SEPARATOR,
+        PANE_ROW_SEPARATOR_ESCAPED,
     };
     use crate::tmux::TmuxError;
 
@@ -371,6 +450,41 @@ mod tests {
         match error {
             TmuxError::PayloadParse { detail } => {
                 assert!(detail.contains("field count"));
+                assert!(detail.contains("expected 10"));
+                assert!(detail.contains("got 3"));
+            }
+            _ => panic!("expected payload parse error"),
+        }
+    }
+
+    #[test]
+    fn parse_pane_row_supports_escaped_octal_separator_payload() {
+        let line = format!(
+            "work{sep}1{sep}2{sep}dev{sep}1{sep}3{sep}0{sep}/tmp/a{sep}1719000000{sep}bash -lc 'echo ok'",
+            sep = PANE_ROW_SEPARATOR_ESCAPED
+        );
+        let parsed = parse_pane_row(&line)
+            .expect("parse should succeed")
+            .expect("parsed row should exist");
+        assert_eq!(parsed.session_name, "work");
+        assert_eq!(parsed.window_index, 2);
+        assert_eq!(parsed.pane_index, 3);
+        assert_eq!(parsed.current_command, "bash -lc 'echo ok'");
+    }
+
+    #[test]
+    fn parse_pane_row_field_count_error_does_not_embed_raw_line_payload() {
+        let line = format!(
+            "work{sep}1{sep}2{sep}dev{sep}1{sep}3{sep}0{sep}/tmp/a",
+            sep = PANE_ROW_SEPARATOR_ESCAPED
+        );
+        let error = parse_pane_row(&line).unwrap_err();
+        match error {
+            TmuxError::PayloadParse { detail } => {
+                assert!(detail.contains("field count"));
+                assert!(detail.contains("separator=escaped_octal_\\037"));
+                assert!(!detail.contains("line=`"));
+                assert!(!detail.contains("/tmp/a"));
             }
             _ => panic!("expected payload parse error"),
         }

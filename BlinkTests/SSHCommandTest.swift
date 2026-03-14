@@ -149,6 +149,22 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
     XCTAssertFalse(message?.localizedCaseInsensitiveContains("runtime is incompatible") ?? true)
   }
 
+  func testSessionsPayloadParseDetailStripsRawLineDumpNoise() {
+    let payload = """
+    {"code":"sessions_payload_parse_error","error":"unexpected tmux sessions payload field count (expected 10, got 8; separator=escaped_octal_\\\\037). line=`73\\\\0371\\\\0371\\\\037bash\\\\037/home/allen/project`"}
+    """
+    let message = tmuxControlSessionsErrorMessageForTesting(
+      statusCode: 500,
+      hostAlias: "allen",
+      payload: payload
+    )
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("sessions_payload_parse_error") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("expected 10, got 8") ?? false)
+    XCTAssertFalse(message?.contains("line=`") ?? true)
+    XCTAssertFalse(message?.contains("\\037") ?? true)
+  }
+
   func testSessionsUnknown500ErrorShowsStructuredCodeAndDetail() {
     let payload = """
     {"code":"tmux_error","error":"tmux command failed: failed to read socket"}
