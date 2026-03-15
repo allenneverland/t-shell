@@ -1046,7 +1046,8 @@ const TMUX_BELL_BODY: &str = "tmux bell";
 
 struct TmuxBellHookSpec {
     notify_shell_command: String,
-    hook_command: String,
+    runtime_hook_command: String,
+    persistent_hook_line: String,
 }
 
 fn install_tmux_bell_hook() -> Result<(), String> {
@@ -1065,8 +1066,8 @@ fn install_tmux_bell_hook() -> Result<(), String> {
 
     let hook_spec = build_tmux_bell_hook_spec(&binary);
     let managed = format!(
-        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\nset-hook -g alert-bell {}\n{TMUX_MANAGED_END}\n",
-        hook_spec.hook_command
+        "{TMUX_MANAGED_START}\nset-window-option -g monitor-bell on\nset-option -g bell-action any\n{}\n{TMUX_MANAGED_END}\n",
+        hook_spec.persistent_hook_line
     );
 
     let updated = upsert_managed_tmux_block(&existing, &managed);
@@ -1076,7 +1077,7 @@ fn install_tmux_bell_hook() -> Result<(), String> {
         println!("Updated {}", tmux_conf.display());
     }
 
-    match apply_runtime_tmux_bell_hook(&hook_spec.hook_command)? {
+    match apply_runtime_tmux_bell_hook(&hook_spec.runtime_hook_command)? {
         RuntimeApplyResult::Applied => {
             println!("Applied tmux alert-bell runtime hook");
         }
@@ -1126,7 +1127,8 @@ fn uninstall_tmux_bell_hook() -> Result<(), String> {
 
 fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport {
     let hook_spec = build_tmux_bell_hook_spec(binary);
-    let expected_fragment = hook_spec.hook_command.clone();
+    let expected_line = hook_spec.persistent_hook_line.clone();
+    let legacy_line = format!("set-hook -g alert-bell {}", hook_spec.runtime_hook_command);
     let mut reasons = Vec::new();
     let mut warnings = Vec::new();
     let mut runtime_probe_reason_codes = Vec::new();
@@ -1155,7 +1157,11 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
             Ok(contents) => {
                 if let Some((start, end)) = managed_tmux_block_range(&contents) {
                     let block = &contents[start..end];
-                    if !block.contains("set-hook -g alert-bell") {
+                    let hook_line = block
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| line.starts_with("set-hook -g alert-bell "));
+                    if hook_line.is_none() {
                         reasons.push(
                             "managed tmux block is present but alert-bell hook line is missing"
                                 .to_string(),
@@ -1167,9 +1173,15 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
                                 .to_string(),
                         );
                         false
-                    } else if !block.contains(expected_fragment.as_str()) {
+                    } else if hook_line == Some(legacy_line.as_str()) {
                         reasons.push(
-                            "managed tmux block exists but hook command does not match current tmuxd binary path or escaping format"
+                            "managed tmux block uses legacy alert-bell hook quoting that breaks `tmux source-file` with `set-hook: too many arguments`"
+                                .to_string(),
+                        );
+                        false
+                    } else if hook_line != Some(expected_line.as_str()) {
+                        reasons.push(
+                            "managed tmux block exists but alert-bell hook line does not match current tmuxd binary path or escaping format"
                                 .to_string(),
                         );
                         false
@@ -1252,7 +1264,7 @@ fn verify_tmux_bell_hook(binary: &str, probe_runtime: bool) -> HookVerifyReport 
     let mut runtime_probe_raw_bel_ok = !probe_runtime;
     if probe_runtime && runtime_server_present {
         runtime_probe_performed = true;
-        let probe = execute_runtime_tmux_bell_probe(&hook_spec.hook_command);
+        let probe = execute_runtime_tmux_bell_probe(&hook_spec.runtime_hook_command);
         runtime_probe_hook_ok = probe.hook_ok;
         runtime_probe_raw_bel_ok = probe.raw_bel_ok;
         for code in probe.reason_codes {
@@ -1869,14 +1881,33 @@ fn build_tmux_bell_notify_command(binary: &str) -> String {
 
 fn build_tmux_bell_hook_spec(binary: &str) -> TmuxBellHookSpec {
     let notify_shell_command = build_tmux_bell_notify_command(binary);
-    let hook_command = format!(
+    let runtime_hook_command = format!(
         "run-shell -b {}",
         shell_escape_single_quoted(&notify_shell_command)
     );
+    let persistent_hook_line = format!(
+        "set-hook -g alert-bell {}",
+        tmux_escape_double_quoted_argument(&runtime_hook_command)
+    );
     TmuxBellHookSpec {
         notify_shell_command,
-        hook_command,
+        runtime_hook_command,
+        persistent_hook_line,
     }
+}
+
+fn tmux_escape_double_quoted_argument(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len() + 2);
+    escaped.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn shell_escape_double_quoted(raw: &str) -> String {
@@ -1904,7 +1935,8 @@ fn shell_escape_single_quoted(raw: &str) -> String {
 mod tests {
     use super::{
         build_tmux_bell_hook_spec, build_tmux_bell_notify_command, is_tmux_no_server_output,
-        push_unique, resolve_notify_port, wait_for_file_marker, TMUX_BELL_TARGET_FORMAT,
+        push_unique, resolve_notify_port, tmux_escape_double_quoted_argument, wait_for_file_marker,
+        TMUX_BELL_TARGET_FORMAT,
     };
     use std::fs;
     use std::path::Path;
@@ -1932,9 +1964,28 @@ mod tests {
     #[test]
     fn bell_hook_command_uses_single_quoted_run_shell_payload() {
         let spec = build_tmux_bell_hook_spec("/home/allen/.local/bin/tmuxd");
-        assert!(spec.hook_command.starts_with("run-shell -b '"));
-        assert!(spec.hook_command.contains("notify --source bell"));
-        assert!(!spec.hook_command.contains("run-shell -b \"\""));
+        assert!(spec.runtime_hook_command.starts_with("run-shell -b '"));
+        assert!(spec.runtime_hook_command.contains("notify --source bell"));
+        assert!(!spec.runtime_hook_command.contains("run-shell -b \"\""));
+    }
+
+    #[test]
+    fn bell_hook_persistent_line_wraps_command_as_single_set_hook_argument() {
+        let spec = build_tmux_bell_hook_spec("/home/allen/.local/bin/tmuxd");
+        assert!(spec
+            .persistent_hook_line
+            .starts_with("set-hook -g alert-bell \""));
+        assert!(spec.persistent_hook_line.contains("notify --source bell"));
+        assert!(spec.persistent_hook_line.contains("run-shell -b '"));
+        assert!(!spec
+            .persistent_hook_line
+            .contains("set-hook -g alert-bell run-shell -b"));
+    }
+
+    #[test]
+    fn tmux_escape_double_quoted_argument_escapes_inner_quotes_and_backslashes() {
+        let escaped = tmux_escape_double_quoted_argument("run-shell -b \"a\\b\"");
+        assert_eq!(escaped, "\"run-shell -b \\\"a\\\\b\\\"\"");
     }
 
     #[test]
@@ -2045,7 +2096,12 @@ mod tests {
         let set_hook = run_tmux_with_tmpdir(
             &tmux_tmpdir,
             &socket,
-            &["set-hook", "-g", "alert-bell", spec.hook_command.as_str()],
+            &[
+                "set-hook",
+                "-g",
+                "alert-bell",
+                spec.runtime_hook_command.as_str(),
+            ],
         );
         if !set_hook.status.success() {
             let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
@@ -2056,9 +2112,31 @@ mod tests {
             );
         }
 
+        let source_conf_path = tmux_tmpdir.join("tmuxd-generated-hook.conf");
+        fs::write(
+            &source_conf_path,
+            format!("{}\n", spec.persistent_hook_line),
+        )
+        .expect("write generated tmux hook config");
+        let source_config = run_tmux_with_tmpdir(
+            &tmux_tmpdir,
+            &socket,
+            &["source-file", source_conf_path.to_string_lossy().as_ref()],
+        );
+        if !source_config.status.success() {
+            let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
+            panic!(
+                "generated persistent hook line rejected by tmux {}: {}",
+                String::from_utf8_lossy(&tmux_version.stdout).trim(),
+                format_output(&source_config)
+            );
+        }
+
         let show_hooks =
             run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["show-hooks", "-g", "alert-bell"]);
+        let _ = fs::remove_file(source_conf_path);
         let _ = run_tmux_with_tmpdir(&tmux_tmpdir, &socket, &["kill-server"]);
+        let _ = fs::remove_dir_all(&tmux_tmpdir);
         assert!(
             show_hooks.status.success(),
             "show-hooks failed: {}",
