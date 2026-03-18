@@ -46,7 +46,6 @@ extern const BlinkActionID BlinkActionChangeLayout;
 extern const BlinkActionID BlinkActionToggleLayoutLock;
 extern const BlinkActionID BlinkActionToggleGeoTrack;
 extern const BlinkActionID BlinkActionToggleCompactActions;
-extern const BlinkActionID BlinkActionTmux;
 
 extern NSString * BLINK_ACTION_TOGGLE_PREFIX;
 typedef NSString * BlinkActionAppearance NS_TYPED_EXTENSIBLE_ENUM;

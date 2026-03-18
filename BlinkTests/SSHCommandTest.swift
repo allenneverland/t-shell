@@ -351,6 +351,128 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
   }
 }
 
+final class TmuxManagedShellVisibilityTests: XCTestCase {
+  func testManagedShellVisibilityRequiresManagedKeyToBeCurrentAndTracked() {
+    let managedKey = UUID()
+    let otherKey = UUID()
+
+    XCTAssertTrue(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: managedKey,
+        currentTerminalKey: managedKey,
+        viewportKeys: [managedKey],
+        hasActiveRoute: true
+      )
+    )
+    XCTAssertFalse(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: managedKey,
+        currentTerminalKey: otherKey,
+        viewportKeys: [managedKey],
+        hasActiveRoute: true
+      )
+    )
+    XCTAssertFalse(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: managedKey,
+        currentTerminalKey: managedKey,
+        viewportKeys: [otherKey],
+        hasActiveRoute: true
+      )
+    )
+  }
+
+  func testManagedShellVisibilityAllowsRestoreFallbackForSingleShell() {
+    let onlyShellKey = UUID()
+
+    XCTAssertTrue(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: nil,
+        currentTerminalKey: onlyShellKey,
+        viewportKeys: [onlyShellKey],
+        hasActiveRoute: true
+      )
+    )
+    XCTAssertFalse(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: nil,
+        currentTerminalKey: onlyShellKey,
+        viewportKeys: [onlyShellKey, UUID()],
+        hasActiveRoute: true
+      )
+    )
+    XCTAssertFalse(
+      tmuxManagedShellIsVisible(
+        managedTerminalKey: nil,
+        currentTerminalKey: onlyShellKey,
+        viewportKeys: [onlyShellKey],
+        hasActiveRoute: false
+      )
+    )
+  }
+}
+
+final class TmuxPaneBridgeRestoreStateTests: XCTestCase {
+  func testRestoreStateCanonicalizesRequestAndResetsTransientFields() {
+    let managedKey = UUID()
+    let state = TmuxPaneBridgePersistedState(
+      request: TmuxNotificationRequest(hostAlias: "raw", sessionName: "dev", paneTarget: "dev:1.1"),
+      managedTabKey: managedKey,
+      retryAttempt: 3,
+      lastFailureReason: "old error"
+    )
+    let canonicalRequest = TmuxNotificationRequest(hostAlias: "canonical", sessionName: "dev", paneTarget: "dev:1.1")
+
+    let restored = tmuxPaneBridgeRestoredState(
+      state,
+      canonicalizeRequest: { _ in canonicalRequest },
+      isTerminalKeyAvailable: { key in key == managedKey }
+    )
+
+    XCTAssertEqual(restored?.request, canonicalRequest)
+    XCTAssertEqual(restored?.managedTabKey, managedKey)
+    XCTAssertEqual(restored?.retryAttempt, 0)
+    XCTAssertNil(restored?.lastFailureReason)
+  }
+
+  func testRestoreStateClearsManagedKeyWhenTerminalNoLongerExists() {
+    let state = TmuxPaneBridgePersistedState(
+      request: TmuxNotificationRequest(hostAlias: "raw", sessionName: "dev", paneTarget: "dev:1.1"),
+      managedTabKey: UUID(),
+      retryAttempt: 1,
+      lastFailureReason: "stale"
+    )
+
+    let restored = tmuxPaneBridgeRestoredState(
+      state,
+      canonicalizeRequest: { $0 },
+      isTerminalKeyAvailable: { _ in false }
+    )
+
+    XCTAssertNotNil(restored)
+    XCTAssertNil(restored?.managedTabKey)
+    XCTAssertEqual(restored?.retryAttempt, 0)
+    XCTAssertNil(restored?.lastFailureReason)
+  }
+
+  func testRestoreStateDropsInvalidRequest() {
+    let state = TmuxPaneBridgePersistedState(
+      request: TmuxNotificationRequest(hostAlias: "raw", sessionName: "dev", paneTarget: "dev:1.1"),
+      managedTabKey: nil,
+      retryAttempt: 1,
+      lastFailureReason: "stale"
+    )
+
+    let restored = tmuxPaneBridgeRestoredState(
+      state,
+      canonicalizeRequest: { _ in nil },
+      isTerminalKeyAvailable: { _ in true }
+    )
+
+    XCTAssertNil(restored)
+  }
+}
+
 final class TmuxTerminalPagingDisableTests: XCTestCase {
   func testPagingCommandsAreDisabled() {
     let disabled: [Command] = [
