@@ -478,7 +478,9 @@ final class TmuxPassthroughUnwrapper {
           state = .plain
         } else if byte == Self.escape {
           buffer.append(Self.escape)
-          state = .dcs(buffer: buffer, sawEscape: true)
+          // ESC ESC encodes a literal ESC in DCS payload. Once consumed,
+          // the next byte should be parsed as normal payload content.
+          state = .dcs(buffer: buffer, sawEscape: false)
         } else {
           buffer.append(Self.escape)
           buffer.append(byte)
@@ -515,6 +517,27 @@ final class TmuxPassthroughUnwrapper {
     while current.starts(with: Self.tmuxPrefix) {
       current.removeFirst(Self.tmuxPrefix.count)
       current = _undoubleEscapes(current)
+
+      // Nested passthrough can remain wrapped as:
+      // ESC P tmux;... ESC \
+      // Strip the DCS envelope only when the inner body is still tmux-prefixed.
+      guard current.count >= 4 else {
+        continue
+      }
+      guard
+        current[0] == Self.escape,
+        current[1] == Self.dcsStart,
+        current[current.count - 2] == Self.escape,
+        current[current.count - 1] == Self.stringTerminator
+      else {
+        continue
+      }
+
+      let nestedBody = Array(current[2..<(current.count - 2)])
+      guard nestedBody.starts(with: Self.tmuxPrefix) else {
+        continue
+      }
+      current = nestedBody
     }
     return current
   }
@@ -1105,6 +1128,9 @@ private final class TmuxControlModeInputBridge: WriterTo {
   private var connectCancellable: AnyCancellable?
   private var writeCancellables: [AnyCancellable] = []
   private var didSendInitialRefresh = false
+  private var lifecycleRequest: TmuxNotificationRequest?
+  private var didSendConnectedLifecycleEvent = false
+  private var didSendTerminalLifecycleEvent = false
 
   init(mcp: MCPSession) {
     self.mcp = mcp
@@ -1135,14 +1161,35 @@ private final class TmuxControlModeInputBridge: WriterTo {
       return -1
     }
 
+    let requestedSession = request.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
+    lifecycleRequest = TmuxNotificationRequest(
+      hostAlias: cleanHost,
+      sessionName: requestedSession?.isEmpty == true ? nil : requestedSession,
+      paneTarget: cleanPane
+    )
+    didSendConnectedLifecycleEvent = false
+    didSendTerminalLifecycleEvent = false
+
     let inferredSession = cleanPane.components(separatedBy: ":").first?.trimmingCharacters(in: .whitespacesAndNewlines)
     let cleanSession = request.sessionName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
       ? request.sessionName!.trimmingCharacters(in: .whitespacesAndNewlines)
       : (inferredSession ?? "")
     guard !cleanSession.isEmpty else {
       print(TmuxPaneBridgeError.missingSessionName.localizedDescription, to: &stderr)
+      _emitLifecycleEvent(
+        .failed,
+        reason: TmuxPaneBridgeError.missingSessionName.localizedDescription,
+        terminal: true
+      )
       return -1
     }
+
+    lifecycleRequest = TmuxNotificationRequest(
+      hostAlias: cleanHost,
+      sessionName: cleanSession,
+      paneTarget: cleanPane
+    )
+    _emitLifecycleEvent(.starting)
 
     let hostName: String
     let config: SSHClientConfig
@@ -1152,7 +1199,9 @@ private final class TmuxControlModeInputBridge: WriterTo {
       hostName = host.hostName ?? cleanHost
       config = try SSHClientConfigProvider.config(host: host, using: device)
     } catch {
-      print("Configuration error - \(error)", to: &stderr)
+      let reason = "Configuration error - \(error)"
+      print(reason, to: &stderr)
+      _emitLifecycleEvent(.failed, reason: reason, terminal: true)
       return -1
     }
 
@@ -1179,7 +1228,9 @@ private final class TmuxControlModeInputBridge: WriterTo {
 
         conn.handleSessionException = { [weak self] error in
           guard let self else { return }
-          print("SSH session exception: \(error)", to: &self.stderr)
+          let reason = "SSH session exception: \(error)"
+          print(reason, to: &self.stderr)
+          self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
           self.exitCode = -1
           self.kill()
         }
@@ -1210,7 +1261,9 @@ private final class TmuxControlModeInputBridge: WriterTo {
           guard let self else { return }
           switch completion {
           case .failure(let error):
-            print("Error connecting tmux pane bridge. \(error)", to: &self.stderr)
+            let reason = "Error connecting tmux pane bridge. \(error)"
+            print(reason, to: &self.stderr)
+            self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
             self.exitCode = -1
             self.kill()
           case .finished:
@@ -1266,6 +1319,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
           stdoutFD: self.outstream,
           stderrFD: self.errstream,
           onControlReady: { [weak self] in
+            self?._emitLifecycleEvent(.connected)
             self?._sendInitialRefreshIfNeeded()
           }
         )
@@ -1278,7 +1332,9 @@ private final class TmuxControlModeInputBridge: WriterTo {
         stream.handleFailure = { [weak self] error in
           guard let self else { return }
           outputBridge.flushPendingLine()
-          print("Tmux pane bridge failed. \(error)", to: &self.stderr)
+          let reason = "Tmux pane bridge failed. \(error)"
+          print(reason, to: &self.stderr)
+          self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
           self.exitCode = -1
           self.kill()
         }
@@ -1288,7 +1344,11 @@ private final class TmuxControlModeInputBridge: WriterTo {
           let status = stream?.exitStatus ?? 0
           if status != 0 {
             self.exitCode = -1
-            print("Tmux pane bridge exited with status \(status) for \(sessionName) \(paneTarget).", to: &self.stderr)
+            let reason = "Tmux pane bridge exited with status \(status) for \(sessionName) \(paneTarget)."
+            print(reason, to: &self.stderr)
+            self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
+          } else {
+            self._emitLifecycleEvent(.disconnected, terminal: true)
           }
           self.kill()
         }
@@ -1385,6 +1445,46 @@ private final class TmuxControlModeInputBridge: WriterTo {
     connectCancellable = nil
     connection = nil
     didSendInitialRefresh = false
+    lifecycleRequest = nil
+    didSendConnectedLifecycleEvent = false
+    didSendTerminalLifecycleEvent = false
+  }
+
+  private func _emitLifecycleEvent(
+    _ event: TmuxPaneBridgeLifecycleEvent,
+    reason: String? = nil,
+    terminal: Bool = false
+  ) {
+    guard let request = lifecycleRequest else {
+      return
+    }
+    if event == .connected {
+      guard !didSendConnectedLifecycleEvent else {
+        return
+      }
+      didSendConnectedLifecycleEvent = true
+    }
+    if terminal {
+      guard !didSendTerminalLifecycleEvent else {
+        return
+      }
+      didSendTerminalLifecycleEvent = true
+    }
+
+    let cleanReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(
+        name: .BLKTmuxPaneBridgeLifecycle,
+        object: nil,
+        userInfo: [
+          TmuxPaneBridgeLifecycleUserInfoKey.event: event.rawValue,
+          TmuxPaneBridgeLifecycleUserInfoKey.hostAlias: request.hostAlias,
+          TmuxPaneBridgeLifecycleUserInfoKey.sessionName: request.sessionName ?? "",
+          TmuxPaneBridgeLifecycleUserInfoKey.paneTarget: request.paneTarget,
+          TmuxPaneBridgeLifecycleUserInfoKey.reason: cleanReason ?? ""
+        ]
+      )
+    }
   }
 
   private func awaitRunLoop() {

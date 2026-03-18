@@ -45,6 +45,7 @@ class SpaceController: UIViewController {
     var keys: [UUID] = []
     var currentKey: UUID? = nil
     var bgColor: CodableColor? = nil
+    var tmuxBridgeState: TmuxPaneBridgePersistedState? = nil
     
     static var activityType: String { "space.ctrl.ui.state" }
   }
@@ -73,6 +74,20 @@ class SpaceController: UIViewController {
   private var _tmuxChatsEdgePanRecognizer: UIScreenEdgePanGestureRecognizer? = nil
   private var _didPresentInitialTmuxPaneInbox: Bool = false
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
+  private var _restoredTmuxBridgeState: TmuxPaneBridgePersistedState? = nil
+  private var _tmuxWorkspaceState: TmuxWorkspaceState = .inbox
+  private lazy var _tmuxPaneRouteCoordinator = TmuxPaneRouteCoordinator(spaceController: self)
+
+  private var _tmuxStrictModeEnabled: Bool {
+    sceneRole == .windowApplication
+  }
+
+  private var _isTmuxPaneActive: Bool {
+    if case .paneActive = _tmuxWorkspaceState {
+      return true
+    }
+    return false
+  }
   
   var safeFrame: CGRect {
     _overlay.frame
@@ -213,6 +228,8 @@ class SpaceController: UIViewController {
     view.addSubview(_overlay)
     
     _registerForNotifications()
+    _tmuxPaneRouteCoordinator.restore(state: _restoredTmuxBridgeState)
+    _tmuxWorkspaceState = .inbox
     
     if let key = _currentKey ?? _viewportsKeys.first {
       let term: TermController = SessionRegistry.shared[key]
@@ -316,6 +333,7 @@ Please go to your subscriptions and cancel one of them!
         _ = ctrl.removeFromContainer()
       }
     }
+    _tmuxPaneRouteCoordinator.onSceneDidEnterBackground(scene: scene)
   }
   
   @objc func _UISceneWillEnterForegroundNotification(_ n: Notification) {
@@ -353,6 +371,7 @@ Please go to your subscriptions and cancel one of them!
     }
    
     currentTerm()?.resumeIfNeeded()
+    _tmuxPaneRouteCoordinator.onSceneWillEnterForeground(scene: scene)
    
     #if targetEnvironment(macCatalyst)
     #else
@@ -375,11 +394,19 @@ Please go to your subscriptions and cancel one of them!
     _focusOnShell()
   }
   
-  func _createShell(
+  fileprivate func _createShell(
     userActivity: NSUserActivity?,
     animated: Bool,
+    source: TmuxShellCreationSource = .userInitiated,
     completion: ((Bool) -> Void)? = nil)
   {
+    if _tmuxStrictModeEnabled && source == .userInitiated {
+      _tmuxWorkspaceState = .inbox
+      _presentTmuxPaneInbox(animated: true)
+      completion?(false)
+      return
+    }
+
     let term = TermController(sceneRole: sceneRole)
     term.delegate = self
     term.userActivity = userActivity
@@ -418,8 +445,9 @@ Please go to your subscriptions and cancel one of them!
     currentTerm()?.delegate = nil
     SessionRegistry.shared.remove(forKey: currentKey)
     _viewportsKeys.remove(at: idx)
+    _tmuxPaneRouteCoordinator.onTerminalKeyRemoved(currentKey)
     if _viewportsKeys.isEmpty {
-      _createShell(userActivity: nil, animated: true)
+      _createShell(userActivity: nil, animated: true, source: .tmuxManaged)
       return
     }
 
@@ -476,6 +504,7 @@ Please go to your subscriptions and cancel one of them!
       isWindowApplicationScene: sceneRole == .windowApplication,
       isSpaceControllerAnimating: _spaceControllerAnimating,
       hasPresentedViewController: presentedViewController != nil,
+      isTmuxPaneActive: _tmuxPaneRouteCoordinator.hasActiveRoute || _isTmuxPaneActive,
       isTmuxChatsPresented: _isPresentingTmuxPaneInbox
     )
   }
@@ -500,7 +529,95 @@ Please go to your subscriptions and cancel one of them!
     ) else {
       return
     }
-    _presentTmuxPaneInbox(animated: true)
+    _returnToTmuxPaneInbox(animated: true)
+  }
+
+  private func _presentTmuxAlert(_ message: String) {
+    let cleanMessage = message.blink_trimmed
+    guard !cleanMessage.isEmpty else {
+      return
+    }
+    let ctrl = UIAlertController(title: "Tmux Mode", message: cleanMessage, preferredStyle: .alert)
+    ctrl.addAction(UIAlertAction(title: "OK", style: .default))
+    if let presented = presentedViewController {
+      presented.present(ctrl, animated: true)
+    } else {
+      present(ctrl, animated: true)
+    }
+  }
+
+  private func _terminateAndRemoveShell(key: UUID) {
+    guard let idx = _viewportsKeys.firstIndex(of: key) else {
+      return
+    }
+    if let ctrl: TermController = SessionRegistry.shared.sessionFromIndexWith(key: key) {
+      ctrl.delegate = nil
+      ctrl.terminate()
+      if ctrl.viewIsLoaded {
+        _ = ctrl.removeFromContainer()
+      }
+    }
+    SessionRegistry.shared.remove(forKey: key)
+    _viewportsKeys.remove(at: idx)
+    _tmuxPaneRouteCoordinator.onTerminalKeyRemoved(key)
+    if _currentKey == key {
+      _currentKey = nil
+    }
+  }
+
+  private func _terminateAndRemoveAllShells() {
+    let keys = _viewportsKeys
+    keys.forEach { _terminateAndRemoveShell(key: $0) }
+    _viewportsKeys.removeAll()
+    _currentKey = nil
+    _spaceControllerAnimating = false
+    _viewportsController.setViewControllers(nil, direction: .forward, animated: false)
+    _hud?.hide(animated: false)
+    _hud = nil
+  }
+
+  private func _compactToSingleShell(preferredKey: UUID?) -> UUID? {
+    let keepKey: UUID? = {
+      if let preferredKey, _viewportsKeys.contains(preferredKey) {
+        return preferredKey
+      }
+      if let currentKey = _currentKey, _viewportsKeys.contains(currentKey) {
+        return currentKey
+      }
+      return _viewportsKeys.first
+    }()
+
+    let keysToRemove = _viewportsKeys.filter { $0 != keepKey }
+    keysToRemove.forEach { _terminateAndRemoveShell(key: $0) }
+    _currentKey = keepKey
+    return keepKey
+  }
+
+  fileprivate func _returnToTmuxPaneInbox(animated: Bool, alertMessage: String? = nil) {
+    _tmuxWorkspaceState = .inbox
+    _tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
+    if _isPresentingTmuxPaneInbox {
+      if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
+        _presentTmuxAlert(alertMessage)
+      }
+      return
+    }
+    _dismissTmuxPaneInboxIfNeeded { [weak self] in
+      guard let self else {
+        return
+      }
+      self._terminateAndRemoveAllShells()
+      self._presentTmuxPaneInbox(animated: animated)
+      if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
+        DispatchQueue.main.async {
+          self._presentTmuxAlert(alertMessage)
+        }
+      }
+    }
+  }
+
+  fileprivate func _enterTmuxPaneWorkspace(_ request: TmuxNotificationRequest) {
+    _tmuxWorkspaceState = .paneActive(request)
   }
 
   private func _presentInitialTmuxPaneInboxIfNeeded() {
@@ -512,6 +629,7 @@ Please go to your subscriptions and cancel one of them!
       return
     }
     _didPresentInitialTmuxPaneInbox = true
+    _tmuxWorkspaceState = .inbox
     _presentTmuxPaneInbox(animated: false)
   }
 
@@ -519,6 +637,7 @@ Please go to your subscriptions and cancel one of them!
     guard !_isPresentingTmuxPaneInbox else {
       return
     }
+    _tmuxWorkspaceState = .inbox
 
     let inbox = TmuxPaneInboxViewController(
       onPaneSelected: { [weak self] request in
@@ -529,17 +648,9 @@ Please go to your subscriptions and cancel one of them!
           self._openTmuxPane(
             hostAlias: request.hostAlias,
             sessionName: request.sessionName,
-            paneTarget: request.paneTarget
+            paneTarget: request.paneTarget,
+            source: .manual
           )
-        }
-      },
-      onCreateTerminal: { [weak self] in
-        guard let self else {
-          return
-        }
-        self._dismissTmuxPaneInboxIfNeeded {
-          self._createShell(userActivity: nil, animated: true)
-          self._focusOnShell()
         }
       },
       onUpgradeHost: { [weak self] hostAlias in
@@ -707,10 +818,13 @@ extension SpaceController: UIGestureRecognizerDelegate {
     if velocity.x == 0 && velocity.y == 0 {
       return true
     }
-    if abs(velocity.x) <= abs(velocity.y) {
+    if velocity.x < -20 {
       return false
     }
-    return velocity.x >= 0
+    if abs(velocity.y) > abs(velocity.x) * 1.8 {
+      return false
+    }
+    return true
   }
 }
 
@@ -719,6 +833,8 @@ extension SpaceController: UIStateRestorable {
   func restore(withState state: UIState) {
     _viewportsKeys = state.keys
     _currentKey = state.currentKey
+    _restoredTmuxBridgeState = state.tmuxBridgeState
+    _tmuxWorkspaceState = .inbox
     if let bgColor = UIColor(codableColor: state.bgColor) {
       view.backgroundColor = bgColor
     }
@@ -727,7 +843,8 @@ extension SpaceController: UIStateRestorable {
   func dumpUIState() -> UIState {
     return UIState(keys: _viewportsKeys,
             currentKey: _currentKey,
-            bgColor: CodableColor(uiColor: view.backgroundColor)
+            bgColor: CodableColor(uiColor: view.backgroundColor),
+            tmuxBridgeState: _tmuxPaneRouteCoordinator.currentPersistedState
     )
   }
   
@@ -754,7 +871,7 @@ extension SpaceController: UIStateRestorable {
       let sceneDelegate = scene.delegate as? SceneDelegate
     {
       DispatchQueue.main.async {
-        sceneDelegate.spaceController.openTmuxPane(
+        sceneDelegate.spaceController.openTmuxPaneFromNotification(
           hostAlias: request.hostAlias,
           sessionName: request.sessionName,
           paneTarget: request.paneTarget
@@ -841,6 +958,10 @@ extension SpaceController: TermControlDelegate {
   
   func terminalHangup(control: TermController) {
     if currentTerm() == control {
+      if _tmuxStrictModeEnabled {
+        _returnToTmuxPaneInbox(animated: true)
+        return
+      }
       _closeCurrentSpace()
     }
   }
@@ -922,6 +1043,9 @@ extension SpaceController {
     guard foregroundActive else {
       return
     }
+    if _tmuxStrictModeEnabled && tmuxTerminalStrictModeCommandDisabled(cmd) {
+      return
+    }
     if tmuxTerminalPagingCommandDisabled(cmd) {
       return
     }
@@ -943,7 +1067,7 @@ extension SpaceController {
     case .tab10: _moveToShell(idx: 9)
     case .tab11: _moveToShell(idx: 10)
     case .tab12: _moveToShell(idx: 11)
-    case .tabClose: _closeCurrentSpace()
+    case .tabClose: closeShellAction()
     case .tabMoveToOtherWindow: _moveToOtherWindowAction()
     case .toggleKeyCast: _toggleKeyCast()
     case .tabNew: newShellAction()
@@ -977,12 +1101,21 @@ extension SpaceController {
   }
   
   @objc func newShellAction() {
+    guard !_tmuxStrictModeEnabled else {
+      _tmuxWorkspaceState = .inbox
+      _presentTmuxPaneInbox(animated: true)
+      return
+    }
     _dismissTmuxPaneInboxIfNeeded { [weak self] in
       self?._createShell(userActivity: nil, animated: true)
     }
   }
   
   @objc func closeShellAction() {
+    guard !_tmuxStrictModeEnabled else {
+      _returnToTmuxPaneInbox(animated: true)
+      return
+    }
     _closeCurrentSpace()
   }
 
@@ -1192,7 +1325,7 @@ extension SpaceController {
       self.view.addSubview(menu.tapToCloseView)
       
       var ids: [BlinkActionID] = []
-      ids.append(contentsOf:  [.snippets, .tabClose, .tabCreate, .tmux])
+      ids.append(contentsOf:  [.snippets, .tabClose, .tmux])
       
       if DeviceInfo.shared().hasCorners {
         ids.append(contentsOf:  [.layoutMenu])
@@ -1237,7 +1370,8 @@ extension SpaceController {
     if receiver._blinkMenu != nil {
       receiver.toggleQuickActionsAction()
     }
-    receiver._presentTmuxHostPicker()
+    receiver._tmuxWorkspaceState = .inbox
+    receiver._presentTmuxPaneInbox(animated: true)
   }
 
   private func _presentTmuxHostPicker() {
@@ -1353,7 +1487,12 @@ extension SpaceController {
         showActiveStar: showPaneStar
       )
       alert.addAction(UIAlertAction(title: title, style: .default, handler: { [weak self] _ in
-        self?._openTmuxPane(hostAlias: hostAlias, sessionName: session.name, paneTarget: entry.pane.target)
+        self?._openTmuxPane(
+          hostAlias: hostAlias,
+          sessionName: session.name,
+          paneTarget: entry.pane.target,
+          source: .manual
+        )
       }))
     }
     alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -1370,14 +1509,33 @@ extension SpaceController {
   }
 
   @objc func openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
-    _interactiveSpaceController()._openTmuxPane(hostAlias: hostAlias, sessionName: sessionName, paneTarget: paneTarget)
+    _interactiveSpaceController()._openTmuxPane(
+      hostAlias: hostAlias,
+      sessionName: sessionName,
+      paneTarget: paneTarget,
+      source: .manual
+    )
+  }
+
+  @objc func openTmuxPaneFromNotification(hostAlias: String, sessionName: String?, paneTarget: String) {
+    _interactiveSpaceController()._openTmuxPane(
+      hostAlias: hostAlias,
+      sessionName: sessionName,
+      paneTarget: paneTarget,
+      source: .notificationTap
+    )
   }
 
   @objc func openShellAndRunCommand(_ command: String) {
     _interactiveSpaceController()._openShellAndRunCommand(command, skipHistoryRecord: false)
   }
 
-  private func _openTmuxPane(hostAlias: String, sessionName: String?, paneTarget: String) {
+  private func _openTmuxPane(
+    hostAlias: String,
+    sessionName: String?,
+    paneTarget: String,
+    source: TmuxPaneRouteSource
+  ) {
     let cleanHost = hostAlias.blink_trimmed
     guard !cleanHost.isEmpty else {
       showAlert(msg: "Missing host alias in tmux notification.")
@@ -1400,8 +1558,7 @@ extension SpaceController {
     _markTmuxPaneReadIfPossible(hostAlias: cleanHost, paneTarget: cleanPane)
 
     let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
-    let requestID = TmuxPaneLaunchRequestStore.shared.register(request: request)
-    _openShellAndRunCommand("tmux-pane-bridge --request-id \(requestID)", skipHistoryRecord: true)
+    _tmuxPaneRouteCoordinator.route(request: request, source: source)
   }
 
   private func _markTmuxPaneReadIfPossible(hostAlias: String, paneTarget: String) {
@@ -1546,7 +1703,7 @@ extension SpaceController {
       return
     }
 
-    _createShell(userActivity: nil, animated: true) { [weak self] _ in
+    _createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
       guard let self else {
         return
       }
@@ -1581,7 +1738,10 @@ extension SpaceController {
       guard let self else {
         return
       }
-      self._createShell(userActivity: nil, animated: true) { [weak self] _ in
+      self._tmuxPaneRouteCoordinator.deactivate(reason: "maintenance_shell")
+      self._tmuxWorkspaceState = .inbox
+      self._terminateAndRemoveAllShells()
+      self._createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
         guard let self,
               let term = self.currentTerm()
         else {
@@ -1592,6 +1752,108 @@ extension SpaceController {
     }
   }
 
+  fileprivate func _hostForTmuxAlias(_ alias: String) -> BKHosts? {
+    _tmuxHost(for: alias)
+  }
+
+  fileprivate func _canonicalTmuxRequest(_ request: TmuxNotificationRequest) -> TmuxNotificationRequest? {
+    let cleanHostAlias = request.hostAlias.blink_trimmed
+    let cleanPaneTarget = request.paneTarget.blink_trimmed
+    guard !cleanHostAlias.isEmpty, !cleanPaneTarget.isEmpty else {
+      return nil
+    }
+
+    let inferredSession = cleanPaneTarget.components(separatedBy: ":").first?.blink_trimmed
+    let cleanSession = request.sessionName?.blink_trimmed.isEmpty == false
+      ? request.sessionName!.blink_trimmed
+      : (inferredSession ?? "")
+
+    guard !cleanSession.isEmpty else {
+      return nil
+    }
+
+    guard let host = _tmuxHost(for: cleanHostAlias) else {
+      return TmuxNotificationRequest(
+        hostAlias: cleanHostAlias,
+        sessionName: cleanSession,
+        paneTarget: cleanPaneTarget
+      )
+    }
+
+    let canonicalAlias = (host.host ?? cleanHostAlias).blink_trimmed
+    guard !canonicalAlias.isEmpty else {
+      return nil
+    }
+
+    return TmuxNotificationRequest(
+      hostAlias: canonicalAlias,
+      sessionName: cleanSession,
+      paneTarget: cleanPaneTarget
+    )
+  }
+
+  fileprivate func _ensureManagedTmuxBridgeTerminal(
+    preferredKey: UUID?,
+    completion: @escaping (UUID?, TermController?) -> Void
+  ) {
+    let finishOnMain: (UUID?, TermController?) -> Void = { key, term in
+      DispatchQueue.main.async {
+        completion(key, term)
+      }
+    }
+
+    _dismissTmuxPaneInboxIfNeeded { [weak self] in
+      guard let self else {
+        finishOnMain(nil, nil)
+        return
+      }
+
+      if let keyToReuse = self._compactToSingleShell(preferredKey: preferredKey) {
+        self._moveToShell(key: keyToReuse, animated: true) {
+          finishOnMain(keyToReuse, self.currentTerm())
+        }
+        return
+      }
+
+      self._createShell(userActivity: nil, animated: true, source: .tmuxManaged) { [weak self] _ in
+        guard let self else {
+          finishOnMain(nil, nil)
+          return
+        }
+        let term = self.currentTerm()
+        finishOnMain(term?.meta.key, term)
+      }
+    }
+  }
+
+  fileprivate func _enqueueTmuxBridgeCommand(
+    in term: TermController,
+    request: TmuxNotificationRequest,
+    completion: @escaping (Bool) -> Void
+  ) {
+    guard let token = request.tmuxAttachToken?.blink_trimmed, !token.isEmpty else {
+      completion(false)
+      return
+    }
+
+    let command = "tmux-pane-bridge --token \(token)"
+    let runCommand: () -> Void = {
+      term.resumeIfNeeded()
+      term.enqueueProgrammaticCommand(command, skipHistoryRecord: true)
+      completion(true)
+    }
+
+    guard term.isRunningCmd() else {
+      runCommand()
+      return
+    }
+
+    term.handleControl("\u{03}")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+      runCommand()
+    }
+  }
+
   @objc private func _openTmuxPaneFromNotification(_ n: Notification) {
     guard
       let userInfo = n.userInfo,
@@ -1599,7 +1861,12 @@ extension SpaceController {
     else {
       return
     }
-    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
+    _openTmuxPane(
+      hostAlias: request.hostAlias,
+      sessionName: request.sessionName,
+      paneTarget: request.paneTarget,
+      source: .notificationTap
+    )
   }
 
   private func _drainPendingTmuxNotificationIfNeeded() {
@@ -1607,7 +1874,12 @@ extension SpaceController {
       return
     }
     Self._pendingTmuxRequest = nil
-    _openTmuxPane(hostAlias: request.hostAlias, sessionName: request.sessionName, paneTarget: request.paneTarget)
+    _openTmuxPane(
+      hostAlias: request.hostAlias,
+      sessionName: request.sessionName,
+      paneTarget: request.paneTarget,
+      source: .notificationTap
+    )
   }
   
   @objc func toggleGeoTrack() {
@@ -1695,17 +1967,21 @@ extension SpaceController {
     _moveToShell(key: uuidKey, animated: true)
   }
   
-  private func _moveToShell(key: UUID, animated: Bool = true) {
-    guard
-      let currentKey = _currentKey,
-      let currentIdx = _viewportsKeys.firstIndex(of: currentKey),
-      let idx = _viewportsKeys.firstIndex(of: key)
-    else {
+  private func _moveToShell(key: UUID, animated: Bool = true, completion: (() -> Void)? = nil) {
+    guard let idx = _viewportsKeys.firstIndex(of: key) else {
       return
     }
     
     let term: TermController = SessionRegistry.shared[key]
-    let direction: UIPageViewController.NavigationDirection = currentIdx < idx ? .forward : .reverse
+    let direction: UIPageViewController.NavigationDirection = {
+      guard
+        let currentKey = _currentKey,
+        let currentIdx = _viewportsKeys.firstIndex(of: currentKey)
+      else {
+        return .forward
+      }
+      return currentIdx < idx ? .forward : .reverse
+    }()
 
     _spaceControllerAnimating = true
     _viewportsController.setViewControllers([term], direction: direction, animated: animated) { (didComplete) in
@@ -1714,6 +1990,7 @@ extension SpaceController {
       self._displayHUD()
       self._attachInputToCurrentTerm()
       self._spaceControllerAnimating = false
+      completion?()
     }
   }
   
@@ -1805,10 +2082,422 @@ extension SpaceController: SnippetContext {
   
 }
 
+fileprivate enum TmuxWorkspaceState: Equatable {
+  case inbox
+  case paneActive(TmuxNotificationRequest)
+}
+
+fileprivate enum TmuxShellCreationSource {
+  case userInitiated
+  case tmuxManaged
+  case maintenance
+}
+
 struct TmuxNotificationRequest: Equatable, Codable {
   let hostAlias: String
   let sessionName: String?
   let paneTarget: String
+}
+
+fileprivate enum TmuxPaneRouteSource {
+  case manual
+  case notificationTap
+
+  var countsAsNotificationTap: Bool {
+    self == .notificationTap
+  }
+}
+
+func tmuxPaneBridgeRetryDelaySeconds(attempt: Int) -> TimeInterval {
+  let safeAttempt = max(1, attempt)
+  let exponent = min(max(0, safeAttempt - 1), 5)
+  return min(pow(2.0, Double(exponent)), 30)
+}
+
+func tmuxPaneBridgeMaximumRetryAttempts() -> Int {
+  3
+}
+
+func tmuxPaneBridgeFailureIsRetryable(_ reason: String?) -> Bool {
+  let normalized = reason?.blink_trimmed.lowercased() ?? ""
+  guard !normalized.isEmpty else {
+    return true
+  }
+
+  let nonRetryableMarkers = [
+    "missing host alias",
+    "missing pane target",
+    "missing session name",
+    "invalid tmux pane bridge token",
+    "invalid or expired tmux pane bridge request id",
+    "configuration error",
+    "rejected credentials",
+    "invalid or insecure",
+    "host not found"
+  ]
+  return !nonRetryableMarkers.contains(where: { normalized.contains($0) })
+}
+
+struct TmuxPaneBridgePersistedState: Codable, Equatable {
+  var request: TmuxNotificationRequest
+  var managedTabKey: UUID?
+  var retryAttempt: Int
+  var lastFailureReason: String?
+}
+
+enum TmuxPaneBridgeLifecycleEvent: String {
+  case starting
+  case connected
+  case disconnected
+  case failed
+}
+
+fileprivate struct TmuxPaneBridgeLifecyclePayload {
+  let event: TmuxPaneBridgeLifecycleEvent
+  let request: TmuxNotificationRequest
+  let reason: String?
+
+  init?(userInfo: [AnyHashable: Any]) {
+    guard
+      let eventValue = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.event] as? String)?.blink_trimmed,
+      let event = TmuxPaneBridgeLifecycleEvent(rawValue: eventValue)
+    else {
+      return nil
+    }
+
+    let hostAlias = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.hostAlias] as? String)?.blink_trimmed ?? ""
+    let paneTarget = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.paneTarget] as? String)?.blink_trimmed ?? ""
+    guard !hostAlias.isEmpty, !paneTarget.isEmpty else {
+      return nil
+    }
+    let sessionName = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.sessionName] as? String)?.blink_trimmed
+    let reason = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.reason] as? String)?.blink_trimmed
+
+    self.event = event
+    self.request = TmuxNotificationRequest(
+      hostAlias: hostAlias,
+      sessionName: sessionName?.isEmpty == true ? nil : sessionName,
+      paneTarget: paneTarget
+    )
+    self.reason = reason?.isEmpty == true ? nil : reason
+  }
+}
+
+enum TmuxPaneBridgeLifecycleUserInfoKey {
+  static let event = "event"
+  static let hostAlias = "hostAlias"
+  static let sessionName = "sessionName"
+  static let paneTarget = "paneTarget"
+  static let reason = "reason"
+}
+
+fileprivate final class TmuxPaneRouteCoordinator {
+  private weak var spaceController: SpaceController?
+  private var persistedState: TmuxPaneBridgePersistedState?
+  private var retryTimer: Timer?
+  private var lifecycleObserver: NSObjectProtocol?
+  private var launchGeneration: UInt64 = 0
+  private var isLaunching = false
+  private var isConnected = false
+  private var notificationTapTotal: UInt64 = 0
+  private var routeSuccessTotal: UInt64 = 0
+  private var routeFallbackTotal: UInt64 = 0
+  private var lastReportedMetrics: (UInt64, UInt64, UInt64)?
+
+  init(spaceController: SpaceController) {
+    self.spaceController = spaceController
+    lifecycleObserver = NotificationCenter.default.addObserver(
+      forName: .BLKTmuxPaneBridgeLifecycle,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      self?._handleLifecycleNotification(notification)
+    }
+  }
+
+  deinit {
+    if let lifecycleObserver {
+      NotificationCenter.default.removeObserver(lifecycleObserver)
+    }
+    retryTimer?.invalidate()
+  }
+
+  var currentPersistedState: TmuxPaneBridgePersistedState? {
+    persistedState
+  }
+
+  var hasActiveRoute: Bool {
+    persistedState != nil
+  }
+
+  var managedTerminalKey: UUID? {
+    persistedState?.managedTabKey
+  }
+
+  func restore(state: TmuxPaneBridgePersistedState?) {
+    persistedState = nil
+    isLaunching = false
+    isConnected = false
+    _cancelRetryTimer()
+    _ = state
+  }
+
+  func deactivate(reason: String? = nil) {
+    _cancelRetryTimer()
+    launchGeneration += 1
+    isLaunching = false
+    isConnected = false
+    persistedState = nil
+    _ = reason
+  }
+
+  func route(request: TmuxNotificationRequest, source: TmuxPaneRouteSource) {
+    guard let spaceController else {
+      return
+    }
+
+    guard let canonical = spaceController._canonicalTmuxRequest(request) else {
+      spaceController.showAlert(msg: "Invalid tmux pane request. Please verify host/session/pane.")
+      return
+    }
+
+    if source.countsAsNotificationTap {
+      notificationTapTotal += 1
+    }
+
+    spaceController._enterTmuxPaneWorkspace(canonical)
+    persistedState = TmuxPaneBridgePersistedState(
+      request: canonical,
+      managedTabKey: persistedState?.managedTabKey,
+      retryAttempt: 0,
+      lastFailureReason: nil
+    )
+    isConnected = false
+    _cancelRetryTimer()
+    _launchIfPossible(trigger: "route")
+    _flushIOSRoutingMetricsIfNeeded()
+  }
+
+  func onSceneDidEnterBackground(scene: UIWindowScene) {
+    guard scene.session.role == .windowApplication else {
+      return
+    }
+    _cancelRetryTimer()
+  }
+
+  func onSceneWillEnterForeground(scene: UIWindowScene) {
+    guard scene.session.role == .windowApplication else {
+      return
+    }
+    _launchIfPossible(trigger: "foreground")
+  }
+
+  func onTerminalKeyRemoved(_ key: UUID) {
+    guard var state = persistedState else {
+      return
+    }
+    guard state.managedTabKey == key else {
+      return
+    }
+    state.managedTabKey = nil
+    persistedState = state
+    isConnected = false
+    _launchIfPossible(trigger: "terminal_removed")
+  }
+
+  private func _launchIfPossible(trigger: String) {
+    guard let spaceController else {
+      return
+    }
+    guard spaceController.foregroundActive else {
+      return
+    }
+    guard let state = persistedState else {
+      return
+    }
+    guard !isLaunching else {
+      return
+    }
+    guard !isConnected else {
+      return
+    }
+
+    launchGeneration += 1
+    let generation = launchGeneration
+    isLaunching = true
+
+    spaceController._ensureManagedTmuxBridgeTerminal(preferredKey: state.managedTabKey) { [weak self] tabKey, term in
+      guard let self else {
+        return
+      }
+      guard generation == self.launchGeneration else {
+        return
+      }
+      guard var latestState = self.persistedState else {
+        self.isLaunching = false
+        return
+      }
+
+      guard let term else {
+        self.isLaunching = false
+        self._scheduleRetry(reason: "Unable to prepare terminal for tmux pane bridge.")
+        return
+      }
+
+      latestState.managedTabKey = tabKey
+      self.persistedState = latestState
+
+      spaceController._enqueueTmuxBridgeCommand(in: term, request: latestState.request) { [weak self] started in
+        guard let self else {
+          return
+        }
+        guard generation == self.launchGeneration else {
+          return
+        }
+        if started {
+          self.isLaunching = true
+          return
+        }
+
+        self.isLaunching = false
+        self._cancelRetryTimer()
+        if let spaceController = self.spaceController {
+          spaceController.showAlert(msg: "Failed to start tmux pane bridge command.")
+        }
+      }
+    }
+
+    _ = trigger
+  }
+
+  private func _handleLifecycleNotification(_ notification: Notification) {
+    guard
+      let userInfo = notification.userInfo,
+      let payload = TmuxPaneBridgeLifecyclePayload(userInfo: userInfo),
+      var state = persistedState
+    else {
+      return
+    }
+
+    guard payload.request == state.request else {
+      return
+    }
+
+    switch payload.event {
+    case .starting:
+      isLaunching = true
+      isConnected = false
+      return
+    case .connected:
+      if !isConnected {
+        routeSuccessTotal += 1
+      }
+      isLaunching = false
+      isConnected = true
+      state.retryAttempt = 0
+      state.lastFailureReason = nil
+      persistedState = state
+      _cancelRetryTimer()
+      _flushIOSRoutingMetricsIfNeeded()
+    case .disconnected:
+      isConnected = false
+      if isLaunching {
+        return
+      }
+      isLaunching = false
+      _scheduleRetry(reason: payload.reason ?? "tmux pane bridge disconnected.")
+    case .failed:
+      isConnected = false
+      isLaunching = false
+      let reason = payload.reason?.blink_trimmed
+      state.lastFailureReason = reason
+      persistedState = state
+
+      if tmuxPaneBridgeFailureIsRetryable(reason) {
+        _scheduleRetry(reason: reason)
+      } else if let reason, let spaceController {
+        _cancelRetryTimer()
+        spaceController.showAlert(msg: reason)
+      }
+    }
+  }
+
+  private func _scheduleRetry(reason: String?) {
+    guard let spaceController else {
+      return
+    }
+    guard spaceController.foregroundActive else {
+      return
+    }
+    guard var state = persistedState else {
+      return
+    }
+
+    state.retryAttempt = max(1, state.retryAttempt + 1)
+    if let reason, !reason.blink_trimmed.isEmpty {
+      state.lastFailureReason = reason.blink_trimmed
+    }
+    persistedState = state
+    routeFallbackTotal += 1
+    _flushIOSRoutingMetricsIfNeeded()
+
+    if state.retryAttempt > tmuxPaneBridgeMaximumRetryAttempts() {
+      let fallbackReason = state.lastFailureReason?.blink_trimmed
+      let message: String
+      if let fallbackReason, !fallbackReason.isEmpty {
+        message = "Tmux pane bridge retried \(tmuxPaneBridgeMaximumRetryAttempts()) times and stopped.\n\n\(fallbackReason)"
+      } else {
+        message = "Tmux pane bridge retried \(tmuxPaneBridgeMaximumRetryAttempts()) times and stopped."
+      }
+      deactivate(reason: "retry_exhausted")
+      spaceController._returnToTmuxPaneInbox(animated: true, alertMessage: message)
+      return
+    }
+
+    _cancelRetryTimer()
+    let delay = tmuxPaneBridgeRetryDelaySeconds(attempt: state.retryAttempt)
+    let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      self.retryTimer = nil
+      self.isConnected = false
+      self._launchIfPossible(trigger: "retry")
+    }
+    retryTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func _cancelRetryTimer() {
+    retryTimer?.invalidate()
+    retryTimer = nil
+  }
+
+  private func _flushIOSRoutingMetricsIfNeeded() {
+    guard let state = persistedState else {
+      return
+    }
+    let snapshot = (notificationTapTotal, routeSuccessTotal, routeFallbackTotal)
+    if let lastReportedMetrics,
+      lastReportedMetrics.0 == snapshot.0,
+      lastReportedMetrics.1 == snapshot.1,
+      lastReportedMetrics.2 == snapshot.2
+    {
+      return
+    }
+    guard let spaceController, let host = spaceController._hostForTmuxAlias(state.request.hostAlias) else {
+      return
+    }
+    lastReportedMetrics = snapshot
+    Task {
+      try? await TmuxControlPlaneClient.ingestIOSRoutingMetrics(
+        for: host,
+        notificationTapTotal: snapshot.0,
+        routeSuccessTotal: snapshot.1,
+        routeFallbackTotal: snapshot.2
+      )
+    }
+  }
 }
 
 enum TmuxNotificationPayloadResolver {
@@ -1886,13 +2575,26 @@ func tmuxTerminalPagingCommandDisabled(_ cmd: Command) -> Bool {
   }
 }
 
+func tmuxTerminalStrictModeCommandDisabled(_ cmd: Command) -> Bool {
+  switch cmd {
+  case .tabMoveToOtherWindow:
+    return true
+  default:
+    return false
+  }
+}
+
 func tmuxChatsEdgeSwipeCanPresentChats(
   isWindowApplicationScene: Bool,
   isSpaceControllerAnimating: Bool,
   hasPresentedViewController: Bool,
+  isTmuxPaneActive: Bool,
   isTmuxChatsPresented: Bool
 ) -> Bool {
   guard isWindowApplicationScene else {
+    return false
+  }
+  guard isTmuxPaneActive else {
     return false
   }
   guard !isSpaceControllerAnimating else {
@@ -1912,9 +2614,9 @@ func tmuxChatsEdgeSwipeShouldPresentChats(
   translationY: Double,
   velocityX: Double
 ) -> Bool {
-  let minDistance = 56.0
+  let minDistance = 24.0
   let maxVerticalDrift = 80.0
-  let minVelocity = 700.0
+  let minVelocity = 280.0
 
   guard translationX > 0 else {
     return false
@@ -2085,7 +2787,6 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
   }
 
   private let onPaneSelected: (TmuxNotificationRequest) -> Void
-  private let onCreateTerminal: () -> Void
   private let onUpgradeHost: (String) -> Void
   private let onFixRuntimeHost: (String) -> Void
 
@@ -2096,12 +2797,10 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
 
   init(
     onPaneSelected: @escaping (TmuxNotificationRequest) -> Void,
-    onCreateTerminal: @escaping () -> Void,
     onUpgradeHost: @escaping (String) -> Void,
     onFixRuntimeHost: @escaping (String) -> Void
   ) {
     self.onPaneSelected = onPaneSelected
-    self.onCreateTerminal = onCreateTerminal
     self.onUpgradeHost = onUpgradeHost
     self.onFixRuntimeHost = onFixRuntimeHost
     super.init(style: .insetGrouped)
@@ -2124,13 +2823,6 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
     let refresh = UIRefreshControl()
     refresh.addTarget(self, action: #selector(_pullToRefresh), for: .valueChanged)
     refreshControl = refresh
-
-    navigationItem.rightBarButtonItem = UIBarButtonItem(
-      title: "New Terminal",
-      style: .plain,
-      target: self,
-      action: #selector(_newTerminalTapped)
-    )
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -2142,10 +2834,6 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
     super.viewWillDisappear(animated)
     autoRefreshTask?.cancel()
     autoRefreshTask = nil
-  }
-
-  @objc private func _newTerminalTapped() {
-    onCreateTerminal()
   }
 
   @objc private func _pullToRefresh() {
@@ -2292,11 +2980,7 @@ fileprivate final class TmuxPaneInboxViewController: UITableViewController {
     titleLabel.font = .preferredFont(forTextStyle: .body)
     titleLabel.text = "No valid tmux hosts found.\nConfigure a host in Settings > Hosts > SSH."
 
-    let button = UIButton(type: .system)
-    button.setTitle("New Terminal", for: .normal)
-    button.addTarget(self, action: #selector(_newTerminalTapped), for: .touchUpInside)
-
-    let stack = UIStackView(arrangedSubviews: [titleLabel, button])
+    let stack = UIStackView(arrangedSubviews: [titleLabel])
     stack.axis = .vertical
     stack.spacing = 12
     stack.alignment = .center
@@ -2508,6 +3192,18 @@ fileprivate struct TmuxControlPaneInputRequest: Encodable {
   let text: String
 }
 
+fileprivate struct TmuxControlIOSMetricsIngestRequest: Encodable {
+  let notificationTapTotal: UInt64
+  let routeSuccessTotal: UInt64
+  let routeFallbackTotal: UInt64
+
+  enum CodingKeys: String, CodingKey {
+    case notificationTapTotal = "notification_tap_total"
+    case routeSuccessTotal = "route_success_total"
+    case routeFallbackTotal = "route_fallback_total"
+  }
+}
+
 fileprivate enum TmuxControlError: LocalizedError {
   case invalidURL(String)
   case unauthorized(Int)
@@ -2637,6 +3333,35 @@ fileprivate enum TmuxControlPlaneClient {
       bearerToken: cleanToken
     )
     let result = try await _request(context: deviceContext, path: path, method: "POST")
+    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+  }
+
+  static func ingestIOSRoutingMetrics(
+    for host: BKHosts,
+    notificationTapTotal: UInt64,
+    routeSuccessTotal: UInt64,
+    routeFallbackTotal: UInt64
+  ) async throws {
+    let context = try _context(for: host)
+    let cleanToken = host.tmuxPushDeviceApiToken?.blink_trimmed ?? ""
+    guard !cleanToken.isEmpty else {
+      throw TmuxControlError.missingDeviceAPIToken(context.hostAlias)
+    }
+
+    let deviceContext = TmuxControlRequestContext(
+      hostAlias: context.hostAlias,
+      baseURL: context.baseURL,
+      bearerToken: cleanToken
+    )
+    let body = try JSONEncoder().encode(
+      TmuxControlIOSMetricsIngestRequest(
+        notificationTapTotal: notificationTapTotal,
+        routeSuccessTotal: routeSuccessTotal,
+        routeFallbackTotal: routeFallbackTotal
+      )
+    )
+    let path = "/v1/push/metrics/ios"
+    let result = try await _request(context: deviceContext, path: path, method: "POST", body: body)
     try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
   }
 
@@ -3230,8 +3955,9 @@ fileprivate final class TmuxPaneDetailViewController: UIViewController, UITextFi
   }
 }
 
-fileprivate extension Notification.Name {
+extension Notification.Name {
   static let BLKOpenTmuxPane = Notification.Name("BLKOpenTmuxPaneNotification")
+  static let BLKTmuxPaneBridgeLifecycle = Notification.Name("BLKTmuxPaneBridgeLifecycleNotification")
 }
 
 fileprivate extension String {

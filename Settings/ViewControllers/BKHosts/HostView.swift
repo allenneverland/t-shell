@@ -1079,7 +1079,12 @@ struct HostView: View {
         _tmuxOnboardingStatus = "Persisting device token…"
         _saveHost()
         _persistLastRegisteredAPNSToken(apnsToken, forAlias: prerequisites.alias)
-        _tmuxOnboardingStatus = "Onboarding completed."
+        if remoteResult.warnings.isEmpty {
+          _tmuxOnboardingStatus = "Onboarding completed."
+        } else {
+          let warningLines = remoteResult.warnings.map { "- \($0)" }.joined(separator: "\n")
+          _tmuxOnboardingStatus = "Onboarding completed with warnings:\n\(warningLines)"
+        }
       } catch {
         if !preservePartialFailureState {
           _tmuxServiceURL = originalTmuxState.serviceURL
@@ -1386,6 +1391,7 @@ enum TmuxSSHOnboardingService {
 
   fileprivate struct RemoteOnboardingResult {
     let discoveredServiceBaseURL: String?
+    let warnings: [String]
   }
 
   private struct SemanticVersion: Comparable {
@@ -1410,6 +1416,8 @@ enum TmuxSSHOnboardingService {
   private static let tmuxdLocalPortCandidates = [8787, 8790, 8791]
   private static let tmuxdLocalProxyTarget = "http://127.0.0.1:8787"
   private static let tailscaleHTTPSFallbackPorts = [8787, 8443, 9443]
+  private static let codexConfigPath = "~/.codex/config.toml"
+  private static let codexNotifyExpectedLine = "notify = [\"tmuxd\", \"notify\"]"
   private static let tmuxdStateLogPath = "$HOME/.local/state/tmuxd/tmuxd.log"
   private static let tmuxVerifyReasonRuntimeServerNotRunning = "runtime_server_not_running"
   private static let tmuxVerifyReasonRuntimeHookEmpty = "runtime_hook_empty"
@@ -1529,7 +1537,8 @@ enum TmuxSSHOnboardingService {
       return "Installed tmuxd is outdated and does not support structured bell hook verification. Re-run onboarding to install the latest tmuxd release."
     }
 
-    if lower.contains("set-hook") && lower.contains("syntax error") {
+    if lower.contains("set-hook") &&
+      (lower.contains("syntax error") || lower.contains("too many arguments")) {
       return "tmux rejected the generated alert-bell hook command due to syntax/escaping mismatch. Re-run onboarding to install the latest tmuxd release; if the host tmux version is very old, upgrade tmux and retry."
     }
 
@@ -1707,6 +1716,18 @@ enum TmuxSSHOnboardingService {
 
   static func tmuxBellHookVerifyScriptForTesting() -> String {
     verifyTmuxBellHookScript()
+  }
+
+  static func codexNotifyCheckScriptForTesting() -> String {
+    codexNotifyCheckScript()
+  }
+
+  static func codexNotifyApplyScriptForTesting() -> String {
+    codexNotifyApplyScript()
+  }
+
+  static func codexNotifyWarningsForTesting(_ raw: String, exitStatus: Int32 = 0) -> [String] {
+    codexNotifyWarnings(checkOutput: raw, exitStatus: exitStatus)
   }
 
   static func parseTmuxBellHookVerifyJSONForTesting(_ raw: String) -> Bool {
@@ -1890,12 +1911,18 @@ enum TmuxSSHOnboardingService {
     await MainActor.run { onProgress("Ensuring tmux server is running…") }
     try await runChecked(script: requireActiveTmuxServerScript(), on: client)
 
-    await MainActor.run { onProgress("Installing tmux bell hook…") }
+    await MainActor.run { onProgress("Installing tmux hooks (bell + coding agents)…") }
     try await installTmuxBellHook(on: client)
+
+    await MainActor.run { onProgress("Verifying Codex notify configuration…") }
+    let codexWarnings = await verifyCodexNotifyConfiguration(on: client)
 
     await MainActor.run { onProgress("Discovering tailscale HTTPS endpoint…") }
     let discoveredServiceBaseURL = try await resolveTailscaleHTTPSBaseURL(on: client, target: runtime.proxyTarget)
-    return RemoteOnboardingResult(discoveredServiceBaseURL: discoveredServiceBaseURL)
+    return RemoteOnboardingResult(
+      discoveredServiceBaseURL: discoveredServiceBaseURL,
+      warnings: codexWarnings
+    )
   }
 
   static func upgradeTmuxdOnly(
@@ -2600,6 +2627,109 @@ enum TmuxSSHOnboardingService {
     }
   }
 
+  private static func verifyCodexNotifyConfiguration(on client: SSH.SSHClient) async -> [String] {
+    do {
+      let initial = try await runExec(
+        command: "sh -lc \(shellQuote(codexNotifyCheckScript()))",
+        on: client
+      )
+      let initialOutput = [initial.stdout, initial.stderr]
+        .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        .joined(separator: "\n")
+      let initialStatus = parseCodexNotifyStatus(from: initialOutput)
+
+      if initialStatus == "missing_file" || initialStatus == "missing_notify" {
+        do {
+          try await runChecked(script: codexNotifyApplyScript(), on: client)
+        } catch {
+          let applyError = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+          var message = "Failed to auto-configure Codex notify in \(codexConfigPath). \(codexNotifyManualGuidanceMessage())"
+          if !applyError.isEmpty {
+            message += "\n\(applyError)"
+          }
+          return [message]
+        }
+
+        let verification = try await runExec(
+          command: "sh -lc \(shellQuote(codexNotifyCheckScript()))",
+          on: client
+        )
+        let verificationOutput = [verification.stdout, verification.stderr]
+          .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+          .joined(separator: "\n")
+        let warnings = codexNotifyWarnings(
+          checkOutput: verificationOutput,
+          exitStatus: verification.exitStatus
+        )
+        if warnings.isEmpty {
+          return []
+        }
+        return uniqueWarnings([
+          "Codex notify auto-configuration did not verify cleanly. \(codexNotifyManualGuidanceMessage())"
+        ] + warnings)
+      }
+
+      return uniqueWarnings(codexNotifyWarnings(checkOutput: initialOutput, exitStatus: initial.exitStatus))
+    } catch {
+      return [
+        "Could not verify Codex notify configuration automatically. \(codexNotifyManualGuidanceMessage())"
+      ]
+    }
+  }
+
+  private static func codexNotifyWarnings(checkOutput: String, exitStatus: Int32) -> [String] {
+    if exitStatus != 0 {
+      return [
+        "Could not verify Codex notify configuration automatically. \(codexNotifyManualGuidanceMessage())"
+      ]
+    }
+
+    let status = parseCodexNotifyStatus(from: checkOutput)
+    switch status {
+    case "configured":
+      return []
+    case "custom_notify":
+      return [
+        "Codex notify is already customized in \(codexConfigPath). Blink kept the existing value. If you want tmuxd push notifications, \(codexNotifyManualGuidanceMessage())"
+      ]
+    case "missing_notify", "missing_file":
+      return [
+        "Codex notify is not configured in \(codexConfigPath). \(codexNotifyManualGuidanceMessage())"
+      ]
+    case "unreadable":
+      return [
+        "Codex config exists but is not readable (\(codexConfigPath)). Verify file permissions, then \(codexNotifyManualGuidanceMessage())"
+      ]
+    default:
+      return [
+        "Could not verify Codex notify configuration automatically. \(codexNotifyManualGuidanceMessage())"
+      ]
+    }
+  }
+
+  private static func parseCodexNotifyStatus(from output: String) -> String? {
+    for line in trimmedNonEmptyLines(output) {
+      guard line.hasPrefix("status=") else {
+        continue
+      }
+      let value = String(line.dropFirst("status=".count))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !value.isEmpty {
+        return value
+      }
+    }
+    return nil
+  }
+
+  private static func codexNotifyManualGuidanceMessage() -> String {
+    "Set top-level \(codexNotifyExpectedLine) in \(codexConfigPath) and restart Codex."
+  }
+
+  private static func uniqueWarnings(_ warnings: [String]) -> [String] {
+    var seen = Set<String>()
+    return warnings.filter { seen.insert($0).inserted }
+  }
+
   private static func runChecked(
     script: String,
     on client: SSH.SSHClient
@@ -2809,6 +2939,80 @@ enum TmuxSSHOnboardingService {
     set -eu
     "$HOME/.local/bin/tmuxd" hooks verify --json --strict --probe-runtime
     """
+  }
+
+  private static func codexNotifyCheckScript() -> String {
+    #"""
+    set -eu
+    codex_file="$HOME/.codex/config.toml"
+
+    if [ ! -e "$codex_file" ]; then
+      printf 'status=missing_file\n'
+      exit 0
+    fi
+
+    if [ ! -r "$codex_file" ]; then
+      printf 'status=unreadable\n'
+      exit 0
+    fi
+
+    if awk 'BEGIN { found=0 } /^[[:space:]]*notify[[:space:]]*=[[:space:]]*\[[[:space:]]*"tmuxd"[[:space:]]*,[[:space:]]*"notify"[[:space:]]*\][[:space:]]*$/ { found=1 } END { exit(found ? 0 : 1) }' "$codex_file"; then
+      printf 'status=configured\n'
+      exit 0
+    fi
+
+    if awk 'BEGIN { found=0 } /^[[:space:]]*notify[[:space:]]*=/ { found=1 } END { exit(found ? 0 : 1) }' "$codex_file"; then
+      printf 'status=custom_notify\n'
+    else
+      printf 'status=missing_notify\n'
+    fi
+    """#
+  }
+
+  private static func codexNotifyApplyScript() -> String {
+    #"""
+    set -eu
+    codex_file="$HOME/.codex/config.toml"
+    codex_dir="$(dirname "$codex_file")"
+    expected='notify = ["tmuxd", "notify"]'
+
+    mkdir -p "$codex_dir"
+
+    if [ -e "$codex_file" ] && [ ! -r "$codex_file" ]; then
+      echo "Codex config exists but is not readable: $codex_file" >&2
+      exit 2
+    fi
+    if [ -e "$codex_file" ] && [ ! -w "$codex_file" ]; then
+      echo "Codex config exists but is not writable: $codex_file" >&2
+      exit 2
+    fi
+
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+
+    if [ -f "$codex_file" ]; then
+      awk '
+        {
+          line = $0
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+          if (line == "# tmuxd push notification hook") next
+          if (line == "notify = [\"tmuxd\", \"notify\"]") next
+          print $0
+        }
+      ' "$codex_file" > "$tmp"
+    else
+      : > "$tmp"
+    fi
+
+    {
+      printf '# tmuxd push notification hook\n'
+      printf '%s\n' "$expected"
+      if [ -s "$tmp" ]; then
+        printf '\n'
+        cat "$tmp"
+      fi
+    } > "$codex_file"
+    """#
   }
 
   private static func writeConfigScript(

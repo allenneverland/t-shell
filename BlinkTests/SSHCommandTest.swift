@@ -261,6 +261,7 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
         isWindowApplicationScene: true,
         isSpaceControllerAnimating: false,
         hasPresentedViewController: false,
+        isTmuxPaneActive: true,
         isTmuxChatsPresented: false
       )
     )
@@ -269,6 +270,7 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
         isWindowApplicationScene: false,
         isSpaceControllerAnimating: false,
         hasPresentedViewController: false,
+        isTmuxPaneActive: true,
         isTmuxChatsPresented: false
       )
     )
@@ -277,6 +279,7 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
         isWindowApplicationScene: true,
         isSpaceControllerAnimating: true,
         hasPresentedViewController: false,
+        isTmuxPaneActive: true,
         isTmuxChatsPresented: false
       )
     )
@@ -285,6 +288,16 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
         isWindowApplicationScene: true,
         isSpaceControllerAnimating: false,
         hasPresentedViewController: true,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: false
+      )
+    )
+    XCTAssertFalse(
+      tmuxChatsEdgeSwipeCanPresentChats(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: false,
         isTmuxChatsPresented: false
       )
     )
@@ -354,6 +367,23 @@ final class TmuxTerminalPagingDisableTests: XCTestCase {
     for cmd in enabled {
       XCTAssertFalse(tmuxTerminalPagingCommandDisabled(cmd), "\(cmd.rawValue) should remain enabled")
     }
+  }
+}
+
+final class TmuxTerminalStrictModeDisableTests: XCTestCase {
+  func testStrictModeDisablesMoveToOtherWindow() {
+    XCTAssertTrue(tmuxTerminalStrictModeCommandDisabled(.tabMoveToOtherWindow))
+  }
+
+  func testStrictModeKeepsOtherCommandsEnabled() {
+    XCTAssertFalse(tmuxTerminalStrictModeCommandDisabled(.tabNew))
+    XCTAssertFalse(tmuxTerminalStrictModeCommandDisabled(.windowClose))
+  }
+}
+
+final class TmuxPaneBridgeRetryPolicyTests: XCTestCase {
+  func testRetryPolicyUsesThreeAttemptsByDefault() {
+    XCTAssertEqual(tmuxPaneBridgeMaximumRetryAttempts(), 3)
   }
 }
 
@@ -821,6 +851,51 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
     XCTAssertTrue(script.contains("\"$HOME/.local/bin/tmuxd\" hooks verify --json --strict --probe-runtime"))
   }
 
+  func testCodexNotifyCheckScriptInspectsCodexConfig() {
+    let script = TmuxSSHOnboardingService.codexNotifyCheckScriptForTesting()
+    XCTAssertTrue(script.contains("$HOME/.codex/config.toml"))
+    XCTAssertTrue(script.contains("status=configured"))
+    XCTAssertTrue(script.contains("status=custom_notify"))
+    XCTAssertTrue(script.contains("status=missing_notify"))
+  }
+
+  func testCodexNotifyApplyScriptWritesExpectedNotifyLine() {
+    let script = TmuxSSHOnboardingService.codexNotifyApplyScriptForTesting()
+    XCTAssertTrue(script.contains("$HOME/.codex/config.toml"))
+    XCTAssertTrue(script.contains("# tmuxd push notification hook"))
+    XCTAssertTrue(script.contains("notify = [\"tmuxd\", \"notify\"]"))
+    XCTAssertTrue(script.contains("mkdir -p \"$codex_dir\""))
+  }
+
+  func testCodexNotifyWarningsConfiguredReturnsNoWarnings() {
+    let warnings = TmuxSSHOnboardingService.codexNotifyWarningsForTesting("status=configured")
+    XCTAssertTrue(warnings.isEmpty)
+  }
+
+  func testCodexNotifyWarningsCustomNotifyKeepsExistingValue() {
+    let warnings = TmuxSSHOnboardingService.codexNotifyWarningsForTesting("status=custom_notify")
+    XCTAssertEqual(warnings.count, 1)
+    XCTAssertTrue(warnings[0].localizedCaseInsensitiveContains("kept the existing value"))
+    XCTAssertTrue(warnings[0].contains("notify = [\"tmuxd\", \"notify\"]"))
+  }
+
+  func testCodexNotifyWarningsMissingNotifySuggestsManualConfig() {
+    let warnings = TmuxSSHOnboardingService.codexNotifyWarningsForTesting("status=missing_notify")
+    XCTAssertEqual(warnings.count, 1)
+    XCTAssertTrue(warnings[0].localizedCaseInsensitiveContains("not configured"))
+    XCTAssertTrue(warnings[0].contains("notify = [\"tmuxd\", \"notify\"]"))
+  }
+
+  func testCodexNotifyWarningsNonZeroExitFallsBackToGenericGuidance() {
+    let warnings = TmuxSSHOnboardingService.codexNotifyWarningsForTesting(
+      "awk: command not found",
+      exitStatus: 127
+    )
+    XCTAssertEqual(warnings.count, 1)
+    XCTAssertTrue(warnings[0].localizedCaseInsensitiveContains("could not verify"))
+    XCTAssertTrue(warnings[0].contains("notify = [\"tmuxd\", \"notify\"]"))
+  }
+
   func testClassifyTmuxBellHookFailurePermissionDeniedMentionsTmuxConf() {
     let output = "Remote command failed with exit status 1.\nstderr:\npermission denied: /home/dev/.tmux.conf"
     let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
@@ -837,6 +912,18 @@ final class TmuxSSHOnboardingServiceTailscaleDiagnosticsTests: XCTestCase {
 
   func testClassifyTmuxBellHookFailureForSetHookSyntaxError() {
     let output = "Remote command failed with exit status 1.\nstderr:\ntmuxd fatal error: internal error: `tmux set-hook` failed: syntax error"
+    let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
+    XCTAssertNotNil(message)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("syntax") ?? false)
+    XCTAssertTrue(message?.localizedCaseInsensitiveContains("tmuxd") ?? false)
+  }
+
+  func testClassifyTmuxBellHookFailureForSetHookTooManyArguments() {
+    let output = """
+      Remote command failed with exit status 1.
+      stderr:
+      /home/dev/.tmux.conf:60: command set-hook: too many arguments (need at most 2)
+      """
     let message = TmuxSSHOnboardingService.classifyTmuxBellHookFailureMessage(output)
     XCTAssertNotNil(message)
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("syntax") ?? false)

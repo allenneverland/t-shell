@@ -168,7 +168,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     } else if let codeUrlScheme = URLContexts.first(where: { $0.url.scheme == "vscode" })?.url {
       _handleCodeUrlScheme(with: codeUrlScheme)
     } else if let httpScheme = URLContexts.first(where: { $0.url.scheme == "http" || $0.url.scheme == "https"})?.url {
-      _handleCodeUrlScheme(with: httpScheme)
+      _handleHttpUrlScheme(with: httpScheme)
     }
   }
 
@@ -453,6 +453,12 @@ fileprivate extension URL {
 
 // MARK: Manage the `scene(_:openURLContexts:)` actions
 extension SceneDelegate {
+  private func _rejectAutomaticShellLaunch(callbackURL: URL? = nil) {
+    if let callbackURL {
+      blink_openurl(callbackURL)
+    }
+    _spCtrl.showAlert(msg: "Strict tmux mode is enabled. URL actions cannot auto-open shells. Open Tmux Chats and select a pane.")
+  }
 
   /*
    Handles the `ssh://` URL schemes and x-callback-url for devices that are running iOS 13 or higher.
@@ -460,52 +466,8 @@ extension SceneDelegate {
      - xCallbackUrl: The x-callback-url specified by the user
    */
   private func _handleSshUrlScheme(with sshUrl: URL) {
-
-    var sshCommand = "ssh"
-
-    // Progressively unwrap all of the parameters available on the URL to form
-    // the SSH command to be later passed to the shell
-    if let port = sshUrl.port {
-      sshCommand += " -p \(port)"
-    }
-
-    if let username = sshUrl.user {
-      sshCommand += " \(username)@"
-    }
-
-    if let host = sshUrl.host {
-      sshCommand += "\(host)"
-    }
-
-    guard let term = _spCtrl.currentTerm() else {
-      _spCtrl.newShellAction()
-      guard let newTerm = _spCtrl.currentTerm() else {
-        return
-      }
-      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-        newTerm.termDevice.write(sshCommand)
-      }
-      return
-    }
-
-    guard term.isRunningCmd() else {
-       // No running command or shell found running, run the SSH command on the
-       // available shell
-       term.termDevice.write(sshCommand)
-       return
-    }
-
-    // If a SSH/mosh connection is already open in the current terminal shell
-    // create a new one and then write the command
-    _spCtrl.newShellAction()
-
-    guard let newTerm = _spCtrl.currentTerm() else {
-       return
-    }
-
-    DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-       newTerm.termDevice.write(sshCommand)
-    }
+    _ = sshUrl
+    _rejectAutomaticShellLaunch()
   }
 
   /**
@@ -579,43 +541,9 @@ extension SceneDelegate {
       }
       return
     }
-
-    guard let term = _spCtrl.currentTerm() else {
-      _spCtrl.newShellAction()
-      guard let newTerm = _spCtrl.currentTerm() else {
-        if let xErrorURL = xErrorURL {
-          blink_openurl(xErrorURL)
-        }
-        return
-      }
-      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-        newTerm.xCallbackLineSubmitted(cmdItem, xSuccessURL)
-      }
-      return
-    }
-
-    _spCtrl.focusOnShellAction()
-
-    // If SSH/mosh session is already open in the current terminal shell
-    // create a new one and then write the SSH command
-    guard term.isRunningCmd() else {
-       // No running command or shell found running, run the SSH command on the
-       // available shell
-      term.xCallbackLineSubmitted(cmdItem, xSuccessURL)
-      return
-    }
-
-    // If a SSH/mosh connection is already open in the current terminal shell
-    // create a new one and then write the command
-    _spCtrl.newShellAction()
-
-    guard let newTerm = _spCtrl.currentTerm() else {
-       return
-    }
-
-    DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-      newTerm.xCallbackLineSubmitted(cmdItem, xSuccessURL)
-    }
+    _ = cmdItem
+    _ = xSuccessURL
+    _rejectAutomaticShellLaunch(callbackURL: xErrorURL ?? xCancelURL)
   }
 
   // vscode://<path_to_file>
@@ -623,77 +551,12 @@ extension SceneDelegate {
   // vscode://github.codespaces/connect?name=
   // vscode://file/path/to/file/file.ext:55:20
   private func _handleCodeUrlScheme(with url: URL) {
-    guard let fileProtocol = url.host else {
-      return
-    }
-
-    var codeCommand = "code "
-    var urlPath = url.path
-    if ["sftp", "local"].contains(fileProtocol) {
-      if fileProtocol == "sftp" {
-        // host/ -> host:/;  host/~ -> host:~/
-        let components = url.pathComponents
-        if components.count < 2 {
-          return
-        }
-        let hostName = components[1]
-        codeCommand += "\(hostName):"
-        urlPath = url.pathComponents[2...].joined(separator: "/")
-        if urlPath.isEmpty {
-          urlPath = "/"
-        }
-      }
-      codeCommand += "\(urlPath)"
-    } else if fileProtocol.lowercased() == "github.codespaces",
-              url.path == "/connect",
-              let codespaceName = url.getQueryStringParameter(param: "name") {
-      codeCommand += "https://\(codespaceName).github.dev"
-    }
-    else {
-      codeCommand += url.absoluteString
-    }
-
-    // Call 'code'
-    guard let term = _spCtrl.currentTerm() else {
-      _spCtrl.newShellAction()
-      guard let newTerm = _spCtrl.currentTerm() else {
-        return
-      }
-      DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-        newTerm.termDevice.write(codeCommand)
-        newTerm.termDevice.write("\n")
-      }
-      return
-    }
-
-    guard term.isRunningCmd() else {
-      // No running command or shell found running, run the SSH command on the
-      // available shell
-      term.termDevice.write(codeCommand)
-      term.termDevice.write("\n")
-      return
-    }
-
-    _spCtrl.newShellAction()
-    guard let newTerm = _spCtrl.currentTerm() else {
-      return
-    }
-
-    DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-      newTerm.termDevice.write(codeCommand)
-      newTerm.termDevice.write("\n")
-    }
+    _ = url
+    _rejectAutomaticShellLaunch()
   }
 
   private func _handleHttpUrlScheme(with url: URL) {
-    _spCtrl.newShellAction()
-    guard let newTerm = _spCtrl.currentTerm() else {
-      return
-    }
-
-    DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.5) {
-      newTerm.termDevice.write(url.absoluteString)
-      newTerm.termDevice.write("\n")
-    }
+    _ = url
+    _rejectAutomaticShellLaunch()
   }
 }
