@@ -36,6 +36,16 @@
 
 import MBProgressHUD
 import SwiftUI
+import WebKit
+
+fileprivate final class TmuxViewportPlaceholderViewController: UIViewController {
+  override func loadView() {
+    let placeholder = UIView()
+    placeholder.isUserInteractionEnabled = false
+    placeholder.backgroundColor = .black
+    view = placeholder
+  }
+}
 
 
 // MARK: UIViewController
@@ -75,23 +85,98 @@ class SpaceController: UIViewController {
   private var _didPresentInitialTmuxPaneInbox: Bool = false
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   private var _restoredTmuxBridgeState: TmuxPaneBridgePersistedState? = nil
+  private var _tmuxChatUIState: TmuxChatUIState = .list
   private lazy var _tmuxPaneRouteCoordinator = TmuxPaneRouteCoordinator(spaceController: self)
+  private var _strictTmuxRuntimeTerminalKey: UUID? = nil
+  private var _viewportTransitionGeneration: UInt64 = 0
+  private lazy var _viewportPlaceholderController = TmuxViewportPlaceholderViewController()
 
   private var _tmuxStrictModeEnabled: Bool {
     sceneRole == .windowApplication
   }
 
-  private var _isTmuxManagedShellVisible: Bool {
-    tmuxManagedShellIsVisible(
-      managedTerminalKey: _tmuxPaneRouteCoordinator.managedTerminalKey,
-      currentTerminalKey: _currentKey,
-      viewportKeys: _viewportsKeys,
-      hasActiveRoute: _tmuxPaneRouteCoordinator.hasActiveRoute
+  private var _isTmuxRoomUIActive: Bool {
+    if case .room = _tmuxChatUIState {
+      return true
+    }
+    return false
+  }
+
+  private func _setTmuxChatUIState(_ newState: TmuxChatUIState) {
+    _tmuxChatUIState = newState
+    _updateTmuxChatsEdgeSwipeGestureState()
+  }
+
+  private func _updateTmuxChatsEdgeSwipeGestureState() {
+    guard let recognizer = _tmuxChatsEdgePanRecognizer else {
+      return
+    }
+    recognizer.isEnabled = _tmuxStrictModeEnabled && _isTmuxRoomUIActive
+  }
+
+  private func _setViewportControllers(
+    requestedControllers: [UIViewController],
+    direction: UIPageViewController.NavigationDirection,
+    animated: Bool,
+    completion: ((Bool) -> Void)? = nil
+  ) {
+    let controllers = tmuxViewportTransitionControllers(
+      requestedControllers: requestedControllers,
+      placeholder: _viewportPlaceholderController
+    )
+    _spaceControllerAnimating = true
+    _viewportTransitionGeneration &+= 1
+    let generation = _viewportTransitionGeneration
+    _viewportsController.setViewControllers(controllers, direction: direction, animated: animated) { [weak self] didComplete in
+      guard let self else {
+        return
+      }
+      guard generation == self._viewportTransitionGeneration else {
+        return
+      }
+      self._spaceControllerAnimating = false
+      completion?(didComplete)
+    }
+  }
+
+  private func _setViewportController(
+    _ controller: UIViewController,
+    direction: UIPageViewController.NavigationDirection,
+    animated: Bool,
+    completion: ((Bool) -> Void)? = nil
+  ) {
+    _setViewportControllers(
+      requestedControllers: [controller],
+      direction: direction,
+      animated: animated,
+      completion: completion
+    )
+  }
+
+  private func _setViewportPlaceholder(animated: Bool, completion: ((Bool) -> Void)? = nil) {
+    _viewportPlaceholderController.loadViewIfNeeded()
+    _viewportPlaceholderController.view.backgroundColor = view.backgroundColor ?? .black
+    _setViewportControllers(
+      requestedControllers: [],
+      direction: .forward,
+      animated: animated,
+      completion: completion
     )
   }
   
   var safeFrame: CGRect {
     _overlay.frame
+  }
+
+  private func _activeTerminalKeys() -> [UUID] {
+    var keys = _viewportsKeys
+    if _tmuxStrictModeEnabled,
+      let strictKey = _strictTmuxRuntimeTerminalKey,
+      !keys.contains(strictKey)
+    {
+      keys.append(strictKey)
+    }
+    return keys
   }
   
   public override func viewDidLayoutSubviews() {
@@ -140,7 +225,7 @@ class SpaceController: UIViewController {
   }
   
   private func forEachActive(block:(TermController) -> ()) {
-    for key in _viewportsKeys {
+    for key in _activeTerminalKeys() {
       if let ctrl: TermController = SessionRegistry.shared.sessionFromIndexWith(key: key) {
         block(ctrl)
       }
@@ -223,13 +308,12 @@ class SpaceController: UIViewController {
     }
     
     _viewportsController.didMove(toParent: self)
-    _disableTerminalPagingGesture()
     
     _overlay.isUserInteractionEnabled = false
     view.addSubview(_overlay)
     
     _registerForNotifications()
-    _enforceTmuxStrictModeShellTopologyAtLaunch(preferredManagedKey: _restoredTmuxBridgeState?.managedTabKey)
+    _enforceTmuxStrictModeShellTopologyAtLaunch()
     _tmuxPaneRouteCoordinator.restore(state: _restoredTmuxBridgeState)
     
     if let key = _currentKey ?? _viewportsKeys.first {
@@ -237,7 +321,9 @@ class SpaceController: UIViewController {
       term.delegate = self
       term.bgColor = view.backgroundColor ?? .black
       _currentKey = key
-      _viewportsController.setViewControllers([term], direction: .forward, animated: false)
+      _setViewportController(term, direction: .forward, animated: false)
+    } else {
+      _setViewportPlaceholder(animated: false)
     }
     
     self.view.addInteraction(_kbObserver)
@@ -409,6 +495,10 @@ Please go to your subscriptions and cancel one of them!
       completion?(false)
       return
     }
+    if _tmuxStrictModeEnabled {
+      _createStrictTmuxRuntimeShell(source: source, animated: false, completion: completion)
+      return
+    }
 
     let term = TermController(sceneRole: sceneRole)
     term.delegate = self
@@ -426,7 +516,47 @@ Please go to your subscriptions and cancel one of them!
     
     _currentKey = term.meta.key
     
-    _viewportsController.setViewControllers([term], direction: .forward, animated: animated) { (didComplete) in
+    _setViewportController(term, direction: .forward, animated: animated) { (didComplete) in
+      self._displayHUD()
+      self._attachInputToCurrentTerm()
+      completion?(didComplete)
+    }
+  }
+
+  private func _createStrictTmuxRuntimeShell(
+    source: TmuxShellCreationSource,
+    animated: Bool,
+    completion: ((Bool) -> Void)? = nil
+  ) {
+    guard source != .userInitiated else {
+      completion?(false)
+      return
+    }
+
+    if
+      let key = _strictTmuxRuntimeTerminalKey,
+      let term: TermController = SessionRegistry.shared.sessionFromIndexWith(key: key)
+    {
+      term.delegate = self
+      term.bgColor = view.backgroundColor ?? .black
+      _currentKey = nil
+      _setViewportController(term, direction: .forward, animated: animated) { didComplete in
+        self._displayHUD()
+        self._attachInputToCurrentTerm()
+        completion?(didComplete)
+      }
+      return
+    }
+
+    let term = TermController(sceneRole: sceneRole)
+    term.delegate = self
+    term.userActivity = nil
+    term.bgColor = view.backgroundColor ?? .black
+    SessionRegistry.shared.track(session: term)
+
+    _strictTmuxRuntimeTerminalKey = term.meta.key
+    _currentKey = nil
+    _setViewportController(term, direction: .forward, animated: animated) { didComplete in
       self._displayHUD()
       self._attachInputToCurrentTerm()
       completion?(didComplete)
@@ -439,6 +569,10 @@ Please go to your subscriptions and cancel one of them!
   }
   
   private func _removeCurrentSpace(attachInput: Bool = true) {
+    guard !_tmuxStrictModeEnabled else {
+      _returnToTmuxPaneInbox(animated: true)
+      return
+    }
     guard
       let currentKey = _currentKey,
       let idx = _viewportsKeys.firstIndex(of: currentKey)
@@ -468,26 +602,17 @@ Please go to your subscriptions and cancel one of them!
     
     self._currentKey = term.meta.key
     
-    _spaceControllerAnimating = true
-    _viewportsController.setViewControllers([term], direction: direction, animated: true) { (didComplete) in
+    _setViewportController(term, direction: direction, animated: true) { (didComplete) in
       self._displayHUD()
       if attachInput {
         self._attachInputToCurrentTerm()
       }
-      self._spaceControllerAnimating = false
+      _ = didComplete
     }
   }
   
   @objc func _focusOnShell() {
     _attachInputToCurrentTerm()
-  }
-
-  private func _disableTerminalPagingGesture() {
-    let scrollViews = _viewportsController.view.subviews.compactMap { $0 as? UIScrollView }
-    for scrollView in scrollViews {
-      scrollView.isScrollEnabled = false
-      scrollView.panGestureRecognizer.isEnabled = false
-    }
   }
 
   private func _setupTmuxChatsEdgeSwipeGesture() {
@@ -497,29 +622,34 @@ Please go to your subscriptions and cancel one of them!
     )
     gesture.edges = .left
     gesture.maximumNumberOfTouches = 1
+    gesture.cancelsTouchesInView = false
+    gesture.delaysTouchesBegan = false
+    gesture.delaysTouchesEnded = false
+    gesture.requiresExclusiveTouchType = false
     gesture.delegate = self
     view.addGestureRecognizer(gesture)
     _tmuxChatsEdgePanRecognizer = gesture
+    _updateTmuxChatsEdgeSwipeGestureState()
   }
 
-  private func _enforceTmuxStrictModeShellTopologyAtLaunch(preferredManagedKey: UUID?) {
+  private func _enforceTmuxStrictModeShellTopologyAtLaunch() {
     guard _tmuxStrictModeEnabled else {
       return
     }
     guard !_viewportsKeys.isEmpty else {
       return
     }
-    guard let preferredManagedKey, _viewportsKeys.contains(preferredManagedKey) else {
-      _terminateAndRemoveAllShells()
-      return
-    }
-
-    _ = _compactToSingleShell(preferredKey: preferredManagedKey)
-    _currentKey = preferredManagedKey
+    _terminateAndRemoveAllShells()
   }
 
   fileprivate func _hasTerminalKey(_ key: UUID) -> Bool {
-    _viewportsKeys.contains(key)
+    if _viewportsKeys.contains(key) {
+      return true
+    }
+    if _tmuxStrictModeEnabled, _strictTmuxRuntimeTerminalKey == key {
+      return true
+    }
+    return false
   }
 
   private var _canPresentTmuxChatsFromEdgeSwipe: Bool {
@@ -527,7 +657,7 @@ Please go to your subscriptions and cancel one of them!
       isWindowApplicationScene: sceneRole == .windowApplication,
       isSpaceControllerAnimating: _spaceControllerAnimating,
       hasPresentedViewController: presentedViewController != nil,
-      isTmuxPaneActive: _isTmuxManagedShellVisible,
+      isTmuxPaneActive: _isTmuxRoomUIActive,
       isTmuxChatsPresented: _isPresentingTmuxPaneInbox
     )
   }
@@ -588,13 +718,29 @@ Please go to your subscriptions and cancel one of them!
     }
   }
 
+  private func _terminateStrictTmuxRuntimeShell() {
+    guard let key = _strictTmuxRuntimeTerminalKey else {
+      return
+    }
+    if let ctrl: TermController = SessionRegistry.shared.sessionFromIndexWith(key: key) {
+      ctrl.delegate = nil
+      ctrl.terminate()
+      if ctrl.viewIsLoaded {
+        _ = ctrl.removeFromContainer()
+      }
+    }
+    SessionRegistry.shared.remove(forKey: key)
+    _tmuxPaneRouteCoordinator.onTerminalKeyRemoved(key)
+    _strictTmuxRuntimeTerminalKey = nil
+  }
+
   private func _terminateAndRemoveAllShells() {
+    _terminateStrictTmuxRuntimeShell()
     let keys = _viewportsKeys
     keys.forEach { _terminateAndRemoveShell(key: $0) }
     _viewportsKeys.removeAll()
     _currentKey = nil
-    _spaceControllerAnimating = false
-    _viewportsController.setViewControllers(nil, direction: .forward, animated: false)
+    _setViewportPlaceholder(animated: false)
     _hud?.hide(animated: false)
     _hud = nil
   }
@@ -617,6 +763,7 @@ Please go to your subscriptions and cancel one of them!
   }
 
   fileprivate func _returnToTmuxPaneInbox(animated: Bool, alertMessage: String? = nil) {
+    _setTmuxChatUIState(.list)
     _tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
     if _isPresentingTmuxPaneInbox {
       if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
@@ -648,10 +795,12 @@ Please go to your subscriptions and cancel one of them!
       return
     }
     _didPresentInitialTmuxPaneInbox = true
+    _setTmuxChatUIState(.list)
     _presentTmuxPaneInbox(animated: false)
   }
 
   private func _presentTmuxPaneInbox(animated: Bool) {
+    _setTmuxChatUIState(.list)
     guard !_isPresentingTmuxPaneInbox else {
       return
     }
@@ -790,15 +939,30 @@ Please go to your subscriptions and cancel one of them!
     
     let pages = UIPageControl()
     pages.currentPageIndicatorTintColor = .blinkHudDot
-    pages.numberOfPages = _viewportsKeys.count
-    let pageNum = _viewportsKeys.firstIndex(of: term.meta.key)
-    pages.currentPage = pageNum ?? NSNotFound
+    let strictTmuxSingleRuntimeMode = _tmuxStrictModeEnabled
+      && _viewportsKeys.isEmpty
+      && _strictTmuxRuntimeTerminalKey != nil
+    let pageNum: Int?
+    if strictTmuxSingleRuntimeMode {
+      pages.numberOfPages = 1
+      pages.currentPage = 0
+      pageNum = 0
+    } else {
+      pages.numberOfPages = _viewportsKeys.count
+      pageNum = _viewportsKeys.firstIndex(of: term.meta.key)
+      pages.currentPage = pageNum ?? NSNotFound
+    }
     
     hud.customView = pages
     
     let title = term.title?.isEmpty == true ? nil : term.title
     
-    var sceneTitle = "[\(pageNum == nil ? 1 : pageNum! + 1) of \(_viewportsKeys.count)] \(title ?? "blink")"
+    var sceneTitle: String
+    if strictTmuxSingleRuntimeMode {
+      sceneTitle = title ?? "tmux room"
+    } else {
+      sceneTitle = "[\(pageNum == nil ? 1 : pageNum! + 1) of \(_viewportsKeys.count)] \(title ?? "blink")"
+    }
     
     if params.rows == 0 && params.cols == 0 {
       hud.label.numberOfLines = 1
@@ -843,24 +1007,59 @@ extension SpaceController: UIGestureRecognizerDelegate {
     }
     return true
   }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    let edgeRecognizer: UIGestureRecognizer?
+    let other: UIGestureRecognizer
+    if gestureRecognizer === _tmuxChatsEdgePanRecognizer {
+      edgeRecognizer = gestureRecognizer
+      other = otherGestureRecognizer
+    } else if otherGestureRecognizer === _tmuxChatsEdgePanRecognizer {
+      edgeRecognizer = otherGestureRecognizer
+      other = gestureRecognizer
+    } else {
+      edgeRecognizer = nil
+      other = otherGestureRecognizer
+    }
+
+    guard edgeRecognizer != nil else {
+      return false
+    }
+    return tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: other.view)
+  }
 }
 
 // MARK: UIStateRestorable
 extension SpaceController: UIStateRestorable {
   func restore(withState state: UIState) {
-    _viewportsKeys = state.keys
-    _currentKey = state.currentKey
-    _restoredTmuxBridgeState = state.tmuxBridgeState
+    let restoredWorkspace = tmuxStrictModeRestoredWorkspace(
+      isStrictModeEnabled: _tmuxStrictModeEnabled,
+      keys: state.keys,
+      currentKey: state.currentKey,
+      tmuxBridgeState: state.tmuxBridgeState
+    )
+    _viewportsKeys = restoredWorkspace.keys
+    _currentKey = restoredWorkspace.currentKey
+    _restoredTmuxBridgeState = restoredWorkspace.tmuxBridgeState
     if let bgColor = UIColor(codableColor: state.bgColor) {
       view.backgroundColor = bgColor
     }
   }
   
   func dumpUIState() -> UIState {
-    return UIState(keys: _viewportsKeys,
-            currentKey: _currentKey,
+    let persistedWorkspace = tmuxStrictModeRestoredWorkspace(
+      isStrictModeEnabled: _tmuxStrictModeEnabled,
+      keys: _viewportsKeys,
+      currentKey: _currentKey,
+      tmuxBridgeState: _tmuxPaneRouteCoordinator.currentPersistedState
+    )
+    return UIState(keys: persistedWorkspace.keys,
+            currentKey: persistedWorkspace.currentKey,
             bgColor: CodableColor(uiColor: view.backgroundColor),
-            tmuxBridgeState: _tmuxPaneRouteCoordinator.currentPersistedState
+            tmuxBridgeState: persistedWorkspace.tmuxBridgeState
     )
   }
   
@@ -1135,6 +1334,9 @@ extension SpaceController {
   }
 
   private func _focusOtherWindowAction() {
+    guard !_tmuxStrictModeEnabled else {
+      return
+    }
     
     var sessions = _activeSessions()
     
@@ -1188,6 +1390,9 @@ extension SpaceController {
   }
   
   private func _moveToOtherWindowAction() {
+    guard !_tmuxStrictModeEnabled else {
+      return
+    }
     var sessions = _activeSessions()
     
     guard
@@ -1250,6 +1455,9 @@ extension SpaceController {
   }
   
   @objc func _newWindowAction() {
+    guard !_tmuxStrictModeEnabled else {
+      return
+    }
     let options = UIWindowScene.ActivationRequestOptions()
     options.requestingScene = self.view.window?.windowScene
     
@@ -1262,6 +1470,9 @@ extension SpaceController {
   }
   
   @objc func _closeWindowAction() {
+    guard !_tmuxStrictModeEnabled else {
+      return
+    }
     guard
       let session = view.window?.windowScene?.session,
       session.role == .windowApplication // Can't close windows on external monitor
@@ -1524,11 +1735,10 @@ extension SpaceController {
   }
 
   @objc func openTmuxPaneFromNotification(hostAlias: String, sessionName: String?, paneTarget: String) {
-    _interactiveSpaceController()._openTmuxPane(
+    _interactiveSpaceController()._showTmuxPaneInboxForNotification(
       hostAlias: hostAlias,
       sessionName: sessionName,
-      paneTarget: paneTarget,
-      source: .notificationTap
+      paneTarget: paneTarget
     )
   }
 
@@ -1564,7 +1774,30 @@ extension SpaceController {
     _markTmuxPaneReadIfPossible(hostAlias: cleanHost, paneTarget: cleanPane)
 
     let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
+    _setTmuxChatUIState(.room(request))
     _tmuxPaneRouteCoordinator.route(request: request, source: source)
+  }
+
+  private func _showTmuxPaneInboxForNotification(
+    hostAlias: String,
+    sessionName: String?,
+    paneTarget: String
+  ) {
+    guard _tmuxStrictModeEnabled else {
+      _openTmuxPane(
+        hostAlias: hostAlias,
+        sessionName: sessionName,
+        paneTarget: paneTarget,
+        source: .notificationTap
+      )
+      return
+    }
+    let request = TmuxNotificationRequest(hostAlias: hostAlias, sessionName: sessionName, paneTarget: paneTarget)
+    guard _canonicalTmuxRequest(request) != nil else {
+      showAlert(msg: "Invalid tmux pane request. Please verify host/session/pane.")
+      return
+    }
+    _returnToTmuxPaneInbox(animated: true)
   }
 
   private func _markTmuxPaneReadIfPossible(hostAlias: String, paneTarget: String) {
@@ -1745,6 +1978,7 @@ extension SpaceController {
         return
       }
       self._tmuxPaneRouteCoordinator.deactivate(reason: "maintenance_shell")
+      self._setTmuxChatUIState(.list)
       self._terminateAndRemoveAllShells()
       self._createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
         guard let self,
@@ -1812,6 +2046,17 @@ extension SpaceController {
         finishOnMain(nil, nil)
         return
       }
+      if self._tmuxStrictModeEnabled {
+        self._createShell(userActivity: nil, animated: false, source: .tmuxManaged) { [weak self] _ in
+          guard let self else {
+            finishOnMain(nil, nil)
+            return
+          }
+          let key = self._strictTmuxRuntimeTerminalKey
+          finishOnMain(key, self.currentTerm())
+        }
+        return
+      }
 
       if let keyToReuse = self._compactToSingleShell(preferredKey: preferredKey) {
         self._moveToShell(key: keyToReuse, animated: true) {
@@ -1866,11 +2111,10 @@ extension SpaceController {
     else {
       return
     }
-    _openTmuxPane(
+    _showTmuxPaneInboxForNotification(
       hostAlias: request.hostAlias,
       sessionName: request.sessionName,
-      paneTarget: request.paneTarget,
-      source: .notificationTap
+      paneTarget: request.paneTarget
     )
   }
 
@@ -1879,11 +2123,10 @@ extension SpaceController {
       return
     }
     Self._pendingTmuxRequest = nil
-    _openTmuxPane(
+    _showTmuxPaneInboxForNotification(
       hostAlias: request.hostAlias,
       sessionName: request.sessionName,
-      paneTarget: request.paneTarget,
-      source: .notificationTap
+      paneTarget: request.paneTarget
     )
   }
   
@@ -1988,14 +2231,13 @@ extension SpaceController {
       return currentIdx < idx ? .forward : .reverse
     }()
 
-    _spaceControllerAnimating = true
-    _viewportsController.setViewControllers([term], direction: direction, animated: animated) { (didComplete) in
+    _setViewportController(term, direction: direction, animated: animated) { (didComplete) in
       term.resumeIfNeeded()
       self._currentKey = term.meta.key
       self._displayHUD()
       self._attachInputToCurrentTerm()
-      self._spaceControllerAnimating = false
       completion?()
+      _ = didComplete
     }
   }
   
@@ -2032,6 +2274,12 @@ extension SpaceController {
 // MARK: CommandsHUDDelegate
 extension SpaceController: CommandsHUDDelegate {
   @objc func currentTerm() -> TermController? {
+    if _tmuxStrictModeEnabled,
+      let strictKey = _strictTmuxRuntimeTerminalKey,
+      let strictTerm: TermController = SessionRegistry.shared.sessionFromIndexWith(key: strictKey)
+    {
+      return strictTerm
+    }
     if let currentKey = _currentKey {
       return SessionRegistry.shared[currentKey]
     }
@@ -2099,6 +2347,11 @@ struct TmuxNotificationRequest: Equatable, Codable {
   let paneTarget: String
 }
 
+fileprivate enum TmuxChatUIState: Equatable {
+  case list
+  case room(TmuxNotificationRequest)
+}
+
 fileprivate enum TmuxPaneRouteSource {
   case manual
   case notificationTap
@@ -2138,6 +2391,32 @@ func tmuxPaneBridgeFailureIsRetryable(_ reason: String?) -> Bool {
   return !nonRetryableMarkers.contains(where: { normalized.contains($0) })
 }
 
+struct TmuxStrictModeWorkspaceState {
+  let keys: [UUID]
+  let currentKey: UUID?
+  let tmuxBridgeState: TmuxPaneBridgePersistedState?
+}
+
+func tmuxStrictModeRestoredWorkspace(
+  isStrictModeEnabled: Bool,
+  keys: [UUID],
+  currentKey: UUID?,
+  tmuxBridgeState: TmuxPaneBridgePersistedState?
+) -> TmuxStrictModeWorkspaceState {
+  guard isStrictModeEnabled else {
+    return TmuxStrictModeWorkspaceState(
+      keys: keys,
+      currentKey: currentKey,
+      tmuxBridgeState: tmuxBridgeState
+    )
+  }
+  return TmuxStrictModeWorkspaceState(
+    keys: [],
+    currentKey: nil,
+    tmuxBridgeState: nil
+  )
+}
+
 func tmuxPaneBridgeRestoredState(
   _ state: TmuxPaneBridgePersistedState?,
   canonicalizeRequest: (TmuxNotificationRequest) -> TmuxNotificationRequest?,
@@ -2160,25 +2439,6 @@ func tmuxPaneBridgeRestoredState(
     retryAttempt: 0,
     lastFailureReason: nil
   )
-}
-
-func tmuxManagedShellIsVisible(
-  managedTerminalKey: UUID?,
-  currentTerminalKey: UUID?,
-  viewportKeys: [UUID],
-  hasActiveRoute: Bool
-) -> Bool {
-  if let managedTerminalKey {
-    return currentTerminalKey == managedTerminalKey && viewportKeys.contains(managedTerminalKey)
-  }
-
-  guard hasActiveRoute else {
-    return false
-  }
-  guard viewportKeys.count == 1, let onlyKey = viewportKeys.first else {
-    return false
-  }
-  return currentTerminalKey == onlyKey
 }
 
 struct TmuxPaneBridgePersistedState: Codable, Equatable {
@@ -2633,7 +2893,7 @@ func tmuxTerminalPagingCommandDisabled(_ cmd: Command) -> Bool {
 
 func tmuxTerminalStrictModeCommandDisabled(_ cmd: Command) -> Bool {
   switch cmd {
-  case .tabMoveToOtherWindow:
+  case .tabMoveToOtherWindow, .windowNew, .windowClose, .windowFocusOther:
     return true
   default:
     return false
@@ -2684,6 +2944,27 @@ func tmuxChatsEdgeSwipeShouldPresentChats(
     return true
   }
   return velocityX >= minVelocity
+}
+
+func tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with view: UIView?) -> Bool {
+  guard let view else {
+    return false
+  }
+  if view is UIScrollView || view is WKWebView {
+    return true
+  }
+  let className = NSStringFromClass(type(of: view)).lowercased()
+  return className.contains("wkcontent")
+}
+
+func tmuxViewportTransitionControllers(
+  requestedControllers: [UIViewController],
+  placeholder: UIViewController
+) -> [UIViewController] {
+  if let first = requestedControllers.first {
+    return [first]
+  }
+  return [placeholder]
 }
 
 struct TmuxPaneInboxItem: Equatable {

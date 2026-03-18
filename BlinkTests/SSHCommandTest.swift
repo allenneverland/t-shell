@@ -31,6 +31,7 @@
 
 
 import XCTest
+import WebKit
 
 @testable import Blink
 
@@ -351,64 +352,44 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
   }
 }
 
-final class TmuxManagedShellVisibilityTests: XCTestCase {
-  func testManagedShellVisibilityRequiresManagedKeyToBeCurrentAndTracked() {
-    let managedKey = UUID()
-    let otherKey = UUID()
-
-    XCTAssertTrue(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: managedKey,
-        currentTerminalKey: managedKey,
-        viewportKeys: [managedKey],
-        hasActiveRoute: true
-      )
-    )
-    XCTAssertFalse(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: managedKey,
-        currentTerminalKey: otherKey,
-        viewportKeys: [managedKey],
-        hasActiveRoute: true
-      )
-    )
-    XCTAssertFalse(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: managedKey,
-        currentTerminalKey: managedKey,
-        viewportKeys: [otherKey],
-        hasActiveRoute: true
-      )
-    )
+final class TmuxChatsEdgeSwipeGestureInteropTests: XCTestCase {
+  func testAllowsSimultaneousRecognitionWithScrollableTerminalViews() {
+    XCTAssertTrue(tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: UIScrollView()))
+    XCTAssertTrue(tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: WKWebView(frame: .zero)))
+    XCTAssertTrue(tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: UIViewMockWKContent()))
   }
 
-  func testManagedShellVisibilityAllowsRestoreFallbackForSingleShell() {
-    let onlyShellKey = UUID()
+  func testRejectsUnrelatedViews() {
+    XCTAssertFalse(tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: nil))
+    XCTAssertFalse(tmuxChatsEdgeSwipeAllowsSimultaneousRecognition(with: UIView()))
+  }
+}
 
-    XCTAssertTrue(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: nil,
-        currentTerminalKey: onlyShellKey,
-        viewportKeys: [onlyShellKey],
-        hasActiveRoute: true
-      )
+private final class UIViewMockWKContent: UIView {}
+
+final class TmuxViewportTransitionControllersTests: XCTestCase {
+  func testUsesPlaceholderWhenNoRequestedController() {
+    let placeholder = UIViewController()
+    let resolved = tmuxViewportTransitionControllers(
+      requestedControllers: [],
+      placeholder: placeholder
     )
-    XCTAssertFalse(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: nil,
-        currentTerminalKey: onlyShellKey,
-        viewportKeys: [onlyShellKey, UUID()],
-        hasActiveRoute: true
-      )
+
+    XCTAssertEqual(resolved.count, 1)
+    XCTAssertTrue(resolved.first === placeholder)
+  }
+
+  func testUsesFirstRequestedController() {
+    let first = UIViewController()
+    let second = UIViewController()
+    let placeholder = UIViewController()
+    let resolved = tmuxViewportTransitionControllers(
+      requestedControllers: [first, second],
+      placeholder: placeholder
     )
-    XCTAssertFalse(
-      tmuxManagedShellIsVisible(
-        managedTerminalKey: nil,
-        currentTerminalKey: onlyShellKey,
-        viewportKeys: [onlyShellKey],
-        hasActiveRoute: false
-      )
-    )
+
+    XCTAssertEqual(resolved.count, 1)
+    XCTAssertTrue(resolved.first === first)
   }
 }
 
@@ -473,6 +454,50 @@ final class TmuxPaneBridgeRestoreStateTests: XCTestCase {
   }
 }
 
+final class TmuxStrictModeWorkspaceStateTests: XCTestCase {
+  func testStrictModeClearsRestoredWorkspaceForColdLaunch() {
+    let key = UUID()
+    let bridgeState = TmuxPaneBridgePersistedState(
+      request: TmuxNotificationRequest(hostAlias: "host", sessionName: "work", paneTarget: "work:1.1"),
+      managedTabKey: key,
+      retryAttempt: 2,
+      lastFailureReason: "stale"
+    )
+
+    let restored = tmuxStrictModeRestoredWorkspace(
+      isStrictModeEnabled: true,
+      keys: [key],
+      currentKey: key,
+      tmuxBridgeState: bridgeState
+    )
+
+    XCTAssertEqual(restored.keys, [])
+    XCTAssertNil(restored.currentKey)
+    XCTAssertNil(restored.tmuxBridgeState)
+  }
+
+  func testNonStrictModePreservesWorkspaceState() {
+    let key = UUID()
+    let bridgeState = TmuxPaneBridgePersistedState(
+      request: TmuxNotificationRequest(hostAlias: "host", sessionName: "work", paneTarget: "work:1.1"),
+      managedTabKey: key,
+      retryAttempt: 0,
+      lastFailureReason: nil
+    )
+
+    let restored = tmuxStrictModeRestoredWorkspace(
+      isStrictModeEnabled: false,
+      keys: [key],
+      currentKey: key,
+      tmuxBridgeState: bridgeState
+    )
+
+    XCTAssertEqual(restored.keys, [key])
+    XCTAssertEqual(restored.currentKey, key)
+    XCTAssertEqual(restored.tmuxBridgeState, bridgeState)
+  }
+}
+
 final class TmuxTerminalPagingDisableTests: XCTestCase {
   func testPagingCommandsAreDisabled() {
     let disabled: [Command] = [
@@ -493,13 +518,16 @@ final class TmuxTerminalPagingDisableTests: XCTestCase {
 }
 
 final class TmuxTerminalStrictModeDisableTests: XCTestCase {
-  func testStrictModeDisablesMoveToOtherWindow() {
+  func testStrictModeDisablesWindowCommands() {
     XCTAssertTrue(tmuxTerminalStrictModeCommandDisabled(.tabMoveToOtherWindow))
+    XCTAssertTrue(tmuxTerminalStrictModeCommandDisabled(.windowNew))
+    XCTAssertTrue(tmuxTerminalStrictModeCommandDisabled(.windowClose))
+    XCTAssertTrue(tmuxTerminalStrictModeCommandDisabled(.windowFocusOther))
   }
 
-  func testStrictModeKeepsOtherCommandsEnabled() {
+  func testStrictModeKeepsChatFlowCommandsEnabled() {
     XCTAssertFalse(tmuxTerminalStrictModeCommandDisabled(.tabNew))
-    XCTAssertFalse(tmuxTerminalStrictModeCommandDisabled(.windowClose))
+    XCTAssertFalse(tmuxTerminalStrictModeCommandDisabled(.tabClose))
   }
 }
 
