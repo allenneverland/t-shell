@@ -191,6 +191,16 @@ final class TmuxControlPlaneRouteTests: XCTestCase {
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("HTTP 500") ?? false)
     XCTAssertTrue(message?.localizedCaseInsensitiveContains("internal server error from upstream") ?? false)
   }
+
+  func testUnauthorizedMessageDifferentiatesDeviceAndServiceCredentials() {
+    let service = tmuxControlUnauthorizedMessageForTesting(scope: "service")
+    let device = tmuxControlUnauthorizedMessageForTesting(scope: "device")
+
+    XCTAssertTrue(service?.localizedCaseInsensitiveContains("service credentials") ?? false)
+    XCTAssertTrue(service?.localizedCaseInsensitiveContains("service token") ?? false)
+    XCTAssertTrue(device?.localizedCaseInsensitiveContains("device credentials") ?? false)
+    XCTAssertTrue(device?.localizedCaseInsensitiveContains("re-register tmux push") ?? false)
+  }
 }
 
 final class TmuxPickerDisplayTests: XCTestCase {
@@ -349,6 +359,191 @@ final class TmuxChatsEdgeSwipeTests: XCTestCase {
         velocityX: 1200
       )
     )
+  }
+}
+
+final class TmuxChatsEdgeSwipeBlockReasonTests: XCTestCase {
+  func testReturnsExpectedBlockingReasons() {
+    XCTAssertEqual(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: false,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: false
+      ),
+      .sceneNotWindowApplication
+    )
+
+    XCTAssertEqual(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: false,
+        isTmuxChatsPresented: false
+      ),
+      .paneRoomInactive
+    )
+
+    XCTAssertEqual(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: true,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: false
+      ),
+      .chatTransitionInFlight
+    )
+
+    XCTAssertEqual(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: true
+      ),
+      .chatsAlreadyPresented
+    )
+
+    XCTAssertEqual(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: true,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: false
+      ),
+      .modalPresented
+    )
+  }
+
+  func testReturnsNilWhenSwipeCanPresentChats() {
+    XCTAssertNil(
+      tmuxChatsEdgeSwipePresentationBlockReason(
+        isWindowApplicationScene: true,
+        isSpaceControllerAnimating: false,
+        hasPresentedViewController: false,
+        isTmuxPaneActive: true,
+        isTmuxChatsPresented: false
+      )
+    )
+  }
+}
+
+final class TmuxChatTransitionDirectionTests: XCTestCase {
+  func testNoTransitionWhenStatesMatch() {
+    XCTAssertEqual(
+      tmuxChatTransitionDirection(fromIsList: true, toIsList: true),
+      .none
+    )
+    XCTAssertEqual(
+      tmuxChatTransitionDirection(fromIsList: false, toIsList: false),
+      .none
+    )
+  }
+
+  func testListToRoomUsesPushDirection() {
+    XCTAssertEqual(
+      tmuxChatTransitionDirection(fromIsList: true, toIsList: false),
+      .listToRoom
+    )
+  }
+
+  func testRoomToListUsesPopDirection() {
+    XCTAssertEqual(
+      tmuxChatTransitionDirection(fromIsList: false, toIsList: true),
+      .roomToList
+    )
+  }
+}
+
+final class TmuxInputFocusPolicyTests: XCTestCase {
+  func testStrictModeListNeverAttachesInput() {
+    XCTAssertFalse(
+      tmuxShouldAttachInput(
+        isStrictModeEnabled: true,
+        isRoomUIActive: false,
+        isTransitionInFlight: false,
+        isPaneInboxPresented: true
+      )
+    )
+  }
+
+  func testStrictModeRoomAttachesInputWhenStable() {
+    XCTAssertTrue(
+      tmuxShouldAttachInput(
+        isStrictModeEnabled: true,
+        isRoomUIActive: true,
+        isTransitionInFlight: false,
+        isPaneInboxPresented: false
+      )
+    )
+  }
+
+  func testStrictModeTransitionBlocksInputAttach() {
+    XCTAssertFalse(
+      tmuxShouldAttachInput(
+        isStrictModeEnabled: true,
+        isRoomUIActive: true,
+        isTransitionInFlight: true,
+        isPaneInboxPresented: false
+      )
+    )
+  }
+
+  func testNonStrictModeAlwaysAllowsInputAttach() {
+    XCTAssertTrue(
+      tmuxShouldAttachInput(
+        isStrictModeEnabled: false,
+        isRoomUIActive: false,
+        isTransitionInFlight: true,
+        isPaneInboxPresented: true
+      )
+    )
+  }
+}
+
+final class TmuxMenuShortcutPolicyTests: XCTestCase {
+  func testReservedShortcutConflictDetectionMatchesSystemBindings() {
+    XCTAssertTrue(tmuxReservedShortcutConflicts(input: ",", modifiers: .command))
+    XCTAssertTrue(tmuxReservedShortcutConflicts(input: "o", modifiers: .command))
+  }
+
+  func testReservedShortcutConflictDetectionAllowsNonReservedBindings() {
+    XCTAssertFalse(tmuxReservedShortcutConflicts(input: "o", modifiers: [.command, .shift]))
+    XCTAssertFalse(tmuxReservedShortcutConflicts(input: "w", modifiers: .command))
+  }
+
+  func testStrictMenuProfileRemovesWindowCommands() {
+    let profile = tmuxMenuProfileCommands(isStrictModeEnabled: true)
+    XCTAssertEqual(profile.shell, [.tabClose, .configShow])
+    XCTAssertEqual(profile.window, [])
+  }
+}
+
+final class TmuxShortcutSanitizeTests: XCTestCase {
+  func testSanitizeRemovesLegacyWindowAndConfigDefaults() {
+    let kept = KeyShortcut(.tabClose, .command, "w")
+    let oldWindow = KeyShortcut(.windowFocusOther, .command, "o")
+    let oldWindowNew = KeyShortcut(.windowNew, [.command, .shift], "t")
+    let oldConfig = KeyShortcut(.configShow, .command, ",")
+
+    let sanitized = tmuxSanitizedStrictModeShortcuts([kept, oldWindow, oldWindowNew, oldConfig])
+    XCTAssertEqual(sanitized.count, 1)
+    XCTAssertTrue(sanitized.first === kept)
+  }
+
+  func testSanitizeKeepsCustomShortcutVariants() {
+    let customConfig = KeyShortcut(.configShow, [.command, .shift], ",")
+    let customWindowFocus = KeyShortcut(.windowFocusOther, [.command, .shift], "o")
+
+    let sanitized = tmuxSanitizedStrictModeShortcuts([customConfig, customWindowFocus])
+    XCTAssertEqual(sanitized.count, 2)
+    XCTAssertTrue(sanitized.contains(where: { $0 === customConfig }))
+    XCTAssertTrue(sanitized.contains(where: { $0 === customWindowFocus }))
   }
 }
 
@@ -534,6 +729,21 @@ final class TmuxTerminalStrictModeDisableTests: XCTestCase {
 final class TmuxPaneBridgeRetryPolicyTests: XCTestCase {
   func testRetryPolicyUsesThreeAttemptsByDefault() {
     XCTAssertEqual(tmuxPaneBridgeMaximumRetryAttempts(), 3)
+  }
+
+  func testFailureCodePolicyBlocksNonRetryableFailures() {
+    XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: .authRejected, reason: "temporary network hiccup"))
+    XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: .configurationError, reason: "connection reset"))
+  }
+
+  func testFailureCodePolicyAllowsRetryableFailures() {
+    XCTAssertTrue(tmuxPaneBridgeFailureShouldRetry(code: .transport, reason: "rejected credentials"))
+    XCTAssertTrue(tmuxPaneBridgeFailureShouldRetry(code: .commandFailed, reason: "configuration error"))
+  }
+
+  func testFallbackPolicyUsesReasonWhenFailureCodeMissing() {
+    XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: nil, reason: "Tmux endpoint rejected credentials"))
+    XCTAssertTrue(tmuxPaneBridgeFailureShouldRetry(code: nil, reason: "connection reset by peer"))
   }
 }
 

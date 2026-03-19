@@ -37,6 +37,49 @@ import UIKit
 
 fileprivate var attachedShortcuts: [UIKeyCommand] = []
 
+struct TmuxMenuProfileCommands: Equatable {
+  let shell: [Command]
+  let window: [Command]
+}
+
+func tmuxStrictMenuProfileEnabled(connectedSceneRoles: [UISceneSession.Role]) -> Bool {
+  if connectedSceneRoles.isEmpty {
+    return true
+  }
+  return connectedSceneRoles.contains(.windowApplication)
+}
+
+func tmuxMenuProfileCommands(isStrictModeEnabled: Bool) -> TmuxMenuProfileCommands {
+  if isStrictModeEnabled {
+    return TmuxMenuProfileCommands(
+      shell: [.tabClose, .configShow],
+      window: []
+    )
+  }
+  return TmuxMenuProfileCommands(
+    shell: [.windowNew, .windowClose, .tabClose, .configShow],
+    window: [.windowFocusOther, .tabMoveToOtherWindow]
+  )
+}
+
+func tmuxShortcutSignature(input: String?, modifiers: UIKeyModifierFlags) -> String? {
+  guard let rawInput = input?.lowercased(), !rawInput.isEmpty else {
+    return nil
+  }
+  return "\(modifiers.rawValue)|\(rawInput)"
+}
+
+func tmuxReservedShortcutConflicts(input: String?, modifiers: UIKeyModifierFlags) -> Bool {
+  guard let signature = tmuxShortcutSignature(input: input, modifiers: modifiers) else {
+    return false
+  }
+  let reserved: Set<String> = [
+    "\(UIKeyModifierFlags.command.rawValue)|,",
+    "\(UIKeyModifierFlags.command.rawValue)|o"
+  ]
+  return reserved.contains(signature)
+}
+
 
 //To rebuild a menu, call the setNeedsRebuild method. Call setNeedsRevalidate when you need the menu system to revalidate a menu.
 @objc public class MenuController: NSObject {
@@ -68,25 +111,38 @@ fileprivate var attachedShortcuts: [UIKeyCommand] = []
   }
 
   override private init() {}
+
+  private class func _isStrictTmuxMenuProfileEnabled() -> Bool {
+    let roles = UIApplication.shared.connectedScenes.compactMap { scene -> UISceneSession.Role? in
+      guard let windowScene = scene as? UIWindowScene else {
+        return nil
+      }
+      return windowScene.session.role
+    }
+    return tmuxStrictMenuProfileEnabled(connectedSceneRoles: roles)
+  }
   
   @objc public class func buildMenu(with builder: UIMenuBuilder) {
     // We will embed our own textSize inside View, so just remove to avoid collisions.
     builder.remove(menu: .textSize)
     
     let kbConfig = KBTracker.shared.loadConfig()
+    let menuProfile = tmuxMenuProfileCommands(isStrictModeEnabled: _isStrictTmuxMenuProfileEnabled())
 
     attachedShortcuts = []
-    let shellMenuCommands:  [UICommand] = ShellMenu.allCases.map  { _generate(Command(rawValue: $0.rawValue)!, with: kbConfig) }
+    let shellMenuCommands:  [UICommand] = menuProfile.shell.map  { _generate($0, with: kbConfig) }
     let editMenuCommands:   [UICommand] = EditMenu.allCases.map   { _generate(Command(rawValue: $0.rawValue)!, with: kbConfig) }
       + Self.remainingStandardEditMenuCommands()
     let viewMenuCommands:   [UICommand] = ViewMenu.allCases.map   { _generate(Command(rawValue: $0.rawValue)!, with: kbConfig) }
-    let windowMenuCommands: [UICommand] = WindowMenu.allCases.map { _generate(Command(rawValue: $0.rawValue)!, with: kbConfig) }
+    let windowMenuCommands: [UICommand] = menuProfile.window.map { _generate($0, with: kbConfig) }
 
-    builder.insertSibling(UIMenu(title: "Shell",
-                                 image: nil,
-                                 identifier: UIMenu.Identifier("com.allenneverland.tshell.menus.shellMenu"),
-                                 options: [],
-                                 children: shellMenuCommands), beforeMenu: .edit)
+    if !shellMenuCommands.isEmpty {
+      builder.insertSibling(UIMenu(title: "Shell",
+                                   image: nil,
+                                   identifier: UIMenu.Identifier("com.allenneverland.tshell.menus.shellMenu"),
+                                   options: [],
+                                   children: shellMenuCommands), beforeMenu: .edit)
+    }
   
     // remove cmd+b, cmd+i and cmd+u
     builder.remove(menu: .textStyle)
@@ -106,7 +162,11 @@ fileprivate var attachedShortcuts: [UIKeyCommand] = []
 
     builder.replaceChildren(ofMenu: .standardEdit) { _ in editMenuCommands   }
     builder.replaceChildren(ofMenu: .view)         { _ in viewMenuCommands  }
-    builder.replaceChildren(ofMenu: .window)       { _ in windowMenuCommands }
+    if windowMenuCommands.isEmpty {
+      builder.remove(menu: .window)
+    } else {
+      builder.replaceChildren(ofMenu: .window) { _ in windowMenuCommands }
+    }
     
   }
   
@@ -123,6 +183,14 @@ fileprivate var attachedShortcuts: [UIKeyCommand] = []
       return false
     })
     {
+      if tmuxReservedShortcutConflicts(input: shortcut.input, modifiers: shortcut.modifiers) {
+        return UICommand(
+          title: command.title,
+          image: nil,
+          action: #selector(SpaceController._onShortcut(_:)),
+          propertyList: ["Command": command.rawValue]
+        )
+      }
       // The same shortcut, or the same action, will make this crash with a
       // 'NSInternalInconsistencyException', reason: 'replacement menu has duplicate submenu,
       // command or key command, or a key command is missing input or action'.

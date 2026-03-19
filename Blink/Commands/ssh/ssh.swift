@@ -1179,6 +1179,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
       _emitLifecycleEvent(
         .failed,
         reason: TmuxPaneBridgeError.missingSessionName.localizedDescription,
+        failureCode: .invalidRequest,
         terminal: true
       )
       return -1
@@ -1201,7 +1202,12 @@ private final class TmuxControlModeInputBridge: WriterTo {
     } catch {
       let reason = "Configuration error - \(error)"
       print(reason, to: &stderr)
-      _emitLifecycleEvent(.failed, reason: reason, terminal: true)
+      _emitLifecycleEvent(
+        .failed,
+        reason: reason,
+        failureCode: _failureCode(for: error, fallbackReason: reason),
+        terminal: true
+      )
       return -1
     }
 
@@ -1230,7 +1236,12 @@ private final class TmuxControlModeInputBridge: WriterTo {
           guard let self else { return }
           let reason = "SSH session exception: \(error)"
           print(reason, to: &self.stderr)
-          self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
+          self._emitLifecycleEvent(
+            .failed,
+            reason: reason,
+            failureCode: self._failureCode(for: error, fallbackReason: reason),
+            terminal: true
+          )
           self.exitCode = -1
           self.kill()
         }
@@ -1263,7 +1274,12 @@ private final class TmuxControlModeInputBridge: WriterTo {
           case .failure(let error):
             let reason = "Error connecting tmux pane bridge. \(error)"
             print(reason, to: &self.stderr)
-            self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
+            self._emitLifecycleEvent(
+              .failed,
+              reason: reason,
+              failureCode: self._failureCode(for: error, fallbackReason: reason),
+              terminal: true
+            )
             self.exitCode = -1
             self.kill()
           case .finished:
@@ -1334,7 +1350,12 @@ private final class TmuxControlModeInputBridge: WriterTo {
           outputBridge.flushPendingLine()
           let reason = "Tmux pane bridge failed. \(error)"
           print(reason, to: &self.stderr)
-          self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
+          self._emitLifecycleEvent(
+            .failed,
+            reason: reason,
+            failureCode: self._failureCode(for: error, fallbackReason: reason),
+            terminal: true
+          )
           self.exitCode = -1
           self.kill()
         }
@@ -1346,9 +1367,14 @@ private final class TmuxControlModeInputBridge: WriterTo {
             self.exitCode = -1
             let reason = "Tmux pane bridge exited with status \(status) for \(sessionName) \(paneTarget)."
             print(reason, to: &self.stderr)
-            self._emitLifecycleEvent(.failed, reason: reason, terminal: true)
+            self._emitLifecycleEvent(
+              .failed,
+              reason: reason,
+              failureCode: .exitedNonZero,
+              terminal: true
+            )
           } else {
-            self._emitLifecycleEvent(.disconnected, terminal: true)
+            self._emitLifecycleEvent(.disconnected, failureCode: .disconnected, terminal: true)
           }
           self.kill()
         }
@@ -1450,9 +1476,83 @@ private final class TmuxControlModeInputBridge: WriterTo {
     didSendTerminalLifecycleEvent = false
   }
 
+  private func _failureCode(for error: Error, fallbackReason: String?) -> TmuxPaneBridgeFailureCode {
+    if let bridgeError = error as? TmuxPaneBridgeError {
+      switch bridgeError {
+      case .missingHostAlias, .missingPaneTarget, .missingSessionName, .invalidPaneID:
+        return .invalidRequest
+      case .remoteCommandFailed(let output):
+        return _failureCode(from: output)
+      }
+    }
+    return _failureCode(from: "\(fallbackReason ?? "") \(error.localizedDescription)")
+  }
+
+  private func _failureCode(from message: String?) -> TmuxPaneBridgeFailureCode {
+    let normalized = message?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    guard !normalized.isEmpty else {
+      return .unknown
+    }
+
+    if normalized.contains("missing host alias")
+      || normalized.contains("missing pane target")
+      || normalized.contains("missing session name")
+      || normalized.contains("invalid tmux pane bridge token")
+      || normalized.contains("invalid or expired tmux pane bridge request id")
+      || normalized.contains("failed to resolve pane id")
+    {
+      return .invalidRequest
+    }
+
+    if normalized.contains("configuration error") {
+      return .configurationError
+    }
+
+    if normalized.contains("rejected credentials")
+      || normalized.contains("permission denied")
+      || normalized.contains("authentication failed")
+      || normalized.contains("host key verification failed")
+      || normalized.contains("publickey")
+    {
+      return .authRejected
+    }
+
+    if normalized.contains("invalid or insecure")
+      || normalized.contains("invalid url")
+      || normalized.contains("unsupported url")
+      || normalized.contains("unsupported endpoint")
+    {
+      return .endpointInvalid
+    }
+
+    if normalized.contains("host not found")
+      || normalized.contains("name or service not known")
+      || normalized.contains("no such host")
+      || normalized.contains("could not resolve hostname")
+    {
+      return .hostNotFound
+    }
+
+    if normalized.contains("timed out")
+      || normalized.contains("network is unreachable")
+      || normalized.contains("connection reset")
+      || normalized.contains("connection refused")
+      || normalized.contains("software caused connection abort")
+    {
+      return .transport
+    }
+
+    if normalized.contains("exited with status") {
+      return .exitedNonZero
+    }
+
+    return .commandFailed
+  }
+
   private func _emitLifecycleEvent(
     _ event: TmuxPaneBridgeLifecycleEvent,
     reason: String? = nil,
+    failureCode: TmuxPaneBridgeFailureCode? = nil,
     terminal: Bool = false
   ) {
     guard let request = lifecycleRequest else {
@@ -1472,17 +1572,22 @@ private final class TmuxControlModeInputBridge: WriterTo {
     }
 
     let cleanReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanFailureCode = failureCode?.rawValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     DispatchQueue.main.async {
+      var userInfo: [String: String] = [
+        TmuxPaneBridgeLifecycleUserInfoKey.event: event.rawValue,
+        TmuxPaneBridgeLifecycleUserInfoKey.hostAlias: request.hostAlias,
+        TmuxPaneBridgeLifecycleUserInfoKey.sessionName: request.sessionName ?? "",
+        TmuxPaneBridgeLifecycleUserInfoKey.paneTarget: request.paneTarget,
+        TmuxPaneBridgeLifecycleUserInfoKey.reason: cleanReason ?? ""
+      ]
+      if !cleanFailureCode.isEmpty {
+        userInfo[TmuxPaneBridgeLifecycleUserInfoKey.failureCode] = cleanFailureCode
+      }
       NotificationCenter.default.post(
         name: .BLKTmuxPaneBridgeLifecycle,
         object: nil,
-        userInfo: [
-          TmuxPaneBridgeLifecycleUserInfoKey.event: event.rawValue,
-          TmuxPaneBridgeLifecycleUserInfoKey.hostAlias: request.hostAlias,
-          TmuxPaneBridgeLifecycleUserInfoKey.sessionName: request.sessionName ?? "",
-          TmuxPaneBridgeLifecycleUserInfoKey.paneTarget: request.paneTarget,
-          TmuxPaneBridgeLifecycleUserInfoKey.reason: cleanReason ?? ""
-        ]
+        userInfo: userInfo
       )
     }
   }

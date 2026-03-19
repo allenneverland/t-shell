@@ -106,3 +106,21 @@ class MigrationRestoreUpstreamCoreShortcuts: MigrationStep {
     }
   }
 }
+
+class MigrationNormalizeStrictTmuxShortcuts: MigrationStep {
+  var version: Int { get { 1910 } }
+
+  func execute() throws {
+    guard KBTracker.shared.kbAlreadyConfigured() else {
+      return
+    }
+
+    let cfg = KBTracker.shared.loadConfig()
+    let sanitized = tmuxSanitizedStrictModeShortcuts(cfg.shortcuts)
+    guard sanitized.count != cfg.shortcuts.count else {
+      return
+    }
+    cfg.shortcuts = sanitized
+    KBTracker.shared.saveAndApply(config: cfg)
+  }
+}

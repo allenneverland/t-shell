@@ -39,6 +39,7 @@
 + (NSString * _Nullable)currentAPNSToken;
 + (BOOL)isAPNSSandboxEnvironment;
 + (void)requestRemoteNotificationsRegistrationIfNeeded;
++ (void)requestTmuxPushRegistrationForHostAlias:(NSString * _Nonnull)hostAlias;
 + (NSString * _Nullable)tmuxAPNsPrivateKeyForHostAlias:(NSString * _Nonnull)hostAlias;
 + (void)setTmuxAPNsPrivateKey:(NSString * _Nullable)privateKey forHostAlias:(NSString * _Nonnull)hostAlias;
 + (void)removeTmuxAPNsPrivateKeyForHostAlias:(NSString * _Nonnull)hostAlias;

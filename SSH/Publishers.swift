@@ -41,30 +41,20 @@ extension Publisher {
   func tryOperation<T, U>(_ operation: @escaping (U) throws -> T)
   -> AnyPublisher<T, Error> where Self == AnyPublisher<U, Error> {
     var doTry = true
-    
-    Swift.print("Scheduling on: %p", String(format: "%p", RunLoop.current))
+
     return self.tryMap { p -> T in
-      if RunLoop.current != RunLoop.main {
-        Swift.print(String(format: "%p", RunLoop.current))
-      }
       while doTry {
         do {
           return try operation(p)
         } catch SSHError.again {
           RunLoop.current.run(mode: libSSHBlockMode, before: Date(timeIntervalSinceNow: 0.5))
           //CFRunLoopRunInMode(libSSHBlockMode, 0.5, true)
-          Swift.print("Retrying..")
           continue
         }
       }
       throw SSHError(title: "Operation cancelled")
     }
     .handleEvents(receiveCancel: {
-      Swift.print("Cancelling on: %p", String(format: "%p", RunLoop.current))
-
-      if RunLoop.current != RunLoop.main {
-        Swift.print("?????????")
-      }
       doTry = false
     })
     .eraseToAnyPublisher()

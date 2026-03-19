@@ -86,6 +86,10 @@ class SpaceController: UIViewController {
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   private var _restoredTmuxBridgeState: TmuxPaneBridgePersistedState? = nil
   private var _tmuxChatUIState: TmuxChatUIState = .list
+  private var _tmuxPaneInboxNavigationController: UINavigationController? = nil
+  private var _tmuxChatTransitionInFlight: Bool = false
+  private var _tmuxChatTransitionGeneration: UInt64 = 0
+  private var _tmuxRoomToListInteractiveContext: TmuxRoomToListInteractiveContext? = nil
   private lazy var _tmuxPaneRouteCoordinator = TmuxPaneRouteCoordinator(spaceController: self)
   private var _strictTmuxRuntimeTerminalKey: UUID? = nil
   private var _viewportTransitionGeneration: UInt64 = 0
@@ -95,6 +99,11 @@ class SpaceController: UIViewController {
     sceneRole == .windowApplication
   }
 
+  private struct TmuxRoomToListInteractiveContext {
+    var width: CGFloat
+    var progress: CGFloat
+  }
+
   private var _isTmuxRoomUIActive: Bool {
     if case .room = _tmuxChatUIState {
       return true
@@ -102,9 +111,386 @@ class SpaceController: UIViewController {
     return false
   }
 
+  private var _canAttachInputInCurrentTmuxState: Bool {
+    tmuxShouldAttachInput(
+      isStrictModeEnabled: _tmuxStrictModeEnabled,
+      isRoomUIActive: _isTmuxRoomUIActive,
+      isTransitionInFlight: _tmuxChatTransitionInFlight,
+      isPaneInboxPresented: _isPresentingTmuxPaneInbox
+    )
+  }
+
+  private func _disarmCurrentInputFocusForTmuxList() {
+    guard _tmuxStrictModeEnabled else {
+      return
+    }
+    _ = currentDevice?.view?.browserView?.resignFirstResponder()
+    _ = currentDevice?.view?.webView?.resignFirstResponder()
+    _ = KBTracker.shared.input?.resignFirstResponder()
+    KBTracker.shared.attach(input: nil)
+    currentDevice?.blur()
+  }
+
+  private func _prepareInputForShellTeardown(completion: @escaping () -> Void) {
+    _disarmCurrentInputFocusForTmuxList()
+    DispatchQueue.main.async {
+      completion()
+    }
+  }
+
   private func _setTmuxChatUIState(_ newState: TmuxChatUIState) {
     _tmuxChatUIState = newState
+    if _isTmuxListUIActive(newState) {
+      _disarmCurrentInputFocusForTmuxList()
+    }
     _updateTmuxChatsEdgeSwipeGestureState()
+  }
+
+  private func _isTmuxListUIActive(_ state: TmuxChatUIState) -> Bool {
+    if case .list = state {
+      return true
+    }
+    return false
+  }
+
+  private func _ensureTmuxPaneInboxNavigationController() -> UINavigationController {
+    if let nav = _tmuxPaneInboxNavigationController {
+      return nav
+    }
+
+    let inbox = TmuxPaneInboxViewController(
+      onPaneSelected: { [weak self] request in
+        guard let self else {
+          return
+        }
+        self._openTmuxPane(
+          hostAlias: request.hostAlias,
+          sessionName: request.sessionName,
+          paneTarget: request.paneTarget,
+          source: .manual
+        )
+      },
+      onUpgradeHost: { [weak self] hostAlias in
+        self?._upgradeTmuxHost(hostAlias: hostAlias)
+      },
+      onFixRuntimeHost: { [weak self] hostAlias in
+        self?._presentTmuxRuntimeFixGuide(hostAlias: hostAlias, issue: nil)
+      }
+    )
+    let nav = UINavigationController(rootViewController: inbox)
+    _tmuxPaneInboxNavigationController = nav
+    return nav
+  }
+
+  @discardableResult
+  private func _attachTmuxPaneInboxIfNeeded() -> UINavigationController {
+    let nav = _ensureTmuxPaneInboxNavigationController()
+    if nav.parent !== self {
+      addChild(nav)
+      nav.view.frame = view.bounds
+      nav.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      if let roomView = _viewportsController.view {
+        view.insertSubview(nav.view, belowSubview: roomView)
+      } else {
+        view.addSubview(nav.view)
+      }
+      nav.didMove(toParent: self)
+      return nav
+    }
+
+    nav.view.frame = view.bounds
+    if let roomView = _viewportsController.view {
+      view.insertSubview(nav.view, belowSubview: roomView)
+    } else if nav.view.superview == nil {
+      view.addSubview(nav.view)
+    }
+    return nav
+  }
+
+  private func _detachTmuxPaneInboxIfNeeded() {
+    guard let nav = _tmuxPaneInboxNavigationController, nav.parent === self else {
+      return
+    }
+    nav.willMove(toParent: nil)
+    nav.view.removeFromSuperview()
+    nav.removeFromParent()
+  }
+
+  private func _syncTmuxChatContainerLayoutForCurrentState() {
+    guard _tmuxStrictModeEnabled, !_tmuxChatTransitionInFlight else {
+      return
+    }
+    guard let roomView = _viewportsController.view else {
+      return
+    }
+    let width = max(view.bounds.width, 1)
+    if _isTmuxListUIActive(_tmuxChatUIState) {
+      let nav = _attachTmuxPaneInboxIfNeeded()
+      nav.view.transform = .identity
+      nav.view.isUserInteractionEnabled = true
+      roomView.transform = CGAffineTransform(translationX: width, y: 0)
+      roomView.isUserInteractionEnabled = false
+      return
+    }
+
+    roomView.transform = .identity
+    roomView.isUserInteractionEnabled = true
+    if let nav = _tmuxPaneInboxNavigationController, nav.parent === self {
+      nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+      nav.view.isUserInteractionEnabled = false
+      _detachTmuxPaneInboxIfNeeded()
+    }
+  }
+
+  private func _markTmuxChatTransitionBegan() -> UInt64 {
+    _tmuxChatTransitionInFlight = true
+    _tmuxChatTransitionGeneration &+= 1
+    let generation = _tmuxChatTransitionGeneration
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      guard let self else {
+        return
+      }
+      guard self._tmuxChatTransitionGeneration == generation else {
+        return
+      }
+      guard self._tmuxChatTransitionInFlight else {
+        return
+      }
+      self._tmuxChatTransitionInFlight = false
+      self._tmuxRoomToListInteractiveContext = nil
+      self._syncTmuxChatContainerLayoutForCurrentState()
+      self._updateTmuxChatsEdgeSwipeGestureState()
+    }
+    return generation
+  }
+
+  private func _markTmuxChatTransitionCompleted(generation: UInt64) {
+    guard generation == _tmuxChatTransitionGeneration else {
+      return
+    }
+    _tmuxChatTransitionInFlight = false
+    _updateTmuxChatsEdgeSwipeGestureState()
+  }
+
+  private func _teardownRoomShellAndReturnToList(alertMessage: String?) {
+    _prepareInputForShellTeardown { [weak self] in
+      guard let self else {
+        return
+      }
+      self._tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
+      self._terminateAndRemoveAllShells()
+      if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
+        self._presentTmuxAlert(alertMessage)
+      }
+    }
+  }
+
+  private func _applyRoomToListInteractiveProgress(_ progress: CGFloat, width: CGFloat) {
+    guard let roomView = _viewportsController.view else {
+      return
+    }
+    let clamped = max(0, min(progress, 1))
+    let nav = _attachTmuxPaneInboxIfNeeded()
+    nav.view.transform = CGAffineTransform(translationX: -width * (1 - clamped), y: 0)
+    roomView.transform = CGAffineTransform(translationX: width * clamped, y: 0)
+  }
+
+  private func _beginTmuxRoomToListInteractiveTransition() -> Bool {
+    guard _tmuxStrictModeEnabled else {
+      return false
+    }
+    guard !_tmuxChatTransitionInFlight else {
+      return false
+    }
+    guard _isTmuxRoomUIActive else {
+      return false
+    }
+    guard let roomView = _viewportsController.view else {
+      return false
+    }
+    let width = max(view.bounds.width, 1)
+    let nav = _attachTmuxPaneInboxIfNeeded()
+    nav.view.isUserInteractionEnabled = false
+    roomView.isUserInteractionEnabled = false
+    _tmuxRoomToListInteractiveContext = TmuxRoomToListInteractiveContext(width: width, progress: 0)
+    _ = _markTmuxChatTransitionBegan()
+    _applyRoomToListInteractiveProgress(0, width: width)
+    return true
+  }
+
+  private func _updateTmuxRoomToListInteractiveTransition(translationX: CGFloat) {
+    guard var context = _tmuxRoomToListInteractiveContext else {
+      return
+    }
+    let progress = max(0, min(translationX / context.width, 1))
+    context.progress = progress
+    _tmuxRoomToListInteractiveContext = context
+    _applyRoomToListInteractiveProgress(progress, width: context.width)
+  }
+
+  private func _endTmuxRoomToListInteractiveTransition(shouldFinish: Bool, velocityX: CGFloat) {
+    guard let context = _tmuxRoomToListInteractiveContext else {
+      return
+    }
+    let width = context.width
+    let start = context.progress
+    let target: CGFloat = shouldFinish ? 1 : 0
+    let remaining = abs(target - start)
+    let velocityBoost = min(abs(velocityX) / 1600.0, 0.08)
+    let duration = max(0.08, min(0.24, Double(remaining) * 0.22 + 0.06 - Double(velocityBoost)))
+    let generation = _tmuxChatTransitionGeneration
+
+    UIView.animate(
+      withDuration: duration,
+      delay: 0,
+      options: [.curveEaseOut, .beginFromCurrentState]
+    ) {
+      self._applyRoomToListInteractiveProgress(target, width: width)
+    } completion: { [weak self] _ in
+      guard let self else {
+        return
+      }
+      self._tmuxRoomToListInteractiveContext = nil
+      self._markTmuxChatTransitionCompleted(generation: generation)
+      guard let roomView = self._viewportsController.view else {
+        return
+      }
+      let nav = self._attachTmuxPaneInboxIfNeeded()
+
+      if shouldFinish {
+        self._setTmuxChatUIState(.list)
+        nav.view.transform = .identity
+        nav.view.isUserInteractionEnabled = true
+        roomView.transform = CGAffineTransform(translationX: width, y: 0)
+        roomView.isUserInteractionEnabled = false
+        self._teardownRoomShellAndReturnToList(alertMessage: nil)
+      } else {
+        self._setTmuxChatUIState(.room)
+        roomView.transform = .identity
+        roomView.isUserInteractionEnabled = true
+        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+        nav.view.isUserInteractionEnabled = false
+        self._detachTmuxPaneInboxIfNeeded()
+      }
+    }
+  }
+
+  private func _applyTmuxChatState(
+    _ newState: TmuxChatUIState,
+    animated: Bool,
+    completion: ((Bool) -> Void)? = nil
+  ) {
+    if _tmuxChatTransitionInFlight {
+      completion?(false)
+      return
+    }
+    let previousState = _tmuxChatUIState
+    _setTmuxChatUIState(newState)
+
+    guard _tmuxStrictModeEnabled else {
+      completion?(true)
+      return
+    }
+    guard let roomView = _viewportsController.view else {
+      completion?(false)
+      return
+    }
+
+    let direction = tmuxChatTransitionDirection(
+      fromIsList: _isTmuxListUIActive(previousState),
+      toIsList: _isTmuxListUIActive(newState)
+    )
+    let width = max(view.bounds.width, 1)
+
+    switch direction {
+    case .none:
+      if _isTmuxListUIActive(newState) {
+        let nav = _attachTmuxPaneInboxIfNeeded()
+        nav.view.transform = .identity
+        nav.view.isUserInteractionEnabled = true
+        roomView.transform = CGAffineTransform(translationX: width, y: 0)
+        roomView.isUserInteractionEnabled = false
+      } else {
+        roomView.transform = .identity
+        roomView.isUserInteractionEnabled = true
+        if let nav = _tmuxPaneInboxNavigationController, nav.parent === self {
+          nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+          nav.view.isUserInteractionEnabled = false
+          _detachTmuxPaneInboxIfNeeded()
+        }
+      }
+      completion?(true)
+
+    case .roomToList:
+      let nav = _attachTmuxPaneInboxIfNeeded()
+      nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+      nav.view.isUserInteractionEnabled = false
+      roomView.transform = .identity
+      roomView.isUserInteractionEnabled = false
+
+      guard animated else {
+        nav.view.transform = .identity
+        nav.view.isUserInteractionEnabled = true
+        roomView.transform = CGAffineTransform(translationX: width, y: 0)
+        roomView.isUserInteractionEnabled = false
+        completion?(true)
+        return
+      }
+
+      let generation = _markTmuxChatTransitionBegan()
+      UIView.animate(
+        withDuration: 0.26,
+        delay: 0,
+        options: [.curveEaseOut, .beginFromCurrentState]
+      ) {
+        nav.view.transform = .identity
+        roomView.transform = CGAffineTransform(translationX: width, y: 0)
+      } completion: { [weak self] finished in
+        guard let self, generation == self._tmuxChatTransitionGeneration else {
+          return
+        }
+        self._markTmuxChatTransitionCompleted(generation: generation)
+        nav.view.isUserInteractionEnabled = true
+        roomView.isUserInteractionEnabled = false
+        completion?(finished)
+      }
+
+    case .listToRoom:
+      let nav = _attachTmuxPaneInboxIfNeeded()
+      roomView.transform = CGAffineTransform(translationX: width, y: 0)
+      roomView.isUserInteractionEnabled = false
+      nav.view.transform = .identity
+      nav.view.isUserInteractionEnabled = false
+
+      guard animated else {
+        roomView.transform = .identity
+        roomView.isUserInteractionEnabled = true
+        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+        nav.view.isUserInteractionEnabled = false
+        _detachTmuxPaneInboxIfNeeded()
+        completion?(true)
+        return
+      }
+
+      let generation = _markTmuxChatTransitionBegan()
+      UIView.animate(
+        withDuration: 0.24,
+        delay: 0,
+        options: [.curveEaseOut, .beginFromCurrentState]
+      ) {
+        roomView.transform = .identity
+        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+      } completion: { [weak self] finished in
+        guard let self, generation == self._tmuxChatTransitionGeneration else {
+          return
+        }
+        self._markTmuxChatTransitionCompleted(generation: generation)
+        roomView.isUserInteractionEnabled = true
+        nav.view.isUserInteractionEnabled = false
+        self._detachTmuxPaneInboxIfNeeded()
+        completion?(finished)
+      }
+    }
   }
 
   private func _updateTmuxChatsEdgeSwipeGestureState() {
@@ -192,6 +578,9 @@ class SpaceController: UIViewController {
     insets.bottom = bottomInset
     _overlay.frame = view.bounds.inset(by: insets)
     _snippetsVC?.view.frame = _overlay.frame
+    _viewportsController.view.frame = view.bounds
+    _tmuxPaneInboxNavigationController?.view.frame = view.bounds
+    _syncTmuxChatContainerLayoutForCurrentState()
     
     if let menu = _blinkMenu {
       let size = _overlay.frame.size;
@@ -491,7 +880,7 @@ Please go to your subscriptions and cancel one of them!
     completion: ((Bool) -> Void)? = nil)
   {
     if _tmuxStrictModeEnabled && source == .userInitiated {
-      _presentTmuxPaneInbox(animated: true)
+      _returnToTmuxPaneInbox(animated: true)
       completion?(false)
       return
     }
@@ -612,6 +1001,9 @@ Please go to your subscriptions and cancel one of them!
   }
   
   @objc func _focusOnShell() {
+    guard _canAttachInputInCurrentTmuxState else {
+      return
+    }
     _attachInputToCurrentTerm()
   }
 
@@ -655,7 +1047,7 @@ Please go to your subscriptions and cancel one of them!
   private var _canPresentTmuxChatsFromEdgeSwipe: Bool {
     tmuxChatsEdgeSwipeCanPresentChats(
       isWindowApplicationScene: sceneRole == .windowApplication,
-      isSpaceControllerAnimating: _spaceControllerAnimating,
+      isSpaceControllerAnimating: _tmuxChatTransitionInFlight,
       hasPresentedViewController: presentedViewController != nil,
       isTmuxPaneActive: _isTmuxRoomUIActive,
       isTmuxChatsPresented: _isPresentingTmuxPaneInbox
@@ -666,23 +1058,50 @@ Please go to your subscriptions and cancel one of them!
     guard gesture === _tmuxChatsEdgePanRecognizer else {
       return
     }
-    guard _canPresentTmuxChatsFromEdgeSwipe else {
-      return
-    }
-    guard gesture.state == .ended else {
-      return
-    }
-
     let translation = gesture.translation(in: view)
     let velocity = gesture.velocity(in: view)
-    guard tmuxChatsEdgeSwipeShouldPresentChats(
-      translationX: Double(translation.x),
-      translationY: Double(translation.y),
-      velocityX: Double(velocity.x)
-    ) else {
+
+    switch gesture.state {
+    case .began:
+      guard _canPresentTmuxChatsFromEdgeSwipe else {
+        return
+      }
+      _ = _beginTmuxRoomToListInteractiveTransition()
+
+    case .changed:
+      _updateTmuxRoomToListInteractiveTransition(translationX: translation.x)
+
+    case .ended:
+      if _tmuxRoomToListInteractiveContext != nil {
+        let shouldFinish = tmuxChatsEdgeSwipeShouldPresentChats(
+          translationX: Double(translation.x),
+          translationY: Double(translation.y),
+          velocityX: Double(velocity.x)
+        )
+        _endTmuxRoomToListInteractiveTransition(shouldFinish: shouldFinish, velocityX: velocity.x)
+        return
+      }
+
+      guard _canPresentTmuxChatsFromEdgeSwipe else {
+        return
+      }
+      guard tmuxChatsEdgeSwipeShouldPresentChats(
+        translationX: Double(translation.x),
+        translationY: Double(translation.y),
+        velocityX: Double(velocity.x)
+      ) else {
+        return
+      }
+      _returnToTmuxPaneInbox(animated: true)
+
+    case .cancelled, .failed:
+      if _tmuxRoomToListInteractiveContext != nil {
+        _endTmuxRoomToListInteractiveTransition(shouldFinish: false, velocityX: velocity.x)
+      }
+
+    default:
       return
     }
-    _returnToTmuxPaneInbox(animated: true)
   }
 
   private func _presentTmuxAlert(_ message: String) {
@@ -763,25 +1182,11 @@ Please go to your subscriptions and cancel one of them!
   }
 
   fileprivate func _returnToTmuxPaneInbox(animated: Bool, alertMessage: String? = nil) {
-    _setTmuxChatUIState(.list)
-    _tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
-    if _isPresentingTmuxPaneInbox {
-      if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
-        _presentTmuxAlert(alertMessage)
-      }
-      return
-    }
-    _dismissTmuxPaneInboxIfNeeded { [weak self] in
+    _applyTmuxChatState(.list, animated: animated) { [weak self] _ in
       guard let self else {
         return
       }
-      self._terminateAndRemoveAllShells()
-      self._presentTmuxPaneInbox(animated: animated)
-      if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
-        DispatchQueue.main.async {
-          self._presentTmuxAlert(alertMessage)
-        }
-      }
+      self._teardownRoomShellAndReturnToList(alertMessage: alertMessage)
     }
   }
 
@@ -795,65 +1200,19 @@ Please go to your subscriptions and cancel one of them!
       return
     }
     _didPresentInitialTmuxPaneInbox = true
-    _setTmuxChatUIState(.list)
     _presentTmuxPaneInbox(animated: false)
   }
 
   private func _presentTmuxPaneInbox(animated: Bool) {
-    _setTmuxChatUIState(.list)
-    guard !_isPresentingTmuxPaneInbox else {
-      return
-    }
-
-    let inbox = TmuxPaneInboxViewController(
-      onPaneSelected: { [weak self] request in
-        guard let self else {
-          return
-        }
-        self._dismissTmuxPaneInboxIfNeeded {
-          self._openTmuxPane(
-            hostAlias: request.hostAlias,
-            sessionName: request.sessionName,
-            paneTarget: request.paneTarget,
-            source: .manual
-          )
-        }
-      },
-      onUpgradeHost: { [weak self] hostAlias in
-        guard let self else {
-          return
-        }
-        self._dismissTmuxPaneInboxIfNeeded {
-          self._upgradeTmuxHost(hostAlias: hostAlias)
-        }
-      },
-      onFixRuntimeHost: { [weak self] hostAlias in
-        guard let self else {
-          return
-        }
-        self._dismissTmuxPaneInboxIfNeeded {
-          self._presentTmuxRuntimeFixGuide(hostAlias: hostAlias, issue: nil)
-        }
-      }
-    )
-    let nav = UINavigationController(rootViewController: inbox)
-    nav.modalPresentationStyle = .fullScreen
-    present(nav, animated: animated)
+    _applyTmuxChatState(.list, animated: animated)
   }
 
   private var _isPresentingTmuxPaneInbox: Bool {
-    guard let nav = presentedViewController as? UINavigationController else {
-      return false
-    }
-    return nav.viewControllers.first is TmuxPaneInboxViewController
+    _isTmuxListUIActive(_tmuxChatUIState)
   }
 
   private func _dismissTmuxPaneInboxIfNeeded(completion: @escaping () -> Void) {
-    guard _isPresentingTmuxPaneInbox else {
-      completion()
-      return
-    }
-    dismiss(animated: true, completion: completion)
+    completion()
   }
   
   @objc private func _termViewIsReady(n: Notification) {
@@ -873,6 +1232,9 @@ Please go to your subscriptions and cancel one of them!
   }
   
   private func _attachInputToCurrentTerm() {
+    guard _canAttachInputInCurrentTmuxState else {
+      return
+    }
     guard
       let device = currentDevice,
       let deviceView = device.view
@@ -1307,6 +1669,9 @@ extension SpaceController {
   }
   
   @objc func focusOnShellAction() {
+    guard _canAttachInputInCurrentTmuxState else {
+      return
+    }
     KBTracker.shared.input?.reset()
     _focusOnShell()
   }
@@ -1317,7 +1682,7 @@ extension SpaceController {
   
   @objc func newShellAction() {
     guard !_tmuxStrictModeEnabled else {
-      _presentTmuxPaneInbox(animated: true)
+      _returnToTmuxPaneInbox(animated: true)
       return
     }
     _dismissTmuxPaneInboxIfNeeded { [weak self] in
@@ -1774,7 +2139,7 @@ extension SpaceController {
     _markTmuxPaneReadIfPossible(hostAlias: cleanHost, paneTarget: cleanPane)
 
     let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
-    _setTmuxChatUIState(.room(request))
+    _applyTmuxChatState(.room, animated: true)
     _tmuxPaneRouteCoordinator.route(request: request, source: source)
   }
 
@@ -1816,6 +2181,11 @@ extension SpaceController {
     Task {
       do {
         try await TmuxControlPlaneClient.markPaneRead(for: host, target: cleanPaneTarget)
+      } catch let controlError as TmuxControlError {
+        if controlError.shouldTriggerPushRegistrationRepair {
+          AppDelegate.requestTmuxPushRegistration(forHostAlias: cleanHostAlias)
+        }
+        debugPrint("Failed to mark tmux pane as read:", controlError.localizedDescription)
       } catch {
         debugPrint("Failed to mark tmux pane as read:", error.localizedDescription)
       }
@@ -1973,21 +2343,16 @@ extension SpaceController {
       return
     }
 
-    _dismissTmuxPaneInboxIfNeeded { [weak self] in
-      guard let self else {
+    _tmuxPaneRouteCoordinator.deactivate(reason: "maintenance_shell")
+    _applyTmuxChatState(.room, animated: true)
+    _terminateAndRemoveAllShells()
+    _createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
+      guard let self,
+            let term = self.currentTerm()
+      else {
         return
       }
-      self._tmuxPaneRouteCoordinator.deactivate(reason: "maintenance_shell")
-      self._setTmuxChatUIState(.list)
-      self._terminateAndRemoveAllShells()
-      self._createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
-        guard let self,
-              let term = self.currentTerm()
-        else {
-          return
-        }
-        term.enqueueProgrammaticCommand(cleanCommand, skipHistoryRecord: skipHistoryRecord)
-      }
+      term.enqueueProgrammaticCommand(cleanCommand, skipHistoryRecord: skipHistoryRecord)
     }
   }
 
@@ -2349,7 +2714,7 @@ struct TmuxNotificationRequest: Equatable, Codable {
 
 fileprivate enum TmuxChatUIState: Equatable {
   case list
-  case room(TmuxNotificationRequest)
+  case room
 }
 
 fileprivate enum TmuxPaneRouteSource {
@@ -2371,6 +2736,28 @@ func tmuxPaneBridgeMaximumRetryAttempts() -> Int {
   3
 }
 
+enum TmuxPaneBridgeFailureCode: String {
+  case invalidRequest = "invalid_request"
+  case configurationError = "configuration_error"
+  case authRejected = "auth_rejected"
+  case endpointInvalid = "endpoint_invalid"
+  case hostNotFound = "host_not_found"
+  case transport = "transport"
+  case commandFailed = "command_failed"
+  case exitedNonZero = "exited_non_zero"
+  case disconnected = "disconnected"
+  case unknown = "unknown"
+
+  var retryable: Bool {
+    switch self {
+    case .invalidRequest, .configurationError, .authRejected, .endpointInvalid, .hostNotFound:
+      return false
+    case .transport, .commandFailed, .exitedNonZero, .disconnected, .unknown:
+      return true
+    }
+  }
+}
+
 func tmuxPaneBridgeFailureIsRetryable(_ reason: String?) -> Bool {
   let normalized = reason?.blink_trimmed.lowercased() ?? ""
   guard !normalized.isEmpty else {
@@ -2389,6 +2776,16 @@ func tmuxPaneBridgeFailureIsRetryable(_ reason: String?) -> Bool {
     "host not found"
   ]
   return !nonRetryableMarkers.contains(where: { normalized.contains($0) })
+}
+
+func tmuxPaneBridgeFailureShouldRetry(
+  code: TmuxPaneBridgeFailureCode?,
+  reason: String?
+) -> Bool {
+  if let code {
+    return code.retryable
+  }
+  return tmuxPaneBridgeFailureIsRetryable(reason)
 }
 
 struct TmuxStrictModeWorkspaceState {
@@ -2459,6 +2856,7 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
   let event: TmuxPaneBridgeLifecycleEvent
   let request: TmuxNotificationRequest
   let reason: String?
+  let failureCode: TmuxPaneBridgeFailureCode?
 
   init?(userInfo: [AnyHashable: Any]) {
     guard
@@ -2475,6 +2873,8 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
     }
     let sessionName = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.sessionName] as? String)?.blink_trimmed
     let reason = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.reason] as? String)?.blink_trimmed
+    let failureCodeValue = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.failureCode] as? String)?.blink_trimmed
+    let failureCode = failureCodeValue.flatMap(TmuxPaneBridgeFailureCode.init(rawValue:))
 
     self.event = event
     self.request = TmuxNotificationRequest(
@@ -2483,6 +2883,7 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
       paneTarget: paneTarget
     )
     self.reason = reason?.isEmpty == true ? nil : reason
+    self.failureCode = failureCode
   }
 }
 
@@ -2492,6 +2893,7 @@ enum TmuxPaneBridgeLifecycleUserInfoKey {
   static let sessionName = "sessionName"
   static let paneTarget = "paneTarget"
   static let reason = "reason"
+  static let failureCode = "failureCode"
 }
 
 fileprivate final class TmuxPaneRouteCoordinator {
@@ -2729,11 +3131,14 @@ fileprivate final class TmuxPaneRouteCoordinator {
       state.lastFailureReason = reason
       persistedState = state
 
-      if tmuxPaneBridgeFailureIsRetryable(reason) {
+      if tmuxPaneBridgeFailureShouldRetry(code: payload.failureCode, reason: reason) {
         _scheduleRetry(reason: reason)
       } else if let reason, let spaceController {
         _cancelRetryTimer()
         spaceController.showAlert(msg: reason)
+      } else if let spaceController {
+        _cancelRetryTimer()
+        spaceController.showAlert(msg: "Tmux pane bridge failed and cannot be retried automatically.")
       }
     }
   }
@@ -2806,12 +3211,20 @@ fileprivate final class TmuxPaneRouteCoordinator {
     }
     lastReportedMetrics = snapshot
     Task {
-      try? await TmuxControlPlaneClient.ingestIOSRoutingMetrics(
-        for: host,
-        notificationTapTotal: snapshot.0,
-        routeSuccessTotal: snapshot.1,
-        routeFallbackTotal: snapshot.2
-      )
+      do {
+        try await TmuxControlPlaneClient.ingestIOSRoutingMetrics(
+          for: host,
+          notificationTapTotal: snapshot.0,
+          routeSuccessTotal: snapshot.1,
+          routeFallbackTotal: snapshot.2
+        )
+      } catch let controlError as TmuxControlError {
+        if controlError.shouldTriggerPushRegistrationRepair {
+          AppDelegate.requestTmuxPushRegistration(forHostAlias: state.request.hostAlias)
+        }
+      } catch {
+        return
+      }
     }
   }
 }
@@ -2900,6 +3313,70 @@ func tmuxTerminalStrictModeCommandDisabled(_ cmd: Command) -> Bool {
   }
 }
 
+enum TmuxChatTransitionDirection: Equatable {
+  case none
+  case listToRoom
+  case roomToList
+}
+
+func tmuxShouldAttachInput(
+  isStrictModeEnabled: Bool,
+  isRoomUIActive: Bool,
+  isTransitionInFlight: Bool,
+  isPaneInboxPresented: Bool
+) -> Bool {
+  guard isStrictModeEnabled else {
+    return true
+  }
+  guard isRoomUIActive else {
+    return false
+  }
+  guard !isTransitionInFlight else {
+    return false
+  }
+  return !isPaneInboxPresented
+}
+
+func tmuxChatTransitionDirection(fromIsList: Bool, toIsList: Bool) -> TmuxChatTransitionDirection {
+  guard fromIsList != toIsList else {
+    return .none
+  }
+  return toIsList ? .roomToList : .listToRoom
+}
+
+enum TmuxChatsEdgeSwipeBlockReason: Equatable {
+  case sceneNotWindowApplication
+  case paneRoomInactive
+  case chatTransitionInFlight
+  case chatsAlreadyPresented
+  case modalPresented
+}
+
+func tmuxChatsEdgeSwipePresentationBlockReason(
+  isWindowApplicationScene: Bool,
+  isSpaceControllerAnimating: Bool,
+  hasPresentedViewController: Bool,
+  isTmuxPaneActive: Bool,
+  isTmuxChatsPresented: Bool
+) -> TmuxChatsEdgeSwipeBlockReason? {
+  guard isWindowApplicationScene else {
+    return .sceneNotWindowApplication
+  }
+  guard isTmuxPaneActive else {
+    return .paneRoomInactive
+  }
+  guard !isSpaceControllerAnimating else {
+    return .chatTransitionInFlight
+  }
+  guard !isTmuxChatsPresented else {
+    return .chatsAlreadyPresented
+  }
+  guard !hasPresentedViewController else {
+    return .modalPresented
+  }
+  return nil
+}
+
 func tmuxChatsEdgeSwipeCanPresentChats(
   isWindowApplicationScene: Bool,
   isSpaceControllerAnimating: Bool,
@@ -2907,22 +3384,13 @@ func tmuxChatsEdgeSwipeCanPresentChats(
   isTmuxPaneActive: Bool,
   isTmuxChatsPresented: Bool
 ) -> Bool {
-  guard isWindowApplicationScene else {
-    return false
-  }
-  guard isTmuxPaneActive else {
-    return false
-  }
-  guard !isSpaceControllerAnimating else {
-    return false
-  }
-  guard !isTmuxChatsPresented else {
-    return false
-  }
-  guard !hasPresentedViewController else {
-    return false
-  }
-  return true
+  tmuxChatsEdgeSwipePresentationBlockReason(
+    isWindowApplicationScene: isWindowApplicationScene,
+    isSpaceControllerAnimating: isSpaceControllerAnimating,
+    hasPresentedViewController: hasPresentedViewController,
+    isTmuxPaneActive: isTmuxPaneActive,
+    isTmuxChatsPresented: isTmuxChatsPresented
+  ) == nil
 }
 
 func tmuxChatsEdgeSwipeShouldPresentChats(
@@ -3495,6 +3963,13 @@ fileprivate struct TmuxControlRequestContext {
   let hostAlias: String
   let baseURL: String
   let bearerToken: String?
+  let credentialScope: TmuxControlCredentialScope
+}
+
+fileprivate enum TmuxControlCredentialScope: String {
+  case service
+  case device
+  case unknown
 }
 
 fileprivate struct TmuxControlHTTPResult {
@@ -3543,7 +4018,7 @@ fileprivate struct TmuxControlIOSMetricsIngestRequest: Encodable {
 
 fileprivate enum TmuxControlError: LocalizedError {
   case invalidURL(String)
-  case unauthorized(Int)
+  case unauthorized(Int, TmuxControlCredentialScope)
   case apiFailure(Int, String, String?, String?, [String], String?)
   case incompatibleCapabilitiesSchema(String)
   case incompatibleSessionsSchema(String)
@@ -3566,8 +4041,15 @@ fileprivate enum TmuxControlError: LocalizedError {
     switch self {
     case .invalidURL(let value):
       return "Tmux endpoint is invalid or insecure: \(value). Use a valid https:// endpoint in Settings > Hosts > SSH."
-    case .unauthorized:
-      return "Tmux endpoint rejected credentials (HTTP 401/403). Verify Service Token in Settings > Hosts > SSH."
+    case .unauthorized(_, let scope):
+      switch scope {
+      case .device:
+        return "Tmux endpoint rejected device credentials (HTTP 401/403). Re-register tmux push in Settings > Hosts > SSH."
+      case .service:
+        return "Tmux endpoint rejected service credentials (HTTP 401/403). Verify Service Token in Settings > Hosts > SSH."
+      case .unknown:
+        return "Tmux endpoint rejected credentials (HTTP 401/403). Verify Settings > Hosts > SSH."
+      }
     case .apiFailure(let statusCode, let path, let code, let detail, let missingCapabilities, let bodySnippet):
       var message = "Tmux control plane returned HTTP \(statusCode) at \(path)."
       let normalizedCode = code?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -3621,6 +4103,15 @@ fileprivate enum TmuxControlError: LocalizedError {
       return "Failed to connect to tmux endpoint: \(error.localizedDescription)"
     }
   }
+
+  var shouldTriggerPushRegistrationRepair: Bool {
+    switch self {
+    case .unauthorized(_, .device), .missingDeviceAPIToken:
+      return true
+    default:
+      return false
+    }
+  }
 }
 
 fileprivate enum TmuxControlPlaneClient {
@@ -3644,7 +4135,12 @@ fileprivate enum TmuxControlPlaneClient {
     if result.statusCode == 404 {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: context.credentialScope
+    )
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(path)
     }
@@ -3667,10 +4163,16 @@ fileprivate enum TmuxControlPlaneClient {
     let deviceContext = TmuxControlRequestContext(
       hostAlias: context.hostAlias,
       baseURL: context.baseURL,
-      bearerToken: cleanToken
+      bearerToken: cleanToken,
+      credentialScope: .device
     )
     let result = try await _request(context: deviceContext, path: path, method: "POST")
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: deviceContext.credentialScope
+    )
   }
 
   static func ingestIOSRoutingMetrics(
@@ -3688,7 +4190,8 @@ fileprivate enum TmuxControlPlaneClient {
     let deviceContext = TmuxControlRequestContext(
       hostAlias: context.hostAlias,
       baseURL: context.baseURL,
-      bearerToken: cleanToken
+      bearerToken: cleanToken,
+      credentialScope: .device
     )
     let body = try JSONEncoder().encode(
       TmuxControlIOSMetricsIngestRequest(
@@ -3699,7 +4202,12 @@ fileprivate enum TmuxControlPlaneClient {
     )
     let path = "/v1/push/metrics/ios"
     let result = try await _request(context: deviceContext, path: path, method: "POST", body: body)
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: deviceContext.credentialScope
+    )
   }
 
   static func getPaneOutput(for host: BKHosts, target: String, lines: Int = outputLines) async throws -> String {
@@ -3707,7 +4215,12 @@ fileprivate enum TmuxControlPlaneClient {
     let encodedTarget = _encodePathComponent(target)
     let path = "/v1/tmux/panes/\(encodedTarget)/output?lines=\(max(1, lines))"
     let result = try await _request(context: context, path: path, method: "GET")
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: context.credentialScope
+    )
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(path)
     }
@@ -3726,7 +4239,12 @@ fileprivate enum TmuxControlPlaneClient {
     let body = try JSONEncoder().encode(TmuxControlPaneInputRequest(text: text))
     let path = "/v1/tmux/panes/\(encodedTarget)/input"
     let result = try await _request(context: context, path: path, method: "POST", body: body)
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: context.credentialScope
+    )
   }
 
   static func sendEscape(for host: BKHosts, target: String) async throws {
@@ -3734,7 +4252,12 @@ fileprivate enum TmuxControlPlaneClient {
     let encodedTarget = _encodePathComponent(target)
     let path = "/v1/tmux/panes/\(encodedTarget)/escape"
     let result = try await _request(context: context, path: path, method: "POST")
-    try _throwIfNonSuccess(result: result, path: path, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: path,
+      hostAlias: context.hostAlias,
+      credentialScope: context.credentialScope
+    )
   }
 
   private static func _context(for host: BKHosts) throws -> TmuxControlRequestContext {
@@ -3752,7 +4275,8 @@ fileprivate enum TmuxControlPlaneClient {
     return TmuxControlRequestContext(
       hostAlias: hostAlias.isEmpty ? (host.hostName ?? "(unknown)") : hostAlias,
       baseURL: base,
-      bearerToken: token?.isEmpty == true ? nil : token
+      bearerToken: token?.isEmpty == true ? nil : token,
+      credentialScope: .service
     )
   }
 
@@ -3794,10 +4318,11 @@ fileprivate enum TmuxControlPlaneClient {
   private static func _throwIfNonSuccess(
     result: TmuxControlHTTPResult,
     path: String,
-    hostAlias: String
+    hostAlias: String,
+    credentialScope: TmuxControlCredentialScope
   ) throws {
     guard !(result.statusCode == 401 || result.statusCode == 403) else {
-      throw TmuxControlError.unauthorized(result.statusCode)
+      throw TmuxControlError.unauthorized(result.statusCode, credentialScope)
     }
     guard !(200...299).contains(result.statusCode) else {
       return
@@ -3870,7 +4395,12 @@ fileprivate enum TmuxControlPlaneClient {
     if result.statusCode == 404 {
       throw TmuxControlError.incompatibleCapabilitiesSchema(context.hostAlias)
     }
-    try _throwIfNonSuccess(result: result, path: capabilitiesPath, hostAlias: context.hostAlias)
+    try _throwIfNonSuccess(
+      result: result,
+      path: capabilitiesPath,
+      hostAlias: context.hostAlias,
+      credentialScope: context.credentialScope
+    )
     guard !result.data.isEmpty else {
       throw TmuxControlError.missingData(capabilitiesPath)
     }
@@ -4040,7 +4570,27 @@ fileprivate enum TmuxControlPlaneClient {
     let data = payload.data(using: .utf8) ?? Data()
     let result = TmuxControlHTTPResult(statusCode: statusCode, data: data)
     do {
-      try _throwIfNonSuccess(result: result, path: sessionsPath, hostAlias: hostAlias)
+      try _throwIfNonSuccess(
+        result: result,
+        path: sessionsPath,
+        hostAlias: hostAlias,
+        credentialScope: .service
+      )
+      return nil
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  static func _unauthorizedMessageForTesting(scope: TmuxControlCredentialScope) -> String? {
+    let result = TmuxControlHTTPResult(statusCode: 401, data: Data())
+    do {
+      try _throwIfNonSuccess(
+        result: result,
+        path: "/v1/testing",
+        hostAlias: "host",
+        credentialScope: scope
+      )
       return nil
     } catch {
       return error.localizedDescription
@@ -4078,6 +4628,20 @@ func tmuxControlSessionsErrorMessageForTesting(
     hostAlias: hostAlias,
     payload: payload
   )
+}
+
+func tmuxControlUnauthorizedMessageForTesting(scope: String) -> String? {
+  let normalized = scope.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  let resolvedScope: TmuxControlCredentialScope
+  switch normalized {
+  case "device":
+    resolvedScope = .device
+  case "service":
+    resolvedScope = .service
+  default:
+    resolvedScope = .unknown
+  }
+  return TmuxControlPlaneClient._unauthorizedMessageForTesting(scope: resolvedScope)
 }
 
 @MainActor

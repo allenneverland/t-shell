@@ -106,7 +106,6 @@ public class Stream : Reader, Writer, WriterTo {
         })
     
     stdinCancellable = input?.writeTo(instream)
-      .print("INSTREAM")
       .receive(on: client.rloop).sink(
         receiveCompletion: { completion in
           switch completion {
@@ -220,7 +219,6 @@ public class Stream : Reader, Writer, WriterTo {
   }
   
   deinit {
-    print("Stream Deinit")
     self.log.message("Stream Deinit", SSH_LOG_INFO)
     self.client.closeChannel(self.channel)
   }

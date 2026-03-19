@@ -87,6 +87,8 @@ enum BKAgentForward {
 @property (nonatomic, strong) NSString *tmuxPushDeviceName;
 @property (nonatomic, strong) NSString *tmuxPushDeviceApiToken;
 @property (nonatomic, strong) NSString *tmuxLastRegisteredAPNSToken;
+@property (nonatomic, strong) NSString *tmuxLastRegisteredEndpoint;
+@property (nonatomic, strong) NSString *tmuxLastRegisteredServiceTokenHash;
 @property (nonatomic, strong) NSNumber *tmuxPushEnabled;
 @property (nonatomic, strong) NSString *tmuxAPNSKeyID;
 @property (nonatomic, strong) NSString *tmuxAPNSTeamID;

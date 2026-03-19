@@ -173,26 +173,55 @@ class KeyShortcut: ObservableObject, Codable, Identifiable {
     [
       KeyShortcut(.clipboardCopy, .command, "c"),
       KeyShortcut(.clipboardPaste, .command, "v"),
-      
-      KeyShortcut(.windowNew, [.command, .shift], "t"),
-      KeyShortcut(.windowClose, [.command, .shift], "w"),
-      KeyShortcut(.windowFocusOther, [.command], "o"),
-      
+
       KeyShortcut(.tabNew, .command, "t"),
       KeyShortcut(.tabClose, .command, "w"),
       KeyShortcut(.tabNext, [.command, .shift], "]"),
       KeyShortcut(.tabNext, [.command, .shift], UIKeyCommand.inputRightArrow),
       KeyShortcut(.tabPrev, [.command, .shift], "["),
       KeyShortcut(.tabPrev, [.command, .shift], UIKeyCommand.inputLeftArrow),
-      
-      KeyShortcut(.tabMoveToOtherWindow, [.command, .shift], "o"),
-      
+
       KeyShortcut(.zoomIn, [.command, .shift], "="),
       KeyShortcut(.zoomOut, .command, "-"),
       KeyShortcut(.zoomReset, .command, "="),
-      
-      KeyShortcut(.configShow, .command, ","),
+
       Self.snippetsShowShortcut
     ]
+  }
+}
+
+fileprivate func _tmuxLegacyShortcutSignature(_ shortcut: KeyShortcut) -> String? {
+  let input = shortcut.input.lowercased()
+  guard !input.isEmpty else {
+    return nil
+  }
+  return "\(shortcut.modifiers.rawValue)|\(input)"
+}
+
+func tmuxShortcutMatchesLegacyStrictModeDefault(_ shortcut: KeyShortcut) -> Bool {
+  guard case .command(let command) = shortcut.action else {
+    return false
+  }
+  let signature = _tmuxLegacyShortcutSignature(shortcut)
+  let cmdShiftRaw = UIKeyModifierFlags.command.union(.shift).rawValue
+  switch command {
+  case .windowNew:
+    return signature == "\(cmdShiftRaw)|t"
+  case .windowClose:
+    return signature == "\(cmdShiftRaw)|w"
+  case .windowFocusOther:
+    return signature == "\(UIKeyModifierFlags.command.rawValue)|o"
+  case .tabMoveToOtherWindow:
+    return signature == "\(cmdShiftRaw)|o"
+  case .configShow:
+    return signature == "\(UIKeyModifierFlags.command.rawValue)|,"
+  default:
+    return false
+  }
+}
+
+func tmuxSanitizedStrictModeShortcuts(_ shortcuts: [KeyShortcut]) -> [KeyShortcut] {
+  shortcuts.filter { shortcut in
+    !tmuxShortcutMatchesLegacyStrictModeDefault(shortcut)
   }
 }

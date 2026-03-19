@@ -40,6 +40,7 @@
 #import <ios_system/ios_system.h>
 #import <UserNotifications/UserNotifications.h>
 #import <math.h>
+#import <CommonCrypto/CommonDigest.h>
 #include "xcall.h"
 #include "Blink-Swift.h"
 
@@ -52,6 +53,7 @@ extern void rebind_ports(void);
 @import CloudKit;
 
 @interface AppDelegate () <UNUserNotificationCenterDelegate>
+- (void)_requestTmuxPushRegistrationForHostAlias:(NSString *)hostAlias;
 @end
 
 @implementation AppDelegate {
@@ -137,6 +139,34 @@ static NSString * _Nullable _BLKAPNSEnvironmentFromEmbeddedProvision(void) {
   NSDictionary *entitlements = [dict[@"Entitlements"] isKindOfClass:NSDictionary.class] ? dict[@"Entitlements"] : nil;
   NSString *environment = [entitlements[@"aps-environment"] isKindOfClass:NSString.class] ? entitlements[@"aps-environment"] : nil;
   return environment.length > 0 ? environment : nil;
+}
+
+static NSString * _BLKTrimmedOrEmpty(NSString *value) {
+  if (!value) {
+    return @"";
+  }
+  return [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+static NSString * _BLKTmuxServiceTokenFingerprint(NSString *serviceToken) {
+  NSString *cleanToken = _BLKTrimmedOrEmpty(serviceToken);
+  if (cleanToken.length == 0) {
+    return @"";
+  }
+
+  NSData *tokenData = [cleanToken dataUsingEncoding:NSUTF8StringEncoding];
+  if (tokenData.length == 0) {
+    return @"";
+  }
+
+  unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(tokenData.bytes, (CC_LONG)tokenData.length, digest);
+
+  NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+  for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    [hex appendFormat:@"%02x", digest[i]];
+  }
+  return hex;
 }
   
 void __on_pipebroken_signal(int signum){
@@ -316,19 +346,64 @@ void __setupProcessEnv(void) {
       continue;
     }
 
-    NSString *serviceToken = [host.tmuxServiceToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *serviceToken = _BLKTrimmedOrEmpty(host.tmuxServiceToken);
     if (serviceToken.length == 0) {
       continue;
     }
 
-    NSString *lastRegisteredToken = [host.tmuxLastRegisteredAPNSToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *deviceApiToken = [host.tmuxPushDeviceApiToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (deviceApiToken.length > 0 && [lastRegisteredToken isEqualToString:apnsToken]) {
+    NSString *deviceApiToken = _BLKTrimmedOrEmpty(host.tmuxPushDeviceApiToken);
+    NSString *lastRegisteredToken = _BLKTrimmedOrEmpty(host.tmuxLastRegisteredAPNSToken);
+    NSString *lastRegisteredEndpoint = _BLKTrimmedOrEmpty(host.tmuxLastRegisteredEndpoint);
+    NSString *lastRegisteredTokenHash = _BLKTrimmedOrEmpty(host.tmuxLastRegisteredServiceTokenHash);
+    NSString *serviceTokenHash = _BLKTmuxServiceTokenFingerprint(serviceToken);
+    BOOL registrationFresh =
+      deviceApiToken.length > 0 &&
+      [lastRegisteredToken isEqualToString:apnsToken] &&
+      [lastRegisteredEndpoint isEqualToString:resolvedURL] &&
+      [lastRegisteredTokenHash isEqualToString:serviceTokenHash];
+    if (registrationFresh) {
       continue;
     }
 
     [self _enqueueAPNSTokenRegistration:apnsToken forTmuxHost:host];
   }
+}
+
+- (void)_requestTmuxPushRegistrationForHostAlias:(NSString *)hostAlias {
+  NSString *cleanAlias = _BLKTrimmedOrEmpty(hostAlias);
+  if (cleanAlias.length == 0) {
+    return;
+  }
+
+  BKHosts *targetHost = nil;
+  for (BKHosts *host in [BKHosts allHosts]) {
+    NSString *alias = _BLKTrimmedOrEmpty(host.host);
+    NSString *hostName = _BLKTrimmedOrEmpty(host.hostName);
+    BOOL matchAlias = [alias caseInsensitiveCompare:cleanAlias] == NSOrderedSame;
+    BOOL matchHostName = [hostName caseInsensitiveCompare:cleanAlias] == NSOrderedSame;
+    if (matchAlias || matchHostName) {
+      targetHost = host;
+      break;
+    }
+  }
+
+  if (!targetHost || !targetHost.tmuxPushEnabled.boolValue) {
+    return;
+  }
+
+  targetHost.tmuxPushDeviceApiToken = @"";
+  targetHost.tmuxLastRegisteredAPNSToken = @"";
+  targetHost.tmuxLastRegisteredEndpoint = @"";
+  targetHost.tmuxLastRegisteredServiceTokenHash = @"";
+  [BKHosts saveHosts];
+
+  [AppDelegate requestRemoteNotificationsRegistrationIfNeeded];
+
+  NSString *apnsToken = _BLKTrimmedOrEmpty([AppDelegate currentAPNSToken]);
+  if (apnsToken.length == 0) {
+    return;
+  }
+  [self _enqueueAPNSTokenRegistration:apnsToken forTmuxHost:targetHost];
 }
 
 - (void)_enqueueAPNSTokenRegistration:(NSString *)apnsToken forTmuxHost:(BKHosts *)host {
@@ -402,7 +477,7 @@ void __setupProcessEnv(void) {
     [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
   }
-  NSString *serviceToken = [host.tmuxServiceToken stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  NSString *serviceToken = _BLKTrimmedOrEmpty(host.tmuxServiceToken);
   if (serviceToken.length == 0) {
     [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     return;
@@ -458,6 +533,15 @@ void __setupProcessEnv(void) {
     }
 
     if (registerError || !hasData || statusCode < 200 || statusCode > 299) {
+      if (statusCode == 401 || statusCode == 403) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          host.tmuxPushDeviceApiToken = @"";
+          host.tmuxLastRegisteredAPNSToken = @"";
+          host.tmuxLastRegisteredEndpoint = @"";
+          host.tmuxLastRegisteredServiceTokenHash = @"";
+          [BKHosts saveHosts];
+        });
+      }
       [self _finishAPNSTokenRegistrationForHostKey:hostKey];
       return;
     }
@@ -478,6 +562,8 @@ void __setupProcessEnv(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
       host.tmuxPushDeviceApiToken = deviceApiToken;
       host.tmuxLastRegisteredAPNSToken = apnsToken;
+      host.tmuxLastRegisteredEndpoint = normalizedURL;
+      host.tmuxLastRegisteredServiceTokenHash = _BLKTmuxServiceTokenFingerprint(serviceToken);
       [BKHosts saveHosts];
       [self _finishAPNSTokenRegistrationForHostKey:hostKey];
     });
@@ -540,6 +626,21 @@ void __setupProcessEnv(void) {
 + (void)requestRemoteNotificationsRegistrationIfNeeded {
   dispatch_async(dispatch_get_main_queue(), ^{
     [UIApplication.sharedApplication registerForRemoteNotifications];
+  });
+}
+
++ (void)requestTmuxPushRegistrationForHostAlias:(NSString *)hostAlias {
+  NSString *cleanAlias = _BLKTrimmedOrEmpty(hostAlias);
+  if (cleanAlias.length == 0) {
+    return;
+  }
+
+  dispatch_async(dispatch_get_main_queue(), ^{
+    AppDelegate *delegate = (AppDelegate *)UIApplication.sharedApplication.delegate;
+    if (![delegate isKindOfClass:AppDelegate.class]) {
+      return;
+    }
+    [delegate _requestTmuxPushRegistrationForHostAlias:cleanAlias];
   });
 }
 

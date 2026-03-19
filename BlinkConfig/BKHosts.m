@@ -98,6 +98,14 @@ static NSString *__tmux_trimmed_or_empty(NSString *value) {
   if (!_tmuxLastRegisteredAPNSToken) {
     _tmuxLastRegisteredAPNSToken = @"";
   }
+  _tmuxLastRegisteredEndpoint = [coder decodeObjectOfClasses:strings forKey:@"tmuxLastRegisteredEndpoint"];
+  if (!_tmuxLastRegisteredEndpoint) {
+    _tmuxLastRegisteredEndpoint = @"";
+  }
+  _tmuxLastRegisteredServiceTokenHash = [coder decodeObjectOfClasses:strings forKey:@"tmuxLastRegisteredServiceTokenHash"];
+  if (!_tmuxLastRegisteredServiceTokenHash) {
+    _tmuxLastRegisteredServiceTokenHash = @"";
+  }
   _tmuxPushEnabled = [coder decodeObjectOfClasses:numbers forKey:@"tmuxPushEnabled"];
   _tmuxAPNSKeyID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSKeyID"];
   _tmuxAPNSTeamID = [coder decodeObjectOfClasses:strings forKey:@"tmuxAPNSTeamID"];
@@ -136,6 +144,8 @@ static NSString *__tmux_trimmed_or_empty(NSString *value) {
   [encoder encodeObject:_tmuxPushDeviceName forKey:@"tmuxPushDeviceName"];
   [encoder encodeObject:_tmuxPushDeviceApiToken forKey:@"tmuxPushDeviceApiToken"];
   [encoder encodeObject:_tmuxLastRegisteredAPNSToken forKey:@"tmuxLastRegisteredAPNSToken"];
+  [encoder encodeObject:_tmuxLastRegisteredEndpoint forKey:@"tmuxLastRegisteredEndpoint"];
+  [encoder encodeObject:_tmuxLastRegisteredServiceTokenHash forKey:@"tmuxLastRegisteredServiceTokenHash"];
   [encoder encodeObject:_tmuxPushEnabled forKey:@"tmuxPushEnabled"];
   [encoder encodeObject:_tmuxAPNSKeyID forKey:@"tmuxAPNSKeyID"];
   [encoder encodeObject:_tmuxAPNSTeamID forKey:@"tmuxAPNSTeamID"];
@@ -208,6 +218,8 @@ tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
     _tmuxPushDeviceName = tmuxPushDeviceName;
     _tmuxPushDeviceApiToken = tmuxPushDeviceApiToken;
     _tmuxLastRegisteredAPNSToken = @"";
+    _tmuxLastRegisteredEndpoint = @"";
+    _tmuxLastRegisteredServiceTokenHash = @"";
     _tmuxPushEnabled = tmuxPushEnabled;
     _tmuxAPNSKeyID = tmuxAPNSKeyID;
     _tmuxAPNSTeamID = tmuxAPNSTeamID;
@@ -408,6 +420,12 @@ tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
   }
 
   BKHosts *bkHost = [BKHosts withHost:host];
+  NSString *previousResolvedURL = @"";
+  NSString *previousServiceToken = @"";
+  if (bkHost) {
+    previousResolvedURL = [BKHosts tmuxResolvedBaseURLForHost:bkHost] ?: @"";
+    previousServiceToken = __tmux_trimmed_or_empty(bkHost.tmuxServiceToken);
+  }
   // Save password to keychain if it changed
   if (!bkHost) {
     bkHost = [[BKHosts alloc] initWithAlias:newHost
@@ -479,9 +497,25 @@ tmuxPushDeviceApiToken:(NSString *)tmuxPushDeviceApiToken
     bkHost.tmuxAPNSKeyID = tmuxAPNSKeyID;
     bkHost.tmuxAPNSTeamID = tmuxAPNSTeamID;
     bkHost.tmuxAPNSBundleID = tmuxAPNSBundleID;
+    NSString *nextResolvedURL = [BKHosts tmuxResolvedBaseURLForHost:bkHost] ?: @"";
+    NSString *nextServiceToken = __tmux_trimmed_or_empty(bkHost.tmuxServiceToken);
+    BOOL endpointChanged = ![previousResolvedURL isEqualToString:nextResolvedURL];
+    BOOL serviceTokenChanged = ![previousServiceToken isEqualToString:nextServiceToken];
+    if (endpointChanged || serviceTokenChanged) {
+      bkHost.tmuxPushDeviceApiToken = @"";
+      bkHost.tmuxLastRegisteredAPNSToken = @"";
+      bkHost.tmuxLastRegisteredEndpoint = @"";
+      bkHost.tmuxLastRegisteredServiceTokenHash = @"";
+    }
   }
   if (!bkHost.tmuxLastRegisteredAPNSToken) {
     bkHost.tmuxLastRegisteredAPNSToken = @"";
+  }
+  if (!bkHost.tmuxLastRegisteredEndpoint) {
+    bkHost.tmuxLastRegisteredEndpoint = @"";
+  }
+  if (!bkHost.tmuxLastRegisteredServiceTokenHash) {
+    bkHost.tmuxLastRegisteredServiceTokenHash = @"";
   }
   if (![BKHosts saveHosts]) {
     return nil;
