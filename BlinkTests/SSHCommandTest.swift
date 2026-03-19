@@ -93,6 +93,31 @@ final class TmuxAttachCommandTests: XCTestCase {
     XCTAssertNil(tmuxAttachTokenArgument(from: ["--other", "value"]))
   }
 
+  func testPaneBridgeAttemptIDArgumentParsingSupportsTwoForms() {
+    XCTAssertEqual(tmuxPaneBridgeAttemptIDArgument(from: ["--attempt-id", "uuid-1"]), "uuid-1")
+    XCTAssertEqual(tmuxPaneBridgeAttemptIDArgument(from: ["--attempt-id=uuid-2"]), "uuid-2")
+    XCTAssertNil(tmuxPaneBridgeAttemptIDArgument(from: ["--attempt-id"]))
+    XCTAssertNil(tmuxPaneBridgeAttemptIDArgument(from: ["--other", "value"]))
+  }
+
+  func testPaneBridgeAttemptIDFromCommandLineParsesTwoForms() {
+    XCTAssertEqual(
+      tmuxPaneBridgeAttemptIDFromCommandLine("tmux-pane-bridge --token abc --attempt-id uuid-1"),
+      "uuid-1"
+    )
+    XCTAssertEqual(
+      tmuxPaneBridgeAttemptIDFromCommandLine("tmux-pane-bridge --token abc --attempt-id=uuid-2"),
+      "uuid-2"
+    )
+    XCTAssertNil(tmuxPaneBridgeAttemptIDFromCommandLine("tmux-pane-bridge --token abc"))
+  }
+
+  func testPaneBridgeCommandLineDetectionSupportsPlainAndAbsolutePath() {
+    XCTAssertTrue(tmuxPaneBridgeCommandLineIsBridge("tmux-pane-bridge --token abc"))
+    XCTAssertTrue(tmuxPaneBridgeCommandLineIsBridge("/usr/local/bin/tmux-pane-bridge --token abc"))
+    XCTAssertFalse(tmuxPaneBridgeCommandLineIsBridge("ssh user@host"))
+  }
+
 }
 
 final class TmuxControlPlaneRouteTests: XCTestCase {
@@ -731,6 +756,10 @@ final class TmuxPaneBridgeRetryPolicyTests: XCTestCase {
     XCTAssertEqual(tmuxPaneBridgeMaximumRetryAttempts(), 3)
   }
 
+  func testBootstrapDisconnectedIsRetryable() {
+    XCTAssertTrue(tmuxPaneBridgeFailureShouldRetry(code: .bootstrapDisconnected, reason: "early exit"))
+  }
+
   func testFailureCodePolicyBlocksNonRetryableFailures() {
     XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: .authRejected, reason: "temporary network hiccup"))
     XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: .configurationError, reason: "connection reset"))
@@ -744,6 +773,15 @@ final class TmuxPaneBridgeRetryPolicyTests: XCTestCase {
   func testFallbackPolicyUsesReasonWhenFailureCodeMissing() {
     XCTAssertFalse(tmuxPaneBridgeFailureShouldRetry(code: nil, reason: "Tmux endpoint rejected credentials"))
     XCTAssertTrue(tmuxPaneBridgeFailureShouldRetry(code: nil, reason: "connection reset by peer"))
+  }
+
+  func testPayloadAttemptMatchingRejectsStaleLifecycleEvents() {
+    XCTAssertTrue(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: nil, payloadAttemptID: nil))
+    XCTAssertTrue(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: "", payloadAttemptID: nil))
+    XCTAssertFalse(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: nil, payloadAttemptID: "new-attempt"))
+    XCTAssertFalse(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: "new-attempt", payloadAttemptID: nil))
+    XCTAssertFalse(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: "new-attempt", payloadAttemptID: "old-attempt"))
+    XCTAssertTrue(tmuxPaneBridgePayloadMatchesActiveAttempt(activeAttemptID: "new-attempt", payloadAttemptID: "new-attempt"))
   }
 }
 

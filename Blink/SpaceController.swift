@@ -2444,18 +2444,22 @@ extension SpaceController {
   fileprivate func _enqueueTmuxBridgeCommand(
     in term: TermController,
     request: TmuxNotificationRequest,
-    completion: @escaping (Bool) -> Void
+    attemptID: String?,
+    completion: @escaping (TmuxPaneBridgeEnqueueResult) -> Void
   ) {
     guard let token = request.tmuxAttachToken?.blink_trimmed, !token.isEmpty else {
-      completion(false)
+      completion(.failed(reason: "Missing tmux pane bridge token."))
       return
     }
 
-    let command = "tmux-pane-bridge --token \(token)"
+    var command = "tmux-pane-bridge --token \(token)"
+    if let attemptID, !attemptID.blink_trimmed.isEmpty {
+      command += " --attempt-id \(attemptID.blink_trimmed)"
+    }
     let runCommand: () -> Void = {
       term.resumeIfNeeded()
       term.enqueueProgrammaticCommand(command, skipHistoryRecord: true)
-      completion(true)
+      completion(.started)
     }
 
     guard term.isRunningCmd() else {
@@ -2464,9 +2468,22 @@ extension SpaceController {
     }
 
     term.handleControl("\u{03}")
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-      runCommand()
+    let deadline = Date().addingTimeInterval(tmuxPaneBridgeLaunchIdleTimeoutSeconds())
+    var pollUntilIdle: (() -> Void)?
+    pollUntilIdle = {
+      if !term.isRunningCmd() {
+        runCommand()
+        return
+      }
+      if Date() >= deadline {
+        completion(.failed(reason: "Tmux pane bridge launch timed out while waiting for shell idle state."))
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + tmuxPaneBridgeLaunchIdlePollIntervalSeconds()) {
+        pollUntilIdle?()
+      }
     }
+    pollUntilIdle?()
   }
 
   @objc private func _openTmuxPaneFromNotification(_ n: Notification) {
@@ -2726,6 +2743,59 @@ fileprivate enum TmuxPaneRouteSource {
   }
 }
 
+fileprivate enum TmuxPaneBridgeEnqueueResult: Equatable {
+  case started
+  case failed(reason: String)
+}
+
+fileprivate enum ShellCommandLifecycleEvent: String {
+  case started
+  case ended
+}
+
+fileprivate struct ShellCommandLifecyclePayload {
+  let event: ShellCommandLifecycleEvent
+  let commandLine: String
+  let attemptID: String?
+  let isTmuxPaneBridge: Bool
+
+  init?(userInfo: [AnyHashable: Any]) {
+    guard
+      let eventValue = (userInfo[ShellCommandLifecycleUserInfoKey.event] as? String)?.blink_trimmed,
+      let event = ShellCommandLifecycleEvent(rawValue: eventValue),
+      let commandLine = (userInfo[ShellCommandLifecycleUserInfoKey.commandLine] as? String)?.blink_trimmed,
+      !commandLine.isEmpty
+    else {
+      return nil
+    }
+    self.event = event
+    self.commandLine = commandLine
+    self.attemptID = tmuxPaneBridgeAttemptIDFromCommandLine(commandLine)
+    self.isTmuxPaneBridge = tmuxPaneBridgeCommandLineIsBridge(commandLine)
+  }
+}
+
+enum ShellCommandLifecycleUserInfoKey {
+  static let event = "event"
+  static let commandLine = "commandLine"
+}
+
+func tmuxPaneBridgeLaunchIdlePollIntervalSeconds() -> TimeInterval {
+  0.05
+}
+
+func tmuxPaneBridgeLaunchIdleTimeoutSeconds() -> TimeInterval {
+  2.0
+}
+
+func tmuxPaneBridgeCommandStartWatchdogTimeoutSeconds() -> TimeInterval {
+  2.0
+}
+
+func tmuxPaneBridgeConnectWatchdogTimeoutSeconds() -> TimeInterval {
+  12.0
+}
+
 func tmuxPaneBridgeRetryDelaySeconds(attempt: Int) -> TimeInterval {
   let safeAttempt = max(1, attempt)
   let exponent = min(max(0, safeAttempt - 1), 5)
@@ -2742,6 +2812,7 @@ enum TmuxPaneBridgeFailureCode: String {
   case authRejected = "auth_rejected"
   case endpointInvalid = "endpoint_invalid"
   case hostNotFound = "host_not_found"
+  case bootstrapDisconnected = "bootstrap_disconnected"
   case transport = "transport"
   case commandFailed = "command_failed"
   case exitedNonZero = "exited_non_zero"
@@ -2752,7 +2823,7 @@ enum TmuxPaneBridgeFailureCode: String {
     switch self {
     case .invalidRequest, .configurationError, .authRejected, .endpointInvalid, .hostNotFound:
       return false
-    case .transport, .commandFailed, .exitedNonZero, .disconnected, .unknown:
+    case .bootstrapDisconnected, .transport, .commandFailed, .exitedNonZero, .disconnected, .unknown:
       return true
     }
   }
@@ -2786,6 +2857,61 @@ func tmuxPaneBridgeFailureShouldRetry(
     return code.retryable
   }
   return tmuxPaneBridgeFailureIsRetryable(reason)
+}
+
+func tmuxPaneBridgePayloadMatchesActiveAttempt(
+  activeAttemptID: String?,
+  payloadAttemptID: String?
+) -> Bool {
+  let active = activeAttemptID?.blink_trimmed ?? ""
+  let payload = payloadAttemptID?.blink_trimmed ?? ""
+  guard !active.isEmpty else {
+    return payload.isEmpty
+  }
+  return !payload.isEmpty && payload == active
+}
+
+func tmuxPaneBridgeCommandLineIsBridge(_ commandLine: String) -> Bool {
+  let clean = commandLine.blink_trimmed
+  guard !clean.isEmpty else {
+    return false
+  }
+  let first = clean.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+  guard !first.isEmpty else {
+    return false
+  }
+  if first == "tmux-pane-bridge" {
+    return true
+  }
+  let suffix = (first as NSString).lastPathComponent
+  return suffix == "tmux-pane-bridge"
+}
+
+func tmuxPaneBridgeAttemptIDFromCommandLine(_ commandLine: String) -> String? {
+  let args = commandLine
+    .split(whereSeparator: \.isWhitespace)
+    .map(String.init)
+  guard !args.isEmpty else {
+    return nil
+  }
+
+  var index = 0
+  while index < args.count {
+    let arg = args[index]
+    if arg == "--attempt-id" {
+      guard index + 1 < args.count else {
+        return nil
+      }
+      let value = args[index + 1].blink_trimmed
+      return value.isEmpty ? nil : value
+    }
+    if arg.hasPrefix("--attempt-id=") {
+      let value = String(arg.dropFirst("--attempt-id=".count)).blink_trimmed
+      return value.isEmpty ? nil : value
+    }
+    index += 1
+  }
+  return nil
 }
 
 struct TmuxStrictModeWorkspaceState {
@@ -2857,6 +2983,8 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
   let request: TmuxNotificationRequest
   let reason: String?
   let failureCode: TmuxPaneBridgeFailureCode?
+  let attemptID: String?
+  let exitStatus: Int32?
 
   init?(userInfo: [AnyHashable: Any]) {
     guard
@@ -2875,6 +3003,18 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
     let reason = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.reason] as? String)?.blink_trimmed
     let failureCodeValue = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.failureCode] as? String)?.blink_trimmed
     let failureCode = failureCodeValue.flatMap(TmuxPaneBridgeFailureCode.init(rawValue:))
+    let attemptID = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.attemptID] as? String)?.blink_trimmed
+    let exitStatus: Int32? = {
+      if let number = userInfo[TmuxPaneBridgeLifecycleUserInfoKey.exitStatus] as? NSNumber {
+        return number.int32Value
+      }
+      if let value = (userInfo[TmuxPaneBridgeLifecycleUserInfoKey.exitStatus] as? String)?.blink_trimmed,
+        let parsed = Int32(value)
+      {
+        return parsed
+      }
+      return nil
+    }()
 
     self.event = event
     self.request = TmuxNotificationRequest(
@@ -2884,6 +3024,8 @@ fileprivate struct TmuxPaneBridgeLifecyclePayload {
     )
     self.reason = reason?.isEmpty == true ? nil : reason
     self.failureCode = failureCode
+    self.attemptID = attemptID?.isEmpty == true ? nil : attemptID
+    self.exitStatus = exitStatus
   }
 }
 
@@ -2894,6 +3036,8 @@ enum TmuxPaneBridgeLifecycleUserInfoKey {
   static let paneTarget = "paneTarget"
   static let reason = "reason"
   static let failureCode = "failureCode"
+  static let attemptID = "attemptID"
+  static let exitStatus = "exitStatus"
 }
 
 fileprivate final class TmuxPaneRouteCoordinator {
@@ -2901,7 +3045,12 @@ fileprivate final class TmuxPaneRouteCoordinator {
   private var persistedState: TmuxPaneBridgePersistedState?
   private var retryTimer: Timer?
   private var lifecycleObserver: NSObjectProtocol?
+  private var commandLifecycleObserver: NSObjectProtocol?
+  private var commandStartWatchdogTimer: Timer?
+  private var connectWatchdogTimer: Timer?
   private var launchGeneration: UInt64 = 0
+  private var activeAttemptID: String?
+  private var didObserveCommandStartForActiveAttempt = false
   private var isLaunching = false
   private var isConnected = false
   private var notificationTapTotal: UInt64 = 0
@@ -2918,13 +3067,24 @@ fileprivate final class TmuxPaneRouteCoordinator {
     ) { [weak self] notification in
       self?._handleLifecycleNotification(notification)
     }
+    commandLifecycleObserver = NotificationCenter.default.addObserver(
+      forName: .BLKShellCommandLifecycle,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      self?._handleCommandLifecycleNotification(notification)
+    }
   }
 
   deinit {
     if let lifecycleObserver {
       NotificationCenter.default.removeObserver(lifecycleObserver)
     }
+    if let commandLifecycleObserver {
+      NotificationCenter.default.removeObserver(commandLifecycleObserver)
+    }
     retryTimer?.invalidate()
+    _cancelLaunchWatchdogs()
   }
 
   var currentPersistedState: TmuxPaneBridgePersistedState? {
@@ -2941,9 +3101,12 @@ fileprivate final class TmuxPaneRouteCoordinator {
 
   func restore(state: TmuxPaneBridgePersistedState?) {
     launchGeneration += 1
+    activeAttemptID = nil
+    didObserveCommandStartForActiveAttempt = false
     isLaunching = false
     isConnected = false
     _cancelRetryTimer()
+    _cancelLaunchWatchdogs()
     guard let spaceController else {
       persistedState = nil
       return
@@ -2963,7 +3126,10 @@ fileprivate final class TmuxPaneRouteCoordinator {
 
   func deactivate(reason: String? = nil) {
     _cancelRetryTimer()
+    _cancelLaunchWatchdogs()
     launchGeneration += 1
+    activeAttemptID = nil
+    didObserveCommandStartForActiveAttempt = false
     isLaunching = false
     isConnected = false
     persistedState = nil
@@ -2990,8 +3156,11 @@ fileprivate final class TmuxPaneRouteCoordinator {
       retryAttempt: 0,
       lastFailureReason: nil
     )
+    activeAttemptID = nil
+    didObserveCommandStartForActiveAttempt = false
     isConnected = false
     _cancelRetryTimer()
+    _cancelLaunchWatchdogs()
     _launchIfPossible(trigger: "route")
     _flushIOSRoutingMetricsIfNeeded()
   }
@@ -3019,7 +3188,10 @@ fileprivate final class TmuxPaneRouteCoordinator {
     }
     state.managedTabKey = nil
     persistedState = state
+    activeAttemptID = nil
+    didObserveCommandStartForActiveAttempt = false
     isConnected = false
+    _cancelLaunchWatchdogs()
     _launchIfPossible(trigger: "terminal_removed")
   }
 
@@ -3042,6 +3214,10 @@ fileprivate final class TmuxPaneRouteCoordinator {
 
     launchGeneration += 1
     let generation = launchGeneration
+    let attemptID = UUID().uuidString.lowercased()
+    _cancelLaunchWatchdogs()
+    activeAttemptID = attemptID
+    didObserveCommandStartForActiveAttempt = false
     isLaunching = true
 
     spaceController._ensureManagedTmuxBridgeTerminal(preferredKey: state.managedTabKey) { [weak self] tabKey, term in
@@ -3057,6 +3233,7 @@ fileprivate final class TmuxPaneRouteCoordinator {
       }
 
       guard let term else {
+        self.activeAttemptID = nil
         self.isLaunching = false
         self._scheduleRetry(reason: "Unable to prepare terminal for tmux pane bridge.")
         return
@@ -3065,22 +3242,27 @@ fileprivate final class TmuxPaneRouteCoordinator {
       latestState.managedTabKey = tabKey
       self.persistedState = latestState
 
-      spaceController._enqueueTmuxBridgeCommand(in: term, request: latestState.request) { [weak self] started in
+      spaceController._enqueueTmuxBridgeCommand(
+        in: term,
+        request: latestState.request,
+        attemptID: attemptID
+      ) { [weak self] result in
         guard let self else {
           return
         }
         guard generation == self.launchGeneration else {
           return
         }
-        if started {
+        switch result {
+        case .started:
           self.isLaunching = true
-          return
-        }
-
-        self.isLaunching = false
-        self._cancelRetryTimer()
-        if let spaceController = self.spaceController {
-          spaceController.showAlert(msg: "Failed to start tmux pane bridge command.")
+          self._armLaunchWatchdogs(attemptID: attemptID)
+        case .failed(let reason):
+          self.activeAttemptID = nil
+          self.didObserveCommandStartForActiveAttempt = false
+          self.isLaunching = false
+          self._cancelLaunchWatchdogs()
+          self._scheduleRetry(reason: reason)
         }
       }
     }
@@ -3100,31 +3282,53 @@ fileprivate final class TmuxPaneRouteCoordinator {
     guard payload.request == state.request else {
       return
     }
+    guard tmuxPaneBridgePayloadMatchesActiveAttempt(
+      activeAttemptID: activeAttemptID,
+      payloadAttemptID: payload.attemptID
+    ) else {
+      return
+    }
 
     switch payload.event {
     case .starting:
+      activeAttemptID = payload.attemptID ?? activeAttemptID
+      didObserveCommandStartForActiveAttempt = true
       isLaunching = true
       isConnected = false
+      commandStartWatchdogTimer?.invalidate()
+      commandStartWatchdogTimer = nil
       return
     case .connected:
       if !isConnected {
         routeSuccessTotal += 1
       }
+      activeAttemptID = payload.attemptID ?? activeAttemptID
+      didObserveCommandStartForActiveAttempt = true
       isLaunching = false
       isConnected = true
       state.retryAttempt = 0
       state.lastFailureReason = nil
       persistedState = state
       _cancelRetryTimer()
+      _cancelLaunchWatchdogs()
       _flushIOSRoutingMetricsIfNeeded()
     case .disconnected:
+      _cancelLaunchWatchdogs()
+      activeAttemptID = nil
+      didObserveCommandStartForActiveAttempt = false
       isConnected = false
-      if isLaunching {
-        return
-      }
       isLaunching = false
-      _scheduleRetry(reason: payload.reason ?? "tmux pane bridge disconnected.")
+      let fallbackReason: String
+      if let exitStatus = payload.exitStatus {
+        fallbackReason = "tmux pane bridge disconnected (exit status \(exitStatus))."
+      } else {
+        fallbackReason = "tmux pane bridge disconnected."
+      }
+      _scheduleRetry(reason: payload.reason ?? fallbackReason)
     case .failed:
+      _cancelLaunchWatchdogs()
+      activeAttemptID = nil
+      didObserveCommandStartForActiveAttempt = false
       isConnected = false
       isLaunching = false
       let reason = payload.reason?.blink_trimmed
@@ -3143,10 +3347,106 @@ fileprivate final class TmuxPaneRouteCoordinator {
     }
   }
 
+  private func _handleCommandLifecycleNotification(_ notification: Notification) {
+    guard
+      let userInfo = notification.userInfo,
+      let payload = ShellCommandLifecyclePayload(userInfo: userInfo),
+      payload.isTmuxPaneBridge,
+      persistedState != nil
+    else {
+      return
+    }
+
+    guard tmuxPaneBridgePayloadMatchesActiveAttempt(
+      activeAttemptID: activeAttemptID,
+      payloadAttemptID: payload.attemptID
+    ) else {
+      return
+    }
+
+    switch payload.event {
+    case .started:
+      didObserveCommandStartForActiveAttempt = true
+      commandStartWatchdogTimer?.invalidate()
+      commandStartWatchdogTimer = nil
+    case .ended:
+      guard isLaunching || isConnected else {
+        return
+      }
+      let reason: String
+      if isConnected {
+        reason = "tmux pane bridge process exited unexpectedly."
+      } else {
+        reason = "tmux pane bridge process exited before lifecycle handshake completed."
+      }
+      _retryActiveAttempt(reason: reason)
+    }
+  }
+
+  private func _retryActiveAttempt(reason: String) {
+    _cancelLaunchWatchdogs()
+    activeAttemptID = nil
+    didObserveCommandStartForActiveAttempt = false
+    isConnected = false
+    isLaunching = false
+    _scheduleRetry(reason: reason)
+  }
+
+  private func _armLaunchWatchdogs(attemptID: String) {
+    _cancelLaunchWatchdogs()
+
+    let startTimer = Timer(
+      timeInterval: tmuxPaneBridgeCommandStartWatchdogTimeoutSeconds(),
+      repeats: false
+    ) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      guard self.activeAttemptID == attemptID else {
+        return
+      }
+      guard self.isLaunching else {
+        return
+      }
+      guard !self.didObserveCommandStartForActiveAttempt else {
+        return
+      }
+      self._retryActiveAttempt(reason: "tmux pane bridge command did not start in time.")
+    }
+    commandStartWatchdogTimer = startTimer
+    RunLoop.main.add(startTimer, forMode: .common)
+
+    let connectTimer = Timer(
+      timeInterval: tmuxPaneBridgeConnectWatchdogTimeoutSeconds(),
+      repeats: false
+    ) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      guard self.activeAttemptID == attemptID else {
+        return
+      }
+      guard self.isLaunching, !self.isConnected else {
+        return
+      }
+      self._retryActiveAttempt(reason: "tmux pane bridge connection timed out before becoming ready.")
+    }
+    connectWatchdogTimer = connectTimer
+    RunLoop.main.add(connectTimer, forMode: .common)
+  }
+
+  private func _cancelLaunchWatchdogs() {
+    commandStartWatchdogTimer?.invalidate()
+    commandStartWatchdogTimer = nil
+    connectWatchdogTimer?.invalidate()
+    connectWatchdogTimer = nil
+  }
+
   private func _scheduleRetry(reason: String?) {
     guard let spaceController else {
       return
     }
+    _cancelLaunchWatchdogs()
     guard spaceController.foregroundActive else {
       return
     }
@@ -4859,6 +5159,7 @@ fileprivate final class TmuxPaneDetailViewController: UIViewController, UITextFi
 extension Notification.Name {
   static let BLKOpenTmuxPane = Notification.Name("BLKOpenTmuxPaneNotification")
   static let BLKTmuxPaneBridgeLifecycle = Notification.Name("BLKTmuxPaneBridgeLifecycleNotification")
+  static let BLKShellCommandLifecycle = Notification.Name("BLKShellCommandLifecycleNotification")
 }
 
 fileprivate extension String {

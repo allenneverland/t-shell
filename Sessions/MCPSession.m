@@ -49,6 +49,12 @@
 #include "ios_error.h"
 #include "Blink-Swift.h"
 
+static NSString *const BLKShellCommandLifecycleNotificationName = @"BLKShellCommandLifecycleNotification";
+static NSString *const BLKShellCommandLifecycleUserInfoEventKey = @"event";
+static NSString *const BLKShellCommandLifecycleUserInfoCommandLineKey = @"commandLine";
+static NSString *const BLKShellCommandLifecycleEventStarted = @"started";
+static NSString *const BLKShellCommandLifecycleEventEnded = @"ended";
+
 
 @implementation MCPSession {
   NSString * _sessionUUID;
@@ -172,6 +178,14 @@
   
   NSArray *arr = [cmdline componentsSeparatedByString:@" "];
   NSString *cmd = arr[0];
+  BOOL shouldEmitCommandLifecycle = cmd.length > 0;
+  NSString *executedCommandLine = shouldEmitCommandLifecycle ? [cmdline copy] : nil;
+
+  if (shouldEmitCommandLifecycle) {
+    [self _postShellCommandLifecycleEvent:BLKShellCommandLifecycleEventStarted commandLine:executedCommandLine];
+  }
+
+  @try {
 
   if ([cmd isEqualToString:@"exit"]) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -248,6 +262,11 @@
   }
   
   return YES;
+  } @finally {
+    if (shouldEmitCommandLifecycle) {
+      [self _postShellCommandLifecycleEvent:BLKShellCommandLifecycleEventEnded commandLine:executedCommandLine];
+    }
+  }
 }
 
 - (int)main:(int)argc argv:(char **)argv
@@ -468,6 +487,24 @@
   thread_stdout = NULL;
   thread_stdin = NULL;
   thread_stderr = NULL;
+}
+
+- (void)_postShellCommandLifecycleEvent:(NSString *)event commandLine:(NSString *)commandLine {
+  NSString *cleanEvent = [event stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  NSString *cleanCommandLine = [commandLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (cleanEvent.length == 0 || cleanCommandLine.length == 0) {
+    return;
+  }
+
+  NSDictionary *userInfo = @{
+    BLKShellCommandLifecycleUserInfoEventKey: cleanEvent,
+    BLKShellCommandLifecycleUserInfoCommandLineKey: cleanCommandLine
+  };
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [[NSNotificationCenter defaultCenter] postNotificationName:BLKShellCommandLifecycleNotificationName
+                                                        object:nil
+                                                      userInfo:userInfo];
+  });
 }
 
 

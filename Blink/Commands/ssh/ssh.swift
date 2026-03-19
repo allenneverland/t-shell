@@ -110,11 +110,12 @@ public func tmux_pane_bridge_main(argc: Int32, argv: Argv) -> Int32 {
 
   let session = Unmanaged<MCPSession>.fromOpaque(thread_context).takeUnretainedValue()
   let cmd = TmuxPaneBridgeCommand(mcp: session)
-  return cmd.start(request: request)
+  let attemptID = tmuxPaneBridgeAttemptIDArgument(from: args)
+  return cmd.start(request: request, attemptID: attemptID)
 }
 
 let tmuxAttachUsage = "Usage: tmux-attach --token <base64url-json>"
-let tmuxPaneBridgeUsage = "Usage: tmux-pane-bridge --request-id <uuid> | --token <base64url-json>"
+let tmuxPaneBridgeUsage = "Usage: tmux-pane-bridge --request-id <uuid> | --token <base64url-json> [--attempt-id <uuid>]"
 
 func tmuxAttachTokenArgument(from args: [String]) -> String? {
   tmuxLongOptionValue(name: "--token", from: args)
@@ -122,6 +123,10 @@ func tmuxAttachTokenArgument(from args: [String]) -> String? {
 
 func tmuxPaneRequestIDArgument(from args: [String]) -> String? {
   tmuxLongOptionValue(name: "--request-id", from: args)
+}
+
+func tmuxPaneBridgeAttemptIDArgument(from args: [String]) -> String? {
+  tmuxLongOptionValue(name: "--attempt-id", from: args)
 }
 
 private func tmuxLongOptionValue(name: String, from args: [String]) -> String? {
@@ -1129,6 +1134,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
   private var writeCancellables: [AnyCancellable] = []
   private var didSendInitialRefresh = false
   private var lifecycleRequest: TmuxNotificationRequest?
+  private var lifecycleAttemptID: String?
   private var didSendConnectedLifecycleEvent = false
   private var didSendTerminalLifecycleEvent = false
 
@@ -1141,7 +1147,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
     super.init()
   }
 
-  func start(request: TmuxNotificationRequest) -> Int32 {
+  func start(request: TmuxNotificationRequest, attemptID: String?) -> Int32 {
     mcp.registerSSHClient(self)
     let originalRawMode = device.rawMode
     defer {
@@ -1167,6 +1173,8 @@ private final class TmuxControlModeInputBridge: WriterTo {
       sessionName: requestedSession?.isEmpty == true ? nil : requestedSession,
       paneTarget: cleanPane
     )
+    let cleanAttemptID = attemptID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    lifecycleAttemptID = (cleanAttemptID?.isEmpty == false) ? cleanAttemptID : nil
     didSendConnectedLifecycleEvent = false
     didSendTerminalLifecycleEvent = false
 
@@ -1371,10 +1379,25 @@ private final class TmuxControlModeInputBridge: WriterTo {
               .failed,
               reason: reason,
               failureCode: .exitedNonZero,
+              exitStatus: status,
+              terminal: true
+            )
+          } else if self.didSendConnectedLifecycleEvent {
+            self._emitLifecycleEvent(
+              .disconnected,
+              failureCode: .disconnected,
+              exitStatus: status,
               terminal: true
             )
           } else {
-            self._emitLifecycleEvent(.disconnected, failureCode: .disconnected, terminal: true)
+            let reason = "Tmux pane bridge exited before control channel became ready."
+            self._emitLifecycleEvent(
+              .failed,
+              reason: reason,
+              failureCode: .bootstrapDisconnected,
+              exitStatus: status,
+              terminal: true
+            )
           }
           self.kill()
         }
@@ -1472,6 +1495,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
     connection = nil
     didSendInitialRefresh = false
     lifecycleRequest = nil
+    lifecycleAttemptID = nil
     didSendConnectedLifecycleEvent = false
     didSendTerminalLifecycleEvent = false
   }
@@ -1553,6 +1577,8 @@ private final class TmuxControlModeInputBridge: WriterTo {
     _ event: TmuxPaneBridgeLifecycleEvent,
     reason: String? = nil,
     failureCode: TmuxPaneBridgeFailureCode? = nil,
+    attemptID: String? = nil,
+    exitStatus: Int32? = nil,
     terminal: Bool = false
   ) {
     guard let request = lifecycleRequest else {
@@ -1573,6 +1599,7 @@ private final class TmuxControlModeInputBridge: WriterTo {
 
     let cleanReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
     let cleanFailureCode = failureCode?.rawValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let resolvedAttemptID = (attemptID ?? lifecycleAttemptID)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     DispatchQueue.main.async {
       var userInfo: [String: String] = [
         TmuxPaneBridgeLifecycleUserInfoKey.event: event.rawValue,
@@ -1583,6 +1610,12 @@ private final class TmuxControlModeInputBridge: WriterTo {
       ]
       if !cleanFailureCode.isEmpty {
         userInfo[TmuxPaneBridgeLifecycleUserInfoKey.failureCode] = cleanFailureCode
+      }
+      if !resolvedAttemptID.isEmpty {
+        userInfo[TmuxPaneBridgeLifecycleUserInfoKey.attemptID] = resolvedAttemptID
+      }
+      if let exitStatus {
+        userInfo[TmuxPaneBridgeLifecycleUserInfoKey.exitStatus] = String(exitStatus)
       }
       NotificationCenter.default.post(
         name: .BLKTmuxPaneBridgeLifecycle,
