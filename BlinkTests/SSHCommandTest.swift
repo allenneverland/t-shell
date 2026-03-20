@@ -485,6 +485,114 @@ final class TmuxChatTransitionDirectionTests: XCTestCase {
   }
 }
 
+final class TmuxPanePresentationReducerTests: XCTestCase {
+  func testOpenPaneMovesListToRoomLoading() {
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .list, event: .openPaneRequested),
+      .roomLoading
+    )
+  }
+
+  func testBridgeConnectedMovesLoadingToRoomActive() {
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomLoading, event: .bridgeConnected),
+      .roomActive
+    )
+  }
+
+  func testRetryingKeepsRoomLoadingState() {
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomLoading, event: .bridgeRetrying),
+      .roomLoading
+    )
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomError, event: .bridgeRetrying),
+      .roomLoading
+    )
+  }
+
+  func testTerminalFailureMovesToRoomError() {
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomLoading, event: .bridgeFailedTerminal),
+      .roomError
+    )
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomActive, event: .bridgeFailedTerminal),
+      .roomError
+    )
+  }
+
+  func testShowListAlwaysWins() {
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomLoading, event: .showList),
+      .list
+    )
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomActive, event: .showList),
+      .list
+    )
+    XCTAssertEqual(
+      tmuxPanePresentationReduce(state: .roomError, event: .showList),
+      .list
+    )
+  }
+}
+
+final class TmuxChatContainerLayoutPlanTests: XCTestCase {
+  func testListLayoutPlanPinsListVisibleAndDisablesRoomInput() {
+    let plan = tmuxChatContainerLayoutPlan(mode: .list, width: 400)
+    XCTAssertEqual(plan.roomTranslationX, 400, accuracy: 0.001)
+    XCTAssertEqual(plan.listTranslationX, 0, accuracy: 0.001)
+    XCTAssertFalse(plan.roomUserInteractionEnabled)
+    XCTAssertTrue(plan.listUserInteractionEnabled)
+    XCTAssertTrue(plan.requiresListAttachment)
+    XCTAssertFalse(plan.shouldDetachListAfterApply)
+  }
+
+  func testRoomLayoutPlanPinsRoomVisibleAndKeepsListAttachedOffscreen() {
+    let plan = tmuxChatContainerLayoutPlan(mode: .room, width: 320)
+    XCTAssertEqual(plan.roomTranslationX, 0, accuracy: 0.001)
+    XCTAssertEqual(plan.listTranslationX, -320, accuracy: 0.001)
+    XCTAssertTrue(plan.roomUserInteractionEnabled)
+    XCTAssertFalse(plan.listUserInteractionEnabled)
+    XCTAssertTrue(plan.requiresListAttachment)
+    XCTAssertFalse(plan.shouldDetachListAfterApply)
+  }
+
+  func testTransitionStartPlansDisableInteractionForBothContainers() {
+    let roomToList = tmuxChatContainerLayoutPlan(mode: .roomToListTransitionStart, width: 300)
+    XCTAssertEqual(roomToList.roomTranslationX, 0, accuracy: 0.001)
+    XCTAssertEqual(roomToList.listTranslationX, -300, accuracy: 0.001)
+    XCTAssertFalse(roomToList.roomUserInteractionEnabled)
+    XCTAssertFalse(roomToList.listUserInteractionEnabled)
+    XCTAssertTrue(roomToList.requiresListAttachment)
+    XCTAssertFalse(roomToList.shouldDetachListAfterApply)
+
+    let listToRoom = tmuxChatContainerLayoutPlan(mode: .listToRoomTransitionStart, width: 300)
+    XCTAssertEqual(listToRoom.roomTranslationX, 300, accuracy: 0.001)
+    XCTAssertEqual(listToRoom.listTranslationX, 0, accuracy: 0.001)
+    XCTAssertFalse(listToRoom.roomUserInteractionEnabled)
+    XCTAssertFalse(listToRoom.listUserInteractionEnabled)
+    XCTAssertTrue(listToRoom.requiresListAttachment)
+    XCTAssertFalse(listToRoom.shouldDetachListAfterApply)
+  }
+
+  func testInteractiveRoomToListPlanClampsProgressAndWidth() {
+    let lowerBound = tmuxChatContainerLayoutPlan(mode: .interactiveRoomToList(progress: -1), width: 500)
+    XCTAssertEqual(lowerBound.roomTranslationX, 0, accuracy: 0.001)
+    XCTAssertEqual(lowerBound.listTranslationX, -500, accuracy: 0.001)
+    XCTAssertFalse(lowerBound.roomUserInteractionEnabled)
+    XCTAssertFalse(lowerBound.listUserInteractionEnabled)
+
+    let upperBound = tmuxChatContainerLayoutPlan(mode: .interactiveRoomToList(progress: 2), width: 500)
+    XCTAssertEqual(upperBound.roomTranslationX, 500, accuracy: 0.001)
+    XCTAssertEqual(upperBound.listTranslationX, 0, accuracy: 0.001)
+
+    let minimumWidth = tmuxChatContainerLayoutPlan(mode: .list, width: 0)
+    XCTAssertEqual(minimumWidth.roomTranslationX, 1, accuracy: 0.001)
+  }
+}
+
 final class TmuxInputFocusPolicyTests: XCTestCase {
   func testStrictModeListNeverAttachesInput() {
     XCTAssertFalse(

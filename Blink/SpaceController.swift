@@ -42,8 +42,108 @@ fileprivate final class TmuxViewportPlaceholderViewController: UIViewController 
   override func loadView() {
     let placeholder = UIView()
     placeholder.isUserInteractionEnabled = false
-    placeholder.backgroundColor = .black
+    placeholder.backgroundColor = .systemBackground
     view = placeholder
+  }
+}
+
+fileprivate enum TmuxRoomStatusViewMode: Equatable {
+  case loading(message: String)
+  case error(message: String)
+}
+
+fileprivate final class TmuxRoomStatusViewController: UIViewController {
+  var onRetry: (() -> Void)?
+  var onCancel: (() -> Void)?
+
+  private let _titleLabel = UILabel()
+  private let _messageLabel = UILabel()
+  private let _activity = UIActivityIndicatorView(style: .large)
+  private let _buttonStack = UIStackView()
+  private let _retryButton = UIButton(type: .system)
+  private let _cancelButton = UIButton(type: .system)
+
+  override func loadView() {
+    let root = UIView()
+    root.backgroundColor = .systemBackground
+    root.isUserInteractionEnabled = true
+    view = root
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+
+    let contentStack = UIStackView()
+    contentStack.axis = .vertical
+    contentStack.spacing = 14
+    contentStack.alignment = .center
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(contentStack)
+
+    _activity.hidesWhenStopped = true
+    contentStack.addArrangedSubview(_activity)
+
+    _titleLabel.font = UIFont.preferredFont(forTextStyle: .headline)
+    _titleLabel.textAlignment = .center
+    _titleLabel.numberOfLines = 0
+    _titleLabel.textColor = .label
+    contentStack.addArrangedSubview(_titleLabel)
+
+    _messageLabel.font = UIFont.preferredFont(forTextStyle: .subheadline)
+    _messageLabel.textAlignment = .center
+    _messageLabel.numberOfLines = 0
+    _messageLabel.textColor = .secondaryLabel
+    _messageLabel.translatesAutoresizingMaskIntoConstraints = false
+    contentStack.addArrangedSubview(_messageLabel)
+    _messageLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
+
+    _buttonStack.axis = .horizontal
+    _buttonStack.spacing = 12
+    _buttonStack.alignment = .center
+    contentStack.addArrangedSubview(_buttonStack)
+
+    _retryButton.setTitle("Retry", for: .normal)
+    _retryButton.addTarget(self, action: #selector(_onRetryTapped), for: .touchUpInside)
+    _buttonStack.addArrangedSubview(_retryButton)
+
+    _cancelButton.setTitle("Back to Chats", for: .normal)
+    _cancelButton.addTarget(self, action: #selector(_onCancelTapped), for: .touchUpInside)
+    _buttonStack.addArrangedSubview(_cancelButton)
+
+    NSLayoutConstraint.activate([
+      contentStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.layoutMarginsGuide.leadingAnchor),
+      contentStack.trailingAnchor.constraint(lessThanOrEqualTo: view.layoutMarginsGuide.trailingAnchor),
+      contentStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      contentStack.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+    ])
+  }
+
+  func apply(mode: TmuxRoomStatusViewMode) {
+    loadViewIfNeeded()
+    switch mode {
+    case .loading(let message):
+      _titleLabel.text = "Connecting to pane"
+      _messageLabel.text = message
+      _activity.startAnimating()
+      _retryButton.isHidden = true
+      _cancelButton.isHidden = false
+      _buttonStack.isHidden = false
+    case .error(let message):
+      _titleLabel.text = "Pane connection failed"
+      _messageLabel.text = message
+      _activity.stopAnimating()
+      _retryButton.isHidden = false
+      _cancelButton.isHidden = false
+      _buttonStack.isHidden = false
+    }
+  }
+
+  @objc private func _onRetryTapped() {
+    onRetry?()
+  }
+
+  @objc private func _onCancelTapped() {
+    onCancel?()
   }
 }
 
@@ -86,11 +186,24 @@ class SpaceController: UIViewController {
   private static var _pendingTmuxRequest: TmuxNotificationRequest? = nil
   private var _restoredTmuxBridgeState: TmuxPaneBridgePersistedState? = nil
   private var _tmuxChatUIState: TmuxChatUIState = .list
+  private var _tmuxRouteStatusMessage: String? = nil
+  private var _lastTmuxRouteRequest: TmuxNotificationRequest? = nil
   private var _tmuxPaneInboxNavigationController: UINavigationController? = nil
   private var _tmuxChatTransitionInFlight: Bool = false
   private var _tmuxChatTransitionGeneration: UInt64 = 0
   private var _tmuxRoomToListInteractiveContext: TmuxRoomToListInteractiveContext? = nil
-  private lazy var _tmuxPaneRouteCoordinator = TmuxPaneRouteCoordinator(spaceController: self)
+  private var _pendingReturnToTmuxPaneInboxRequest: (animated: Bool, alertMessage: String?)? = nil
+  private lazy var _tmuxRoomStatusController: TmuxRoomStatusViewController = {
+    let ctrl = TmuxRoomStatusViewController()
+    ctrl.onRetry = { [weak self] in
+      self?._retryLastTmuxPaneRouteIfNeeded()
+    }
+    ctrl.onCancel = { [weak self] in
+      self?._returnToTmuxPaneInbox(animated: true)
+    }
+    return ctrl
+  }()
+  private lazy var _tmuxPaneRouteCoordinator = TmuxPaneRouteCoordinator(spaceController: self, delegate: self)
   private var _strictTmuxRuntimeTerminalKey: UUID? = nil
   private var _viewportTransitionGeneration: UInt64 = 0
   private lazy var _viewportPlaceholderController = TmuxViewportPlaceholderViewController()
@@ -102,13 +215,18 @@ class SpaceController: UIViewController {
   private struct TmuxRoomToListInteractiveContext {
     var width: CGFloat
     var progress: CGFloat
+    var originState: TmuxChatUIState
   }
 
   private var _isTmuxRoomUIActive: Bool {
-    if case .room = _tmuxChatUIState {
+    if case .roomActive = _tmuxChatUIState {
       return true
     }
     return false
+  }
+
+  private var _isTmuxRoomContainerPresented: Bool {
+    !_isTmuxListUIActive(_tmuxChatUIState)
   }
 
   private var _canAttachInputInCurrentTmuxState: Bool {
@@ -143,7 +261,93 @@ class SpaceController: UIViewController {
     if _isTmuxListUIActive(newState) {
       _disarmCurrentInputFocusForTmuxList()
     }
+    _syncTmuxRoomStatusControllerForCurrentState()
     _updateTmuxChatsEdgeSwipeGestureState()
+  }
+
+  private func _defaultTmuxLoadingStatusMessage() -> String {
+    "Preparing tmux pane bridge handshake..."
+  }
+
+  private func _defaultTmuxErrorStatusMessage() -> String {
+    "The tmux pane bridge failed. Retry or go back to Chats."
+  }
+
+  private func _ensureViewportShowsControllerIfNeeded(_ controller: UIViewController, animated: Bool) {
+    if _viewportsController.viewControllers?.first === controller {
+      return
+    }
+    _setViewportController(controller, direction: .forward, animated: animated)
+  }
+
+  private func _syncTmuxRoomStatusControllerForCurrentState() {
+    guard _tmuxStrictModeEnabled else {
+      return
+    }
+    switch _tmuxChatUIState {
+    case .list:
+      return
+    case .roomLoading:
+      let message = _tmuxRouteStatusMessage?.blink_trimmed
+      _tmuxRoomStatusController.apply(mode: .loading(message: (message?.isEmpty == false) ? message! : _defaultTmuxLoadingStatusMessage()))
+      _ensureViewportShowsControllerIfNeeded(_tmuxRoomStatusController, animated: false)
+    case .roomError:
+      let message = _tmuxRouteStatusMessage?.blink_trimmed
+      _tmuxRoomStatusController.apply(mode: .error(message: (message?.isEmpty == false) ? message! : _defaultTmuxErrorStatusMessage()))
+      _ensureViewportShowsControllerIfNeeded(_tmuxRoomStatusController, animated: false)
+    case .roomActive:
+      if let term = currentTerm() {
+        _ensureViewportShowsControllerIfNeeded(term, animated: false)
+      } else {
+        _tmuxRoomStatusController.apply(mode: .loading(message: _defaultTmuxLoadingStatusMessage()))
+        _ensureViewportShowsControllerIfNeeded(_tmuxRoomStatusController, animated: false)
+      }
+    }
+  }
+
+  private func _applyTmuxPanePresentationEvent(
+    _ event: TmuxPanePresentationEvent,
+    animated: Bool
+  ) {
+    let targetState = tmuxPanePresentationReduce(state: _tmuxChatUIState, event: event)
+    _applyTmuxChatState(targetState, animated: animated)
+  }
+
+  private func _retryLastTmuxPaneRouteIfNeeded() {
+    guard let request = _lastTmuxRouteRequest else {
+      _returnToTmuxPaneInbox(animated: true)
+      return
+    }
+    _openTmuxPane(
+      hostAlias: request.hostAlias,
+      sessionName: request.sessionName,
+      paneTarget: request.paneTarget,
+      source: .manual
+    )
+  }
+
+  private func _queueReturnToTmuxPaneInboxRequest(animated: Bool, alertMessage: String?) {
+    let cleanAlert = alertMessage?.blink_trimmed
+    if var pending = _pendingReturnToTmuxPaneInboxRequest {
+      pending.animated = pending.animated || animated
+      if let cleanAlert, !cleanAlert.isEmpty {
+        pending.alertMessage = cleanAlert
+      }
+      _pendingReturnToTmuxPaneInboxRequest = pending
+      return
+    }
+    _pendingReturnToTmuxPaneInboxRequest = (animated: animated, alertMessage: cleanAlert)
+  }
+
+  private func _drainPendingReturnToTmuxPaneInboxRequestIfNeeded() {
+    guard !_tmuxChatTransitionInFlight else {
+      return
+    }
+    guard let pending = _pendingReturnToTmuxPaneInboxRequest else {
+      return
+    }
+    _pendingReturnToTmuxPaneInboxRequest = nil
+    _returnToTmuxPaneInbox(animated: pending.animated, alertMessage: pending.alertMessage)
   }
 
   private func _isTmuxListUIActive(_ state: TmuxChatUIState) -> Bool {
@@ -216,60 +420,75 @@ class SpaceController: UIViewController {
     nav.removeFromParent()
   }
 
+  private func _tmuxChatContainerLayoutMode(for state: TmuxChatUIState) -> TmuxChatContainerLayoutMode {
+    _isTmuxListUIActive(state) ? .list : .room
+  }
+
+  @discardableResult
+  private func _applyTmuxChatContainerLayoutPlan(
+    _ plan: TmuxChatContainerLayoutPlan,
+    finalize: Bool = true
+  ) -> Bool {
+    guard _tmuxStrictModeEnabled else {
+      return false
+    }
+    guard let roomView = _viewportsController.view else {
+      return false
+    }
+
+    let attachedNav: UINavigationController? = {
+      if plan.requiresListAttachment {
+        return _attachTmuxPaneInboxIfNeeded()
+      }
+      guard let nav = _tmuxPaneInboxNavigationController, nav.parent === self else {
+        return nil
+      }
+      return nav
+    }()
+
+    roomView.transform = CGAffineTransform(translationX: CGFloat(plan.roomTranslationX), y: 0)
+    roomView.isUserInteractionEnabled = plan.roomUserInteractionEnabled
+
+    if let attachedNav {
+      attachedNav.view.transform = CGAffineTransform(translationX: CGFloat(plan.listTranslationX), y: 0)
+      attachedNav.view.isUserInteractionEnabled = plan.listUserInteractionEnabled
+    }
+
+    if finalize, plan.shouldDetachListAfterApply {
+      _detachTmuxPaneInboxIfNeeded()
+    }
+    return true
+  }
+
+  @discardableResult
+  private func _applyTmuxChatContainerLayoutForCurrentState(finalize: Bool = true) -> Bool {
+    let mode = _tmuxChatContainerLayoutMode(for: _tmuxChatUIState)
+    let plan = tmuxChatContainerLayoutPlan(mode: mode, width: Double(max(view.bounds.width, 1)))
+    return _applyTmuxChatContainerLayoutPlan(plan, finalize: finalize)
+  }
+
   private func _syncTmuxChatContainerLayoutForCurrentState() {
     guard _tmuxStrictModeEnabled, !_tmuxChatTransitionInFlight else {
       return
     }
-    guard let roomView = _viewportsController.view else {
-      return
-    }
-    let width = max(view.bounds.width, 1)
-    if _isTmuxListUIActive(_tmuxChatUIState) {
-      let nav = _attachTmuxPaneInboxIfNeeded()
-      nav.view.transform = .identity
-      nav.view.isUserInteractionEnabled = true
-      roomView.transform = CGAffineTransform(translationX: width, y: 0)
-      roomView.isUserInteractionEnabled = false
-      return
-    }
-
-    roomView.transform = .identity
-    roomView.isUserInteractionEnabled = true
-    if let nav = _tmuxPaneInboxNavigationController, nav.parent === self {
-      nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
-      nav.view.isUserInteractionEnabled = false
-      _detachTmuxPaneInboxIfNeeded()
-    }
+    _ = _applyTmuxChatContainerLayoutForCurrentState()
   }
 
   private func _markTmuxChatTransitionBegan() -> UInt64 {
     _tmuxChatTransitionInFlight = true
     _tmuxChatTransitionGeneration &+= 1
-    let generation = _tmuxChatTransitionGeneration
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-      guard let self else {
-        return
-      }
-      guard self._tmuxChatTransitionGeneration == generation else {
-        return
-      }
-      guard self._tmuxChatTransitionInFlight else {
-        return
-      }
-      self._tmuxChatTransitionInFlight = false
-      self._tmuxRoomToListInteractiveContext = nil
-      self._syncTmuxChatContainerLayoutForCurrentState()
-      self._updateTmuxChatsEdgeSwipeGestureState()
-    }
-    return generation
+    return _tmuxChatTransitionGeneration
   }
 
   private func _markTmuxChatTransitionCompleted(generation: UInt64) {
     guard generation == _tmuxChatTransitionGeneration else {
       return
     }
+    _tmuxRoomToListInteractiveContext = nil
     _tmuxChatTransitionInFlight = false
+    _syncTmuxChatContainerLayoutForCurrentState()
     _updateTmuxChatsEdgeSwipeGestureState()
+    _drainPendingReturnToTmuxPaneInboxRequestIfNeeded()
   }
 
   private func _teardownRoomShellAndReturnToList(alertMessage: String?) {
@@ -279,6 +498,7 @@ class SpaceController: UIViewController {
       }
       self._tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
       self._terminateAndRemoveAllShells()
+      self._syncTmuxChatContainerLayoutForCurrentState()
       if let alertMessage, !alertMessage.blink_trimmed.isEmpty {
         self._presentTmuxAlert(alertMessage)
       }
@@ -286,13 +506,11 @@ class SpaceController: UIViewController {
   }
 
   private func _applyRoomToListInteractiveProgress(_ progress: CGFloat, width: CGFloat) {
-    guard let roomView = _viewportsController.view else {
-      return
-    }
-    let clamped = max(0, min(progress, 1))
-    let nav = _attachTmuxPaneInboxIfNeeded()
-    nav.view.transform = CGAffineTransform(translationX: -width * (1 - clamped), y: 0)
-    roomView.transform = CGAffineTransform(translationX: width * clamped, y: 0)
+    let plan = tmuxChatContainerLayoutPlan(
+      mode: .interactiveRoomToList(progress: Double(progress)),
+      width: Double(width)
+    )
+    _ = _applyTmuxChatContainerLayoutPlan(plan, finalize: false)
   }
 
   private func _beginTmuxRoomToListInteractiveTransition() -> Bool {
@@ -302,19 +520,23 @@ class SpaceController: UIViewController {
     guard !_tmuxChatTransitionInFlight else {
       return false
     }
-    guard _isTmuxRoomUIActive else {
-      return false
-    }
-    guard let roomView = _viewportsController.view else {
+    guard _isTmuxRoomContainerPresented else {
       return false
     }
     let width = max(view.bounds.width, 1)
-    let nav = _attachTmuxPaneInboxIfNeeded()
-    nav.view.isUserInteractionEnabled = false
-    roomView.isUserInteractionEnabled = false
-    _tmuxRoomToListInteractiveContext = TmuxRoomToListInteractiveContext(width: width, progress: 0)
+    let startPlan = tmuxChatContainerLayoutPlan(
+      mode: .roomToListTransitionStart,
+      width: Double(width)
+    )
+    guard _applyTmuxChatContainerLayoutPlan(startPlan, finalize: false) else {
+      return false
+    }
+    _tmuxRoomToListInteractiveContext = TmuxRoomToListInteractiveContext(
+      width: width,
+      progress: 0,
+      originState: _tmuxChatUIState
+    )
     _ = _markTmuxChatTransitionBegan()
-    _applyRoomToListInteractiveProgress(0, width: width)
     return true
   }
 
@@ -339,38 +561,29 @@ class SpaceController: UIViewController {
     let velocityBoost = min(abs(velocityX) / 1600.0, 0.08)
     let duration = max(0.08, min(0.24, Double(remaining) * 0.22 + 0.06 - Double(velocityBoost)))
     let generation = _tmuxChatTransitionGeneration
+    let targetMode: TmuxChatContainerLayoutMode = shouldFinish ? .list : .room
+    let targetPlan = tmuxChatContainerLayoutPlan(mode: targetMode, width: Double(width))
 
     UIView.animate(
       withDuration: duration,
       delay: 0,
       options: [.curveEaseOut, .beginFromCurrentState]
     ) {
-      self._applyRoomToListInteractiveProgress(target, width: width)
+      _ = self._applyTmuxChatContainerLayoutPlan(targetPlan, finalize: false)
     } completion: { [weak self] _ in
       guard let self else {
         return
       }
       self._tmuxRoomToListInteractiveContext = nil
       self._markTmuxChatTransitionCompleted(generation: generation)
-      guard let roomView = self._viewportsController.view else {
-        return
-      }
-      let nav = self._attachTmuxPaneInboxIfNeeded()
 
       if shouldFinish {
         self._setTmuxChatUIState(.list)
-        nav.view.transform = .identity
-        nav.view.isUserInteractionEnabled = true
-        roomView.transform = CGAffineTransform(translationX: width, y: 0)
-        roomView.isUserInteractionEnabled = false
+        _ = self._applyTmuxChatContainerLayoutForCurrentState()
         self._teardownRoomShellAndReturnToList(alertMessage: nil)
       } else {
-        self._setTmuxChatUIState(.room)
-        roomView.transform = .identity
-        roomView.isUserInteractionEnabled = true
-        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
-        nav.view.isUserInteractionEnabled = false
-        self._detachTmuxPaneInboxIfNeeded()
+        self._setTmuxChatUIState(context.originState)
+        _ = self._applyTmuxChatContainerLayoutForCurrentState()
       }
     }
   }
@@ -380,114 +593,84 @@ class SpaceController: UIViewController {
     animated: Bool,
     completion: ((Bool) -> Void)? = nil
   ) {
-    if _tmuxChatTransitionInFlight {
+    let previousState = _tmuxChatUIState
+    let direction = tmuxChatTransitionDirection(
+      fromIsList: _isTmuxListUIActive(previousState),
+      toIsList: _isTmuxListUIActive(newState)
+    )
+    if _tmuxChatTransitionInFlight, direction != .none {
       completion?(false)
       return
     }
-    let previousState = _tmuxChatUIState
     _setTmuxChatUIState(newState)
 
     guard _tmuxStrictModeEnabled else {
       completion?(true)
       return
     }
-    guard let roomView = _viewportsController.view else {
-      completion?(false)
-      return
-    }
-
-    let direction = tmuxChatTransitionDirection(
-      fromIsList: _isTmuxListUIActive(previousState),
-      toIsList: _isTmuxListUIActive(newState)
-    )
-    let width = max(view.bounds.width, 1)
+    let width = Double(max(view.bounds.width, 1))
 
     switch direction {
     case .none:
-      if _isTmuxListUIActive(newState) {
-        let nav = _attachTmuxPaneInboxIfNeeded()
-        nav.view.transform = .identity
-        nav.view.isUserInteractionEnabled = true
-        roomView.transform = CGAffineTransform(translationX: width, y: 0)
-        roomView.isUserInteractionEnabled = false
-      } else {
-        roomView.transform = .identity
-        roomView.isUserInteractionEnabled = true
-        if let nav = _tmuxPaneInboxNavigationController, nav.parent === self {
-          nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
-          nav.view.isUserInteractionEnabled = false
-          _detachTmuxPaneInboxIfNeeded()
-        }
-      }
-      completion?(true)
+      completion?(_applyTmuxChatContainerLayoutForCurrentState())
 
     case .roomToList:
-      let nav = _attachTmuxPaneInboxIfNeeded()
-      nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
-      nav.view.isUserInteractionEnabled = false
-      roomView.transform = .identity
-      roomView.isUserInteractionEnabled = false
+      let startPlan = tmuxChatContainerLayoutPlan(mode: .roomToListTransitionStart, width: width)
+      guard _applyTmuxChatContainerLayoutPlan(startPlan, finalize: false) else {
+        completion?(false)
+        return
+      }
 
       guard animated else {
-        nav.view.transform = .identity
-        nav.view.isUserInteractionEnabled = true
-        roomView.transform = CGAffineTransform(translationX: width, y: 0)
-        roomView.isUserInteractionEnabled = false
+        _ = _applyTmuxChatContainerLayoutForCurrentState()
         completion?(true)
         return
       }
 
+      let endPlan = tmuxChatContainerLayoutPlan(mode: .list, width: width)
       let generation = _markTmuxChatTransitionBegan()
       UIView.animate(
         withDuration: 0.26,
         delay: 0,
         options: [.curveEaseOut, .beginFromCurrentState]
       ) {
-        nav.view.transform = .identity
-        roomView.transform = CGAffineTransform(translationX: width, y: 0)
+        _ = self._applyTmuxChatContainerLayoutPlan(endPlan, finalize: false)
       } completion: { [weak self] finished in
         guard let self, generation == self._tmuxChatTransitionGeneration else {
           return
         }
         self._markTmuxChatTransitionCompleted(generation: generation)
-        nav.view.isUserInteractionEnabled = true
-        roomView.isUserInteractionEnabled = false
+        _ = self._applyTmuxChatContainerLayoutForCurrentState()
         completion?(finished)
       }
 
     case .listToRoom:
-      let nav = _attachTmuxPaneInboxIfNeeded()
-      roomView.transform = CGAffineTransform(translationX: width, y: 0)
-      roomView.isUserInteractionEnabled = false
-      nav.view.transform = .identity
-      nav.view.isUserInteractionEnabled = false
+      let startPlan = tmuxChatContainerLayoutPlan(mode: .listToRoomTransitionStart, width: width)
+      guard _applyTmuxChatContainerLayoutPlan(startPlan, finalize: false) else {
+        completion?(false)
+        return
+      }
 
       guard animated else {
-        roomView.transform = .identity
-        roomView.isUserInteractionEnabled = true
-        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
-        nav.view.isUserInteractionEnabled = false
-        _detachTmuxPaneInboxIfNeeded()
+        _ = _applyTmuxChatContainerLayoutForCurrentState()
         completion?(true)
         return
       }
 
+      let endPlan = tmuxChatContainerLayoutPlan(mode: .room, width: width)
       let generation = _markTmuxChatTransitionBegan()
       UIView.animate(
         withDuration: 0.24,
         delay: 0,
         options: [.curveEaseOut, .beginFromCurrentState]
       ) {
-        roomView.transform = .identity
-        nav.view.transform = CGAffineTransform(translationX: -width, y: 0)
+        _ = self._applyTmuxChatContainerLayoutPlan(endPlan, finalize: false)
       } completion: { [weak self] finished in
         guard let self, generation == self._tmuxChatTransitionGeneration else {
           return
         }
         self._markTmuxChatTransitionCompleted(generation: generation)
-        roomView.isUserInteractionEnabled = true
-        nav.view.isUserInteractionEnabled = false
-        self._detachTmuxPaneInboxIfNeeded()
+        _ = self._applyTmuxChatContainerLayoutForCurrentState()
         completion?(finished)
       }
     }
@@ -497,7 +680,7 @@ class SpaceController: UIViewController {
     guard let recognizer = _tmuxChatsEdgePanRecognizer else {
       return
     }
-    recognizer.isEnabled = _tmuxStrictModeEnabled && _isTmuxRoomUIActive
+    recognizer.isEnabled = _tmuxStrictModeEnabled && _isTmuxRoomContainerPresented
   }
 
   private func _setViewportControllers(
@@ -521,6 +704,7 @@ class SpaceController: UIViewController {
         return
       }
       self._spaceControllerAnimating = false
+      self._syncTmuxChatContainerLayoutForCurrentState()
       completion?(didComplete)
     }
   }
@@ -541,7 +725,7 @@ class SpaceController: UIViewController {
 
   private func _setViewportPlaceholder(animated: Bool, completion: ((Bool) -> Void)? = nil) {
     _viewportPlaceholderController.loadViewIfNeeded()
-    _viewportPlaceholderController.view.backgroundColor = view.backgroundColor ?? .black
+    _viewportPlaceholderController.view.backgroundColor = view.backgroundColor ?? .systemBackground
     _setViewportControllers(
       requestedControllers: [],
       direction: .forward,
@@ -700,6 +884,10 @@ class SpaceController: UIViewController {
     
     _overlay.isUserInteractionEnabled = false
     view.addSubview(_overlay)
+
+    if _tmuxStrictModeEnabled {
+      _ = _attachTmuxPaneInboxIfNeeded()
+    }
     
     _registerForNotifications()
     _enforceTmuxStrictModeShellTopologyAtLaunch()
@@ -725,6 +913,7 @@ class SpaceController: UIViewController {
     _bottomTapAreaView.addGestureRecognizer(doubleTap)
 
     _setupTmuxChatsEdgeSwipeGesture()
+    _presentInitialTmuxPaneInboxIfNeeded()
     
     NotificationCenter.default.addObserver(self, selector: #selector(_geoTrackStateChanged), name: NSNotification.Name.BLGeoTrackStateChange, object: nil)
     
@@ -1049,7 +1238,7 @@ Please go to your subscriptions and cancel one of them!
       isWindowApplicationScene: sceneRole == .windowApplication,
       isSpaceControllerAnimating: _tmuxChatTransitionInFlight,
       hasPresentedViewController: presentedViewController != nil,
-      isTmuxPaneActive: _isTmuxRoomUIActive,
+      isTmuxPaneActive: _isTmuxRoomContainerPresented,
       isTmuxChatsPresented: _isPresentingTmuxPaneInbox
     )
   }
@@ -1160,6 +1349,8 @@ Please go to your subscriptions and cancel one of them!
     _viewportsKeys.removeAll()
     _currentKey = nil
     _setViewportPlaceholder(animated: false)
+    _syncTmuxRoomStatusControllerForCurrentState()
+    _syncTmuxChatContainerLayoutForCurrentState()
     _hud?.hide(animated: false)
     _hud = nil
   }
@@ -1182,8 +1373,21 @@ Please go to your subscriptions and cancel one of them!
   }
 
   fileprivate func _returnToTmuxPaneInbox(animated: Bool, alertMessage: String? = nil) {
-    _applyTmuxChatState(.list, animated: animated) { [weak self] _ in
+    if _tmuxChatTransitionInFlight {
+      _queueReturnToTmuxPaneInboxRequest(animated: animated, alertMessage: alertMessage)
+      return
+    }
+    _tmuxPaneRouteCoordinator.deactivate(reason: "pane_inbox")
+    _tmuxRouteStatusMessage = nil
+    _applyTmuxChatState(.list, animated: animated) { [weak self] didApply in
       guard let self else {
+        return
+      }
+      guard didApply else {
+        self._queueReturnToTmuxPaneInboxRequest(animated: animated, alertMessage: alertMessage)
+        DispatchQueue.main.async {
+          self._drainPendingReturnToTmuxPaneInboxRequestIfNeeded()
+        }
         return
       }
       self._teardownRoomShellAndReturnToList(alertMessage: alertMessage)
@@ -2139,7 +2343,13 @@ extension SpaceController {
     _markTmuxPaneReadIfPossible(hostAlias: cleanHost, paneTarget: cleanPane)
 
     let request = TmuxNotificationRequest(hostAlias: cleanHost, sessionName: cleanSession, paneTarget: cleanPane)
-    _applyTmuxChatState(.room, animated: true)
+    _lastTmuxRouteRequest = request
+    _tmuxRouteStatusMessage = _defaultTmuxLoadingStatusMessage()
+    if _tmuxStrictModeEnabled {
+      _applyTmuxPanePresentationEvent(.openPaneRequested, animated: true)
+    } else {
+      _applyTmuxChatState(.roomActive, animated: true)
+    }
     _tmuxPaneRouteCoordinator.route(request: request, source: source)
   }
 
@@ -2344,7 +2554,7 @@ extension SpaceController {
     }
 
     _tmuxPaneRouteCoordinator.deactivate(reason: "maintenance_shell")
-    _applyTmuxChatState(.room, animated: true)
+    _applyTmuxChatState(.roomActive, animated: true)
     _terminateAndRemoveAllShells()
     _createShell(userActivity: nil, animated: true, source: .maintenance) { [weak self] _ in
       guard let self,
@@ -2729,9 +2939,39 @@ struct TmuxNotificationRequest: Equatable, Codable {
   let paneTarget: String
 }
 
-fileprivate enum TmuxChatUIState: Equatable {
+enum TmuxPanePresentationState: Equatable {
   case list
-  case room
+  case roomLoading
+  case roomActive
+  case roomError
+}
+
+typealias TmuxChatUIState = TmuxPanePresentationState
+
+enum TmuxPanePresentationEvent: Equatable {
+  case showList
+  case openPaneRequested
+  case bridgeConnected
+  case bridgeRetrying
+  case bridgeFailedTerminal
+}
+
+func tmuxPanePresentationReduce(
+  state: TmuxPanePresentationState,
+  event: TmuxPanePresentationEvent
+) -> TmuxPanePresentationState {
+  switch event {
+  case .showList:
+    return .list
+  case .openPaneRequested:
+    return .roomLoading
+  case .bridgeConnected:
+    return .roomActive
+  case .bridgeRetrying:
+    return .roomLoading
+  case .bridgeFailedTerminal:
+    return .roomError
+  }
 }
 
 fileprivate enum TmuxPaneRouteSource {
@@ -3040,8 +3280,21 @@ enum TmuxPaneBridgeLifecycleUserInfoKey {
   static let exitStatus = "exitStatus"
 }
 
+fileprivate enum TmuxPaneRouteCoordinatorEvent: Equatable {
+  case launching(request: TmuxNotificationRequest)
+  case connected(request: TmuxNotificationRequest)
+  case retrying(request: TmuxNotificationRequest, attempt: Int, reason: String?)
+  case failed(request: TmuxNotificationRequest, reason: String?)
+  case retriesExhausted(request: TmuxNotificationRequest, message: String)
+}
+
+fileprivate protocol TmuxPaneRouteCoordinatorDelegate: AnyObject {
+  func tmuxPaneRouteCoordinator(_ coordinator: TmuxPaneRouteCoordinator, didEmit event: TmuxPaneRouteCoordinatorEvent)
+}
+
 fileprivate final class TmuxPaneRouteCoordinator {
   private weak var spaceController: SpaceController?
+  private weak var delegate: TmuxPaneRouteCoordinatorDelegate?
   private var persistedState: TmuxPaneBridgePersistedState?
   private var retryTimer: Timer?
   private var lifecycleObserver: NSObjectProtocol?
@@ -3058,8 +3311,9 @@ fileprivate final class TmuxPaneRouteCoordinator {
   private var routeFallbackTotal: UInt64 = 0
   private var lastReportedMetrics: (UInt64, UInt64, UInt64)?
 
-  init(spaceController: SpaceController) {
+  init(spaceController: SpaceController, delegate: TmuxPaneRouteCoordinatorDelegate?) {
     self.spaceController = spaceController
+    self.delegate = delegate
     lifecycleObserver = NotificationCenter.default.addObserver(
       forName: .BLKTmuxPaneBridgeLifecycle,
       object: nil,
@@ -3099,6 +3353,10 @@ fileprivate final class TmuxPaneRouteCoordinator {
     persistedState?.managedTabKey
   }
 
+  private func _emit(_ event: TmuxPaneRouteCoordinatorEvent) {
+    delegate?.tmuxPaneRouteCoordinator(self, didEmit: event)
+  }
+
   func restore(state: TmuxPaneBridgePersistedState?) {
     launchGeneration += 1
     activeAttemptID = nil
@@ -3121,6 +3379,9 @@ fileprivate final class TmuxPaneRouteCoordinator {
         spaceController._hasTerminalKey(key)
       }
     )
+    if let restored = persistedState {
+      _emit(.launching(request: restored.request))
+    }
     _launchIfPossible(trigger: "restore")
   }
 
@@ -3161,6 +3422,7 @@ fileprivate final class TmuxPaneRouteCoordinator {
     isConnected = false
     _cancelRetryTimer()
     _cancelLaunchWatchdogs()
+    _emit(.launching(request: canonical))
     _launchIfPossible(trigger: "route")
     _flushIOSRoutingMetricsIfNeeded()
   }
@@ -3297,6 +3559,7 @@ fileprivate final class TmuxPaneRouteCoordinator {
       isConnected = false
       commandStartWatchdogTimer?.invalidate()
       commandStartWatchdogTimer = nil
+      _emit(.launching(request: state.request))
       return
     case .connected:
       if !isConnected {
@@ -3311,6 +3574,7 @@ fileprivate final class TmuxPaneRouteCoordinator {
       persistedState = state
       _cancelRetryTimer()
       _cancelLaunchWatchdogs()
+      _emit(.connected(request: state.request))
       _flushIOSRoutingMetricsIfNeeded()
     case .disconnected:
       _cancelLaunchWatchdogs()
@@ -3337,12 +3601,13 @@ fileprivate final class TmuxPaneRouteCoordinator {
 
       if tmuxPaneBridgeFailureShouldRetry(code: payload.failureCode, reason: reason) {
         _scheduleRetry(reason: reason)
-      } else if let reason, let spaceController {
+      } else {
         _cancelRetryTimer()
-        spaceController.showAlert(msg: reason)
-      } else if let spaceController {
-        _cancelRetryTimer()
-        spaceController.showAlert(msg: "Tmux pane bridge failed and cannot be retried automatically.")
+        let message = reason?.blink_trimmed
+        _emit(.failed(
+          request: state.request,
+          reason: (message?.isEmpty == false) ? message : "Tmux pane bridge failed and cannot be retried automatically."
+        ))
       }
     }
   }
@@ -3470,10 +3735,17 @@ fileprivate final class TmuxPaneRouteCoordinator {
       } else {
         message = "Tmux pane bridge retried \(tmuxPaneBridgeMaximumRetryAttempts()) times and stopped."
       }
+      let exhaustedRequest = state.request
       deactivate(reason: "retry_exhausted")
-      spaceController._returnToTmuxPaneInbox(animated: true, alertMessage: message)
+      _emit(.retriesExhausted(request: exhaustedRequest, message: message))
       return
     }
+
+    _emit(.retrying(
+      request: state.request,
+      attempt: state.retryAttempt,
+      reason: state.lastFailureReason?.blink_trimmed
+    ))
 
     _cancelRetryTimer()
     let delay = tmuxPaneBridgeRetryDelaySeconds(attempt: state.retryAttempt)
@@ -3525,6 +3797,44 @@ fileprivate final class TmuxPaneRouteCoordinator {
       } catch {
         return
       }
+    }
+  }
+}
+
+extension SpaceController: TmuxPaneRouteCoordinatorDelegate {
+  fileprivate func tmuxPaneRouteCoordinator(_ coordinator: TmuxPaneRouteCoordinator, didEmit event: TmuxPaneRouteCoordinatorEvent) {
+    _ = coordinator
+    switch event {
+    case .launching(let request):
+      _lastTmuxRouteRequest = request
+      _tmuxRouteStatusMessage = _defaultTmuxLoadingStatusMessage()
+      _applyTmuxPanePresentationEvent(.openPaneRequested, animated: true)
+
+    case .connected(let request):
+      _lastTmuxRouteRequest = request
+      _tmuxRouteStatusMessage = nil
+      _applyTmuxPanePresentationEvent(.bridgeConnected, animated: true)
+
+    case .retrying(let request, let attempt, let reason):
+      _lastTmuxRouteRequest = request
+      let cleanReason = reason?.blink_trimmed
+      if let cleanReason, !cleanReason.isEmpty {
+        _tmuxRouteStatusMessage = "Retrying pane bridge (\(attempt)/\(tmuxPaneBridgeMaximumRetryAttempts()))...\n\(cleanReason)"
+      } else {
+        _tmuxRouteStatusMessage = "Retrying pane bridge (\(attempt)/\(tmuxPaneBridgeMaximumRetryAttempts()))..."
+      }
+      _applyTmuxPanePresentationEvent(.bridgeRetrying, animated: false)
+
+    case .failed(let request, let reason):
+      _lastTmuxRouteRequest = request
+      let cleanReason = reason?.blink_trimmed
+      _tmuxRouteStatusMessage = (cleanReason?.isEmpty == false) ? cleanReason : _defaultTmuxErrorStatusMessage()
+      _applyTmuxPanePresentationEvent(.bridgeFailedTerminal, animated: true)
+
+    case .retriesExhausted(let request, let message):
+      _lastTmuxRouteRequest = request
+      _tmuxRouteStatusMessage = message.blink_trimmed
+      _returnToTmuxPaneInbox(animated: true, alertMessage: message)
     }
   }
 }
@@ -3642,6 +3952,83 @@ func tmuxChatTransitionDirection(fromIsList: Bool, toIsList: Bool) -> TmuxChatTr
     return .none
   }
   return toIsList ? .roomToList : .listToRoom
+}
+
+enum TmuxChatContainerLayoutMode: Equatable {
+  case list
+  case room
+  case roomToListTransitionStart
+  case listToRoomTransitionStart
+  case interactiveRoomToList(progress: Double)
+}
+
+struct TmuxChatContainerLayoutPlan: Equatable {
+  let roomTranslationX: Double
+  let listTranslationX: Double
+  let roomUserInteractionEnabled: Bool
+  let listUserInteractionEnabled: Bool
+  let requiresListAttachment: Bool
+  let shouldDetachListAfterApply: Bool
+}
+
+func tmuxChatContainerLayoutPlan(
+  mode: TmuxChatContainerLayoutMode,
+  width: Double
+) -> TmuxChatContainerLayoutPlan {
+  let clampedWidth = max(1.0, width)
+
+  switch mode {
+  case .list:
+    return TmuxChatContainerLayoutPlan(
+      roomTranslationX: clampedWidth,
+      listTranslationX: 0,
+      roomUserInteractionEnabled: false,
+      listUserInteractionEnabled: true,
+      requiresListAttachment: true,
+      shouldDetachListAfterApply: false
+    )
+
+  case .room:
+    return TmuxChatContainerLayoutPlan(
+      roomTranslationX: 0,
+      listTranslationX: -clampedWidth,
+      roomUserInteractionEnabled: true,
+      listUserInteractionEnabled: false,
+      requiresListAttachment: true,
+      shouldDetachListAfterApply: false
+    )
+
+  case .roomToListTransitionStart:
+    return TmuxChatContainerLayoutPlan(
+      roomTranslationX: 0,
+      listTranslationX: -clampedWidth,
+      roomUserInteractionEnabled: false,
+      listUserInteractionEnabled: false,
+      requiresListAttachment: true,
+      shouldDetachListAfterApply: false
+    )
+
+  case .listToRoomTransitionStart:
+    return TmuxChatContainerLayoutPlan(
+      roomTranslationX: clampedWidth,
+      listTranslationX: 0,
+      roomUserInteractionEnabled: false,
+      listUserInteractionEnabled: false,
+      requiresListAttachment: true,
+      shouldDetachListAfterApply: false
+    )
+
+  case .interactiveRoomToList(let progress):
+    let clampedProgress = min(max(progress, 0.0), 1.0)
+    return TmuxChatContainerLayoutPlan(
+      roomTranslationX: clampedWidth * clampedProgress,
+      listTranslationX: -clampedWidth * (1 - clampedProgress),
+      roomUserInteractionEnabled: false,
+      listUserInteractionEnabled: false,
+      requiresListAttachment: true,
+      shouldDetachListAfterApply: false
+    )
+  }
 }
 
 enum TmuxChatsEdgeSwipeBlockReason: Equatable {
